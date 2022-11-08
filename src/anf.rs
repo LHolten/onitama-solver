@@ -1,57 +1,72 @@
 use std::{
+    borrow::Borrow,
     collections::HashSet,
+    hash::Hash,
     ops::{BitAnd, Not},
 };
 
-#[derive(Default, Clone)]
-struct Anf {
-    terms: HashSet<u32>,
+#[derive(Clone, Debug)]
+pub struct Anf<T> {
+    terms: HashSet<T>,
 }
 
-const MAX_TERM_SIZE: u32 = 5;
-// term has an optional king location part
-// and for each square optional one of three states
-
-impl Anf {
-    fn xor_term(&mut self, term: u32) {
-        if term.count_ones() > MAX_TERM_SIZE {
-            return;
+impl<T> Default for Anf<T> {
+    fn default() -> Self {
+        Self {
+            terms: Default::default(),
         }
-        if !self.terms.remove(&term) {
-            assert!(self.terms.insert(term))
-        }
-    }
-
-    pub fn forget_vars(&self, var: u32) -> Self {
-        let mut result = Self::default();
-        for &x in &self.terms {
-            result.xor_term(x & !var)
-        }
-        result
     }
 }
 
-impl BitAnd for &Anf {
-    type Output = Anf;
+impl<T: Eq + Hash + Clone> Anf<T> {
+    fn xor_term(&mut self, term: impl Borrow<T>) {
+        if !self.terms.remove(term.borrow()) {
+            assert!(self.terms.insert(term.borrow().clone()))
+        }
+    }
+}
 
-    fn bitand(self, rhs: &Anf) -> Self::Output {
+impl<'a, T: Eq + Hash + Clone> BitAnd for &'a Anf<T>
+where
+    &'a T: BitAnd<Output = Option<T>>,
+{
+    type Output = Anf<T>;
+
+    fn bitand(self, rhs: &'a Anf<T>) -> Self::Output {
         let mut result = Anf::default();
-        for &x in &self.terms {
-            for &y in &rhs.terms {
-                let term = x | y;
-                result.xor_term(term)
+        for x in &self.terms {
+            for y in &rhs.terms {
+                if let Some(term) = x & y {
+                    result.xor_term(term)
+                }
             }
         }
         result
     }
 }
 
-impl Not for &Anf {
-    type Output = Anf;
+impl<'a, T: Eq + Hash + Clone + Default> Not for Anf<T> {
+    type Output = Anf<T>;
 
-    fn not(self) -> Self::Output {
-        let mut result = self.clone();
-        result.xor_term(0);
+    fn not(mut self) -> Self::Output {
+        self.xor_term(&Default::default());
+        self
+    }
+}
+
+impl<T: Eq + Hash + Clone> Anf<T> {
+    pub fn map(&self, f: impl Fn(&T) -> Option<[T; 2]>) -> Self {
+        let mut result = Anf::default();
+        for x in &self.terms {
+            if let Some([a, b]) = f(x) {
+                result.xor_term(a);
+                result.xor_term(b);
+            }
+        }
         result
+    }
+
+    pub fn len(&self) -> usize {
+        self.terms.len()
     }
 }
