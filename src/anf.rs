@@ -1,38 +1,31 @@
 use std::{
     borrow::Borrow,
     collections::HashSet,
-    hash::Hash,
     ops::{BitAnd, Not},
 };
 
-#[derive(Clone, Debug)]
-pub struct Anf<T> {
-    terms: HashSet<T>,
+use crate::board::Board;
+
+#[derive(Clone, Debug, Default)]
+pub struct Anf {
+    terms: HashSet<Board>,
 }
 
-impl<T> Default for Anf<T> {
-    fn default() -> Self {
-        Self {
-            terms: Default::default(),
-        }
-    }
-}
-
-impl<T: Eq + Hash + Clone> Anf<T> {
-    fn xor_term(&mut self, term: impl Borrow<T>) {
+impl Anf {
+    fn xor_term(&mut self, term: impl Borrow<Board>) {
+        let Some(term) = term.borrow().clone().check() else {
+            return;
+        };
         if !self.terms.remove(term.borrow()) {
-            assert!(self.terms.insert(term.borrow().clone()))
+            assert!(self.terms.insert(term))
         }
     }
 }
 
-impl<'a, T: Eq + Hash + Clone> BitAnd for &'a Anf<T>
-where
-    &'a T: BitAnd<Output = Option<T>>,
-{
-    type Output = Anf<T>;
+impl<'a> BitAnd for &'a Anf {
+    type Output = Anf;
 
-    fn bitand(self, rhs: &'a Anf<T>) -> Self::Output {
+    fn bitand(self, rhs: &'a Anf) -> Self::Output {
         let mut result = Anf::default();
         for x in &self.terms {
             for y in &rhs.terms {
@@ -45,8 +38,8 @@ where
     }
 }
 
-impl<'a, T: Eq + Hash + Clone + Default> Not for Anf<T> {
-    type Output = Anf<T>;
+impl<'a> Not for Anf {
+    type Output = Anf;
 
     fn not(mut self) -> Self::Output {
         self.xor_term(&Default::default());
@@ -54,13 +47,12 @@ impl<'a, T: Eq + Hash + Clone + Default> Not for Anf<T> {
     }
 }
 
-impl<T: Eq + Hash + Clone> Anf<T> {
-    pub fn map(&self, f: impl Fn(&T) -> Option<[T; 2]>) -> Self {
+impl Anf {
+    pub fn map(&self, f: impl Fn(&Board) -> Option<[Board; 2]>) -> Self {
         let mut result = Anf::default();
         for x in &self.terms {
-            if let Some([a, b]) = f(x) {
-                result.xor_term(a);
-                result.xor_term(b);
+            for new in f(x).into_iter().flatten() {
+                result.xor_term(new)
             }
         }
         result
@@ -68,5 +60,17 @@ impl<T: Eq + Hash + Clone> Anf<T> {
 
     pub fn len(&self) -> usize {
         self.terms.len()
+    }
+
+    pub fn eval(&self, board: &Board) -> bool {
+        let mut res = false;
+        for x in &self.terms {
+            res ^= x.includes(board)
+        }
+        res
+    }
+
+    pub fn count(&self, list: &[Board]) -> usize {
+        list.iter().filter(|b| self.eval(b)).count()
     }
 }
