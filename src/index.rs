@@ -137,56 +137,33 @@ pub struct ChooseExact {
     count: u8,
 }
 
-impl Gen<u16, u16> for ChooseExact {
-    type GenIter = impl Iterator<Item = u16>;
-
-    fn gen_iter(&self, mask: u16) -> Self::GenIter {
-        debug_assert!(self.count < 5);
-
-        let mut lookup = [0u16; 5];
-        let mut low_mask = 0;
-        for i in 0..=self.count as usize {
-            lookup[self.count as usize - i] = low_mask;
-            let high_bits = mask & !low_mask;
-            low_mask |= high_bits & high_bits.wrapping_neg();
-        }
-
-        println!("{:?}", lookup);
-
-        let mut curr = 0u16;
-        iter::from_fn(move || {
-            let lowest = curr & curr.wrapping_neg();
-
-            let (new, done) = (curr | !mask).overflowing_add(lowest);
-
-            curr = new & mask;
-            curr |= lookup[curr.count_ones() as usize];
-
-            (!done).then_some(curr)
-        })
-    }
-
-    fn index(&self, mask: u16, vals: &u16) -> Index {
-        Index {
-            index: index_exact(*vals as u32, mask as u32),
-            total: comb_exact(mask.count_ones(), vals.count_ones()),
-        }
-    }
-}
-
 macro_rules! gen_impl {
     ($($t:ty)*) => {$(
         impl Gen<$t, $t> for ChooseExact {
             type GenIter = impl Iterator<Item = $t>;
 
             fn gen_iter(&self, mask: $t) -> Self::GenIter {
-                // TODO: fix this
-                BitIter::from(mask).map(|offset| offset as $t)
-                // BitIter::from(mask).flat_map(|offset| {
-                //     let mask_less = (1 << offset) - 1;
-                //     let new_mask = mask & mask_less;
-                //     todo!()
-                // })
+                debug_assert!(self.count < 5);
+
+                let mut lookup: [$t; 5] = [0; 5];
+                let mut low_mask = 0;
+                for i in 0..=self.count as usize {
+                    lookup[self.count as usize - i] = low_mask;
+                    let high_bits = mask & !low_mask;
+                    low_mask |= high_bits & high_bits.wrapping_neg();
+                }
+
+                let mut curr: $t = 0;
+                iter::from_fn(move || {
+                    let lowest = curr & curr.wrapping_neg();
+
+                    let (new, done) = (curr | !mask).overflowing_add(lowest);
+
+                    curr = new & mask;
+                    curr |= lookup[curr.count_ones() as usize];
+
+                    (!done).then_some(curr)
+                })
             }
 
             fn index(&self, mask: $t, vals: &$t) -> Index {
@@ -199,7 +176,7 @@ macro_rules! gen_impl {
     )*}
 }
 
-gen_impl! { u8 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
+gen_impl! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
 
 pub fn index_exact(vals: u32, mask: u32) -> usize {
     debug_assert_eq!(vals & !mask, 0);
@@ -230,8 +207,10 @@ mod tests {
 
     #[test]
     fn comb_some() {
-        ChooseExact { count: 2 }
-            .gen_iter(0b1111u16)
-            .for_each(|x| println!("{x:04b}"))
+        let indexer = ChooseExact { count: 3 };
+        let mask = 0b101111u16;
+        indexer
+            .gen_iter(mask)
+            .for_each(|x| println!("{x:06b} with id {}", indexer.index(mask, &x).index))
     }
 }
