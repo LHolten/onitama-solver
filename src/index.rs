@@ -1,3 +1,5 @@
+use std::intrinsics::assume;
+
 use std::{
     iter::{self, once, Once},
     marker::PhantomData,
@@ -7,7 +9,6 @@ use bit_iter::BitIter;
 
 use crate::proj::{Mask, Proj};
 
-#[derive(Default)]
 pub struct Index {
     pub index: usize,
     pub total: usize,
@@ -29,7 +30,7 @@ pub trait Indexer: IntoIterator + Sized {
         }
     }
 
-    fn choose_exact<V, M>(self, proj: V, mask: M, count: u8) -> Flatten<Self, V, M, ChooseExact>
+    fn choose<V, M>(self, n: u8, proj: V, mask: M) -> Flatten<Self, V, M, ChooseExact>
     where
         V: Proj<Self::Item>,
         M: Mask<Self::Item>,
@@ -38,7 +39,7 @@ pub trait Indexer: IntoIterator + Sized {
             inner: self,
             proj,
             mask,
-            gen: ChooseExact { count },
+            gen: ChooseExact { count: n },
         }
     }
 }
@@ -57,7 +58,7 @@ impl<T: Default> IntoIterator for Empty<T> {
 
 impl<T: Default> Indexer for Empty<T> {
     fn index(self, _: &Self::Item) -> Index {
-        Index::default()
+        Index { index: 0, total: 1 }
     }
 }
 
@@ -144,24 +145,27 @@ macro_rules! gen_impl {
 
             fn gen_iter(&self, mask: $t) -> Self::GenIter {
                 debug_assert!(self.count < 5);
+                assert!(self.count <= mask.count_ones() as u8);
 
                 let mut lookup: [$t; 5] = [0; 5];
-                let mut low_mask = 0;
+                let mut entry = !mask;
                 for i in 0..=self.count as usize {
-                    lookup[self.count as usize - i] = low_mask;
-                    let high_bits = mask & !low_mask;
-                    low_mask |= high_bits & high_bits.wrapping_neg();
+                    lookup[self.count as usize - i] = entry;
+                    entry |= (!entry) & (!entry).wrapping_neg();
                 }
 
+                let mut curr_or_skip = !mask;
                 let mut curr: $t = 0;
                 iter::from_fn(move || {
                     let lowest = curr & curr.wrapping_neg();
 
-                    let (new, done) = (curr | !mask).overflowing_add(lowest);
+                    let (new, done) = curr_or_skip.overflowing_add(lowest);
+                    let bits = (new & mask).count_ones();
 
-                    curr = new & mask;
-                    curr |= lookup[curr.count_ones() as usize];
+                    unsafe {assume(bits <= 4)}
+                    curr_or_skip = new | lookup[bits as usize];
 
+                    curr = curr_or_skip & mask;
                     (!done).then_some(curr)
                 })
             }
@@ -203,7 +207,7 @@ pub fn comb_exact(num_less: u32, count: u32) -> usize {
 #[cfg(test)]
 mod tests {
 
-    use super::{comb_exact, ChooseExact, Gen};
+    use super::{ChooseExact, ChooseOne, Gen};
 
     #[test]
     fn comb_some() {
@@ -212,5 +216,14 @@ mod tests {
         indexer
             .gen_iter(mask)
             .for_each(|x| println!("{x:06b} with id {}", indexer.index(mask, &x).index))
+    }
+
+    #[test]
+    fn comb_one() {
+        let indexer = ChooseOne;
+        let mask = 0b101111u32;
+        indexer
+            .gen_iter(mask)
+            .for_each(|x| println!("{x} with id {}", indexer.index(mask, &x).index))
     }
 }
