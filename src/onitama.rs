@@ -40,6 +40,11 @@ impl BoardIncomplete {
             .choose_one(proj!(|b: B| b.pawn_n[0]), NUM_PAWNS_MASK)
             .choose_one(proj!(|b: B| b.pawn_n[1]), NUM_PAWNS_MASK)
     }
+
+    pub fn is_lost(&self) -> bool {
+        let king1_temple_attack = cards_mask::<false>(TEMPLES[0], self.cards[1]);
+        (1 << self.king1) & king1_temple_attack != 0
+    }
 }
 
 impl Board {
@@ -68,10 +73,14 @@ impl Board {
         let pawns0_mask = move |b: &B| TABLE_MASK & !king1 & !king0(b) & !attack_kings1;
         let pawns1_mask = move |b: &B| TABLE_MASK & !king1 & !king0(b) & !b.pawns[0];
 
-        Empty::default()
-            .choose_one(proj!(|b: B| b.kings[0]), kings0_mask)
-            .choose(first.pawn_n[0], proj!(|b: B| b.pawns[0]), pawns0_mask)
-            .choose(first.pawn_n[1], proj!(|b: B| b.pawns[1]), pawns1_mask)
+        Empty(Board {
+            pawns: [0; 2],
+            cards: first.cards,
+            kings: [0, first.king1],
+        })
+        .choose_one(proj!(|b: B| b.kings[0]), kings0_mask)
+        .choose(first.pawn_n[0], proj!(|b: B| b.pawns[0]), pawns0_mask)
+        .choose(first.pawn_n[1], proj!(|b: B| b.pawns[1]), pawns1_mask)
     }
 
     // // generate pawn moves that do not result in obv win for opp

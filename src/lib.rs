@@ -1,4 +1,13 @@
+#![feature(type_alias_impl_trait)]
+#![feature(core_intrinsics)]
+
 mod anf;
+mod card;
+mod index;
+mod onitama;
+// mod ply;
+mod proj;
+mod table;
 
 use anf::Anf;
 use board::Board;

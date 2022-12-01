@@ -7,7 +7,7 @@ use seq_macro::seq;
 pub(crate) fn cards_mask<const S: bool>(offset: u8, cards: u16) -> u32 {
     let bitmap = get_bitmap::<S>(cards);
     let new = bitmap & BOARD_MASK[offset as usize];
-    ((new as u64) << offset >> 14) as u32
+    ((new as u64) << 12 >> offset) as u32
 }
 
 #[allow(clippy::unusual_byte_groupings)]
@@ -39,6 +39,7 @@ const BOARD_MASK: [u32; 25] = [
     0b11100_11100_11100_00000_00000,
 ];
 
+// card masks are ordered from top to bottom
 pub(crate) fn get_bitmap<const S: bool>(cards: u16) -> u32 {
     #[allow(clippy::unusual_byte_groupings)]
     const CARD_MAP_0: [u32; 16] = [
@@ -72,5 +73,28 @@ pub(crate) fn get_bitmap<const S: bool>(cards: u16) -> u32 {
 
 #[inline]
 const fn reverse_bitmap(board: u32) -> u32 {
-    board.reverse_bits() >> 3
+    board.reverse_bits() >> (32 - 25)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cards_mask;
+
+    #[test]
+    pub fn test() {
+        let cards = 1;
+        let res10 = 0b00000_10000_01000_10000_00000;
+        let res12 = 0b00000_00100_00010_00100_00000;
+        let res10_rev = 0b00000_10000_00000_10000_00000;
+        let res3_rev = 0b00100_00010_00000_00000_00000;
+        let mask10 = cards_mask::<false>(10, cards);
+        let mask10_rev = cards_mask::<true>(10, cards);
+        let mask12 = cards_mask::<false>(12, cards);
+        let mask3_rev = cards_mask::<true>(3, cards);
+        // println!("{mask3_rev:025b}");
+        assert_eq!(res12, mask12);
+        assert_eq!(res10, mask10);
+        assert_eq!(res10_rev, mask10_rev);
+        assert_eq!(res3_rev, mask3_rev);
+    }
 }
