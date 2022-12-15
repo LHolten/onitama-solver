@@ -97,36 +97,41 @@ impl Board {
 
         let temple1_attacked = cards_mask::<true>(TEMPLES[1], first.cards0);
         let need_pawn0_on_temple1 = king0 & temple1_attacked != 0;
-        // if need_pawn0_on_temple1 && !has_pawn0_on_temple1 {
-        //     return None;
-        // }
+        if need_pawn0_on_temple1 && !has_pawn0_on_temple1 {
+            return None;
+        }
 
-        let pawns0 = if need_pawn0_on_temple1 {
+        let pawns0 = if has_pawn0_on_temple1 {
             1 << TEMPLES[1]
         } else {
-            // let mut cards0_iter = BitIter::from(first.cards0);
-            // let options1 = cards_mask::<false>(first.kings[0], 1 << cards0_iter.next().unwrap());
-            // let options2 = cards_mask::<false>(first.kings[0], 1 << cards0_iter.next().unwrap());
-            // let mut cards0_iter = BitIter::from(first.cards0);
-            // let rev_2 = cards_mask::<true>(
-            //     TEMPLES[1],
-            //     1 << first.side_card | 1 << cards0_iter.next().unwrap(),
-            // );
-            // let rev_1 = cards_mask::<true>(
-            //     TEMPLES[1],
-            //     1 << first.side_card | 1 << cards0_iter.next().unwrap(),
-            // );
-            // options1 & rev_1 | options2 & rev_2
-            0u32
+            let mut cards0_iter = BitIter::from(first.cards0);
+            let options1 = cards_mask::<false>(first.kings[0], 1 << cards0_iter.next().unwrap());
+            let options2 = cards_mask::<false>(first.kings[0], 1 << cards0_iter.next().unwrap());
+            let mut cards0_iter = BitIter::from(first.cards0);
+            let rev_2 = cards_mask::<true>(
+                TEMPLES[1],
+                1 << first.side_card | 1 << cards0_iter.next().unwrap(),
+            );
+            let rev_1 = cards_mask::<true>(
+                TEMPLES[1],
+                1 << first.side_card | 1 << cards0_iter.next().unwrap(),
+            );
+            BitIter::from(options1 & rev_1 | options2 & rev_2)
+                .filter(|&offset| cards_mask::<false>(offset as u8, cards1) & pieces1 == 0)
+                .fold(0, |a, b| a | 1 << b)
         };
+
+        if (pieces1 | king1_attacked) & pawns0 != 0 {
+            return None;
+        }
 
         let pawns0_required = pawns0.count_ones() as u8;
         if pawns0_required > pawns0_len {
             return None;
         }
 
-        let pawns0_mask = TABLE_MASK & !king1_attacked & !king0 & !pawns0 & !first.pawns1;
-        // & !(1 << TEMPLES[1])
+        let pawns0_mask =
+            TABLE_MASK & !king1_attacked & !king0 & !(1 << TEMPLES[1]) & !first.pawns1;
 
         // TODO: add required pawns
         let iter = Empty(Board {
@@ -151,17 +156,21 @@ fn count_perft2() {
     for pawns1_len in 0..=4 {
         for board_no_pawns in Board1::index1(all_cards, pawns1_len) {
             for pawns0_len in 0..=4 {
-                let Some(indexer) = Board::index2(all_cards, board_no_pawns.clone(), pawns0_len, false) else {
-                    continue;
-                };
-                let board = indexer.clone().into_iter().next().unwrap();
-                total += indexer.index(&board).total;
+                'first: {
+                    let Some(indexer) = Board::index2(all_cards, board_no_pawns.clone(), pawns0_len, false) else {
+                        break 'first;
+                    };
+                    let board = indexer.clone().into_iter().next().unwrap();
+                    total += indexer.index(&board).total;
+                }
 
-                // let Some(indexer) = Board::index2(all_cards, board_no_pawns.clone(), pawns0_len, true) else {
-                //     continue;
-                // };
-                // let board = indexer.clone().into_iter().next().unwrap();
-                // total += indexer.index(&board).total;
+                'second: {
+                    let Some(indexer) = Board::index2(all_cards, board_no_pawns.clone(), pawns0_len, true) else {
+                        break 'second;
+                    };
+                    let board = indexer.clone().into_iter().next().unwrap();
+                    total += indexer.index(&board).total;
+                }
             }
         }
     }
