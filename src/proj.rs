@@ -1,5 +1,7 @@
+use std::ops::BitOrAssign;
+
 pub trait Proj<T>: Copy {
-    type Output;
+    type Output: BitOrAssign;
     fn proj_ref(self, board: &T) -> &Self::Output;
     fn proj_mut(self, board: &mut T) -> &mut Self::Output;
 }
@@ -16,7 +18,7 @@ impl<X, Y> Projector<X, Y> {
     }
 }
 
-impl<T, O, X, Y> Proj<T> for Projector<X, Y>
+impl<T, O: BitOrAssign, X, Y> Proj<T> for Projector<X, Y>
 where
     X: Fn(&T) -> &O + Copy,
     Y: Fn(&mut T) -> &mut O + Copy,

@@ -87,6 +87,11 @@ impl Board {
 
         // make sure opp doesn't have double attack with any old cards on our king
         let pieces1 = first.pawns1 | king1;
+        let pieces1_attack = BitIter::from(pieces1).fold(0, |union, offset| {
+            union | cards_mask::<true>(offset as u8, cards1)
+        });
+
+        // check if previous state must have been a win in 1 by king capture
         let king0_old1_attacked = cards_mask::<false>(first.kings[0], old1_cards);
         let king0_old2_attacked = cards_mask::<false>(first.kings[0], old2_cards);
         if (king0_old1_attacked & pieces1).count_ones() >= 2
@@ -95,15 +100,24 @@ impl Board {
             return None;
         }
 
+        // check for temple win in 1 ply
         let temple1_attacked = cards_mask::<true>(TEMPLES[1], first.cards0);
         let need_pawn0_on_temple1 = king0 & temple1_attacked != 0;
         if need_pawn0_on_temple1 && !has_pawn0_on_temple1 {
             return None;
         }
 
+        // check if we are in checkmate
+        let king0_attacked = cards_mask::<false>(first.kings[0], cards1);
+        let options = cards_mask::<false>(first.kings[0], first.cards0);
+        if (king0_attacked & pieces1).count_ones() >= 2 && options & !pieces1_attack == 0 {
+            return None;
+        }
+
         let pawns0 = if has_pawn0_on_temple1 {
             1 << TEMPLES[1]
         } else {
+            // if there is no pawn on temple, then we need to block jump squares
             let mut cards0_iter = BitIter::from(first.cards0);
             let options1 = cards_mask::<false>(first.kings[0], 1 << cards0_iter.next().unwrap());
             let options2 = cards_mask::<false>(first.kings[0], 1 << cards0_iter.next().unwrap());
@@ -116,22 +130,22 @@ impl Board {
                 TEMPLES[1],
                 1 << first.side_card | 1 << cards0_iter.next().unwrap(),
             );
-            BitIter::from(options1 & rev_1 | options2 & rev_2)
-                .filter(|&offset| cards_mask::<false>(offset as u8, cards1) & pieces1 == 0)
-                .fold(0, |a, b| a | 1 << b)
+            (options1 & rev_1 | options2 & rev_2) & !pieces1_attack
         };
 
+        // any required pawns should not interfer with existing pieces
         if (pieces1 | king1_attacked) & pawns0 != 0 {
             return None;
         }
 
+        // we can not have to many pieces
         let pawns0_required = pawns0.count_ones() as u8;
         if pawns0_required > pawns0_len {
             return None;
         }
 
         let pawns0_mask =
-            TABLE_MASK & !king1_attacked & !king0 & !(1 << TEMPLES[1]) & !first.pawns1;
+            TABLE_MASK & !king1_attacked & !king0 & !(1 << TEMPLES[1]) & !first.pawns1 & !pawns0;
 
         // TODO: add required pawns
         let iter = Empty(Board {

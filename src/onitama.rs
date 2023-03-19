@@ -1,21 +1,23 @@
+use bit_iter::BitIter;
+
 use crate::{
-    card::cards_mask,
+    card::{cards_mask, get_bitmap},
     index::{Empty, Indexer},
     proj,
 };
-
-#[derive(PartialEq, Eq, Default, Clone, Copy)]
-pub struct Board {
-    pawns: [u32; 2],
-    cards: [u16; 2],
-    kings: [u8; 2],
-}
 
 #[derive(Clone, Default)]
 pub struct BoardIncomplete {
     pawn_n: [u8; 2], // number of pawns for each side
     cards: [u16; 2],
     king1: u8,
+}
+
+#[derive(PartialEq, Eq, Default, Clone, Copy)]
+pub struct Board {
+    pawns: [u32; 2],
+    cards: [u16; 2],
+    kings: [u8; 2],
 }
 
 // team 0 is at the bottom, so that they can use the cards unrotated
@@ -42,6 +44,7 @@ impl BoardIncomplete {
     }
 
     pub fn is_lost(&self) -> bool {
+        // TODO: might nog be lost when there is a pawn on the temple
         let king1_temple_attack = cards_mask::<false>(TEMPLES[0], self.cards[1]);
         (1 << self.king1) & king1_temple_attack != 0
     }
@@ -83,23 +86,29 @@ impl Board {
         .choose(first.pawn_n[1], proj!(|b: B| b.pawns[1]), pawns1_mask)
     }
 
-    // // generate pawn moves that do not result in obv win for opp
-    // fn generate_next_pawn(self) -> impl Iterator<Item = Board> {
-    //     // if king is threatened we only need to consider defense moves
+    // generate pawn moves that do not result in obv win for opp
+    fn generate_next_pawn(self, all_cards: u16) -> impl Iterator<Item = Board> {
+        // if king is threatened we only need to consider defense moves
 
-    //     // let card_mask = self.cards[0];
-    //     // Choose::<1, true, u16>::new(!card_mask).flat_map(|card| {
-    //     //     let from_mask = self.pawns[0] | 1 << self.kings[0];
-    //     //     Choose::<1, true, u32>::new(!from_mask).flat_map(|from_mask| {
-    //     //         let from = from_mask.trailing_zeros() as u8;
-    //     //         let to_mask = cards_mask(from, card, false);
-    //     //         Choose::<1, true, u32>::new(!to_mask).map(|to|{
+        let from_mask = self.pawns[0];
+        BitIter::from(from_mask).flat_map(move |from| {
+            let to_mask = cards_mask::<false>(from as u8, self.cards[0]);
+            BitIter::from(to_mask).flat_map(move |to| {
+                let offset = to - from;
+                let mut new = self;
+                new.pawns[0] ^= 1 << from | 1 << to;
+                new.pawns[1] &= !(1 << to);
+                BitIter::from(self.cards[0]).flat_map(move |card| {
+                    let mut new = new;
+                    new.cards[0] = (1 << card) ^ all_cards ^ new.cards[1];
 
-    //     //         })
-    //     //     })
-    //     // })
-    //     todo!()
-    // }
+                    // TODO: check this
+                    let allowed = get_bitmap::<false>(1 << card) & (1 << offset >> 12) != 0;
+                    allowed.then_some(new)
+                })
+            })
+        })
+    }
 
     // // generate king moves that do not result in obv win for opp
     // // this might return a board that is obv loss for opp (temple threat)
