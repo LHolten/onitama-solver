@@ -26,9 +26,9 @@ pub struct Board1 {
 }
 
 // team 0 is at the bottom, so that they can use the cards unrotated
-const TEMPLES: [u8; 2] = [22, 2];
-const TABLE_MASK: u32 = (1 << 25) - 1;
-const NUM_PAWNS_MASK: u32 = 0b11111; // five options, because there can be 0..=4 pawns
+pub const TEMPLES: [u8; 2] = [22, 2];
+pub const TABLE_MASK: u32 = (1 << 25) - 1;
+pub const NUM_PAWNS_MASK: u32 = 0b11111; // five options, because there can be 0..=4 pawns
 
 impl Board1 {
     pub fn index1(all_cards: u16, pawns1_len: u8) -> impl Indexer<Item = Self> {
@@ -171,19 +171,17 @@ fn count_perft2() {
         for board_no_pawns in Board1::index1(all_cards, pawns1_len) {
             for pawns0_len in 0..=4 {
                 'first: {
-                    let Some(indexer) = Board::index2(all_cards, board_no_pawns.clone(), pawns0_len, false) else {
+                    let Some(indexer) = Board::index2(all_cards, board_no_pawns, pawns0_len, false) else {
                         break 'first;
                     };
-                    let board = indexer.clone().into_iter().next().unwrap();
-                    total += indexer.index(&board).total;
+                    total += indexer.total();
                 }
 
                 'second: {
-                    let Some(indexer) = Board::index2(all_cards, board_no_pawns.clone(), pawns0_len, true) else {
+                    let Some(indexer) = Board::index2(all_cards, board_no_pawns, pawns0_len, true) else {
                         break 'second;
                     };
-                    let board = indexer.clone().into_iter().next().unwrap();
-                    total += indexer.index(&board).total;
+                    total += indexer.total();
                 }
             }
         }

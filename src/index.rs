@@ -4,26 +4,25 @@ use std::iter::{self, once, Once};
 
 use bit_iter::BitIter;
 
-use crate::proj::{Mask, Proj};
+use crate::proj::{CountOnes, Mask, Proj};
 
-pub struct Index {
-    pub index: usize,
-    pub total: usize,
-}
+pub trait Indexer: IntoIterator + Sized + Clone {
+    fn index(&self, item: &Self::Item) -> usize;
 
-pub trait Indexer: IntoIterator + Sized {
-    fn index(&self, board: &Self::Item) -> Index;
+    fn total(&self) -> usize;
 
     fn choose_one<V, M>(self, proj: V, mask: M) -> Flatten<Self, V, M, ChooseOne>
     where
         V: Proj<Self::Item, Output = u8>,
-        M: Mask<Self::Item, Output = u32>,
+        M: Mask<Self::Item>,
     {
+        let item = self.clone().into_iter().next().unwrap();
+        let mask_size = mask.get_mask(&item).count_ones() as u8;
         Flatten {
             inner: self,
             proj,
             mask,
-            gen: ChooseOne,
+            gen: ChooseOne { mask_size },
         }
     }
 
@@ -32,11 +31,16 @@ pub trait Indexer: IntoIterator + Sized {
         V: Proj<Self::Item>,
         M: Mask<Self::Item>,
     {
+        let item = self.clone().into_iter().next().unwrap();
+        let mask_size = mask.get_mask(&item).count_ones() as u8;
         Flatten {
             inner: self,
             proj,
             mask,
-            gen: ChooseExact { count: n },
+            gen: ChooseExact {
+                count: n,
+                mask_size,
+            },
         }
     }
 }
@@ -53,9 +57,13 @@ impl<T> IntoIterator for Empty<T> {
     }
 }
 
-impl<T> Indexer for Empty<T> {
-    fn index(&self, _: &Self::Item) -> Index {
-        Index { index: 0, total: 1 }
+impl<T: Clone> Indexer for Empty<T> {
+    fn index(&self, _: &Self::Item) -> usize {
+        0
+    }
+
+    fn total(&self) -> usize {
+        1
     }
 }
 
@@ -96,26 +104,30 @@ where
     G: Gen<M::Output, V::Output>,
     I::Item: Clone,
 {
-    fn index(&self, board: &I::Item) -> Index {
+    fn index(&self, board: &I::Item) -> usize {
         let this = self.inner.index(board);
         let mask: M::Output = self.mask.get_mask(board);
         let field: &V::Output = self.proj.proj_ref(board);
         let other = self.gen.index(mask, field);
-        Index {
-            index: this.index * other.total + other.index,
-            total: this.total * other.total,
-        }
+        this * self.gen.total() + other
+    }
+
+    fn total(&self) -> usize {
+        self.inner.total() * self.gen.total()
     }
 }
 
-trait Gen<M, F> {
+trait Gen<M, F>: Clone {
     type GenIter: Iterator<Item = F>;
     fn gen_iter(&self, mask: M) -> Self::GenIter;
-    fn index(&self, mask: M, field: &F) -> Index;
+    fn index(&self, mask: M, field: &F) -> usize;
+    fn total(&self) -> usize;
 }
 
 #[derive(Clone, Copy)]
-pub struct ChooseOne;
+pub struct ChooseOne {
+    mask_size: u8,
+}
 
 impl Gen<u32, u8> for ChooseOne {
     type GenIter = impl Iterator<Item = u8>;
@@ -126,20 +138,23 @@ impl Gen<u32, u8> for ChooseOne {
         BitIter::from(mask).map(|offset| offset as u8)
     }
 
-    fn index(&self, mask: u32, offset: &u8) -> Index {
+    fn index(&self, mask: u32, offset: &u8) -> usize {
+        debug_assert_eq!(mask.count_ones() as u8, self.mask_size);
         debug_assert_eq!((1 << *offset) & !mask, 0);
 
         let mask_less = (1 << *offset) - 1;
-        Index {
-            index: (mask_less & mask).count_ones() as usize,
-            total: mask.count_ones() as usize,
-        }
+        (mask_less & mask).count_ones() as usize
+    }
+
+    fn total(&self) -> usize {
+        self.mask_size as usize
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct ChooseExact {
     count: u8,
+    mask_size: u8,
 }
 
 macro_rules! gen_impl {
@@ -148,6 +163,7 @@ macro_rules! gen_impl {
             type GenIter = impl Iterator<Item = $t>;
 
             fn gen_iter(&self, mask: $t) -> Self::GenIter {
+                debug_assert_eq!(mask.count_ones() as u8, self.mask_size);
                 debug_assert!(self.count < 6);
                 assert!(self.count <= mask.count_ones() as u8);
 
@@ -178,20 +194,21 @@ macro_rules! gen_impl {
                 })
             }
 
-            fn index(&self, mask: $t, vals: &$t) -> Index {
+            fn index(&self, mask: $t, vals: &$t) -> usize {
                 debug_assert_eq!(vals.count_ones() as u8, self.count);
                 debug_assert_eq!(vals & !mask, 0);
 
-                Index {
-                    index: index_exact(*vals as u32, mask as u32),
-                    total: comb_exact(mask.count_ones(), vals.count_ones()),
-                }
+                index_exact(*vals as u32, mask as u32)
+            }
+
+            fn total(&self) -> usize {
+                comb_exact(self.mask_size as u32, self.count as u32)
             }
         }
     )*}
 }
 
-gen_impl! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
+gen_impl! { u16 u32 }
 
 pub fn index_exact(vals: u32, mask: u32) -> usize {
     debug_assert_eq!(vals & !mask, 0);
@@ -224,20 +241,25 @@ mod tests {
 
     #[test]
     fn comb_some() {
-        let indexer = ChooseExact { count: 2 };
         let mask = 0b101111u16;
+        let indexer = ChooseExact {
+            count: 2,
+            mask_size: mask.count_ones() as u8,
+        };
         indexer
             .gen_iter(mask)
-            .for_each(|x| println!("{x:06b} with id {}", indexer.index(mask, &x).index))
+            .for_each(|x| println!("{x:06b} with id {}", indexer.index(mask, &x)))
     }
 
     #[test]
     fn comb_one() {
-        let indexer = ChooseOne;
         let mask = 0b101111u32;
+        let indexer = ChooseOne {
+            mask_size: mask.count_ones() as u8,
+        };
         indexer
             .gen_iter(mask)
-            .for_each(|x| println!("{x} with id {}", indexer.index(mask, &x).index))
+            .for_each(|x| println!("{x} with id {}", indexer.index(mask, &x)))
     }
 
     #[test]
@@ -255,7 +277,7 @@ mod tests {
                 0b1111u32 & !b.one & !b.two
             });
         for (i, x) in indexer.clone().into_iter().enumerate() {
-            assert_eq!(i, indexer.index(&x).index)
+            assert_eq!(i, indexer.index(&x))
         }
     }
 }

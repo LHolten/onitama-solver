@@ -44,11 +44,11 @@ macro_rules! proj {
 }
 
 pub trait Mask<A>: Copy {
-    type Output: Copy;
+    type Output: CountOnes;
     fn get_mask(self, board: &A) -> Self::Output;
 }
 
-impl<F: Fn(&A) -> O + Copy, A, O: Copy> Mask<A> for F {
+impl<O: CountOnes, F: Fn(&A) -> O + Copy, A> Mask<A> for F {
     type Output = O;
 
     fn get_mask(self, board: &A) -> Self::Output {
@@ -56,8 +56,18 @@ impl<F: Fn(&A) -> O + Copy, A, O: Copy> Mask<A> for F {
     }
 }
 
+pub trait CountOnes: Copy {
+    fn count_ones(self) -> u32;
+}
+
 macro_rules! mask_impl {
     ($($t:ty)*) => {$(
+        impl CountOnes for $t {
+            fn count_ones(self) -> u32 {
+                self.count_ones()
+            }
+        }
+
         impl<A> Mask<A> for $t {
             type Output = $t;
 

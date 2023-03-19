@@ -6,8 +6,9 @@ mod card;
 mod index;
 mod onitama;
 // mod ply;
+mod onitama2;
 mod proj;
-mod table;
+// mod table;
 
 use anf::Anf;
 use board::Board;
