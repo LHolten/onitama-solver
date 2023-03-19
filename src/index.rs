@@ -102,8 +102,8 @@ where
         let field: &V::Output = self.proj.proj_ref(board);
         let other = self.gen.index(mask, field);
         Index {
-            index: this.index * other.total as usize + other.index as usize,
-            total: this.total * other.total as usize,
+            index: this.index * other.total + other.index,
+            total: this.total * other.total,
         }
     }
 }
@@ -121,10 +121,14 @@ impl Gen<u32, u8> for ChooseOne {
     type GenIter = impl Iterator<Item = u8>;
 
     fn gen_iter(&self, mask: u32) -> Self::GenIter {
+        debug_assert_ne!(mask, 0);
+
         BitIter::from(mask).map(|offset| offset as u8)
     }
 
     fn index(&self, mask: u32, offset: &u8) -> Index {
+        debug_assert_eq!((1 << *offset) & !mask, 0);
+
         let mask_less = (1 << *offset) - 1;
         Index {
             index: (mask_less & mask).count_ones() as usize,
@@ -144,10 +148,10 @@ macro_rules! gen_impl {
             type GenIter = impl Iterator<Item = $t>;
 
             fn gen_iter(&self, mask: $t) -> Self::GenIter {
-                debug_assert!(self.count < 5);
+                debug_assert!(self.count < 6);
                 assert!(self.count <= mask.count_ones() as u8);
 
-                let mut lookup: [$t; 5] = [0; 5];
+                let mut lookup: [$t; 6] = [0; 6];
                 let mut entry = !mask;
                 for i in 0..=self.count as usize {
                     lookup[self.count as usize - i] = entry;
@@ -175,6 +179,9 @@ macro_rules! gen_impl {
             }
 
             fn index(&self, mask: $t, vals: &$t) -> Index {
+                debug_assert_eq!(vals.count_ones() as u8, self.count);
+                debug_assert_eq!(vals & !mask, 0);
+
                 Index {
                     index: index_exact(*vals as u32, mask as u32),
                     total: comb_exact(mask.count_ones(), vals.count_ones()),
@@ -199,7 +206,7 @@ pub fn index_exact(vals: u32, mask: u32) -> usize {
 }
 
 pub fn comb_exact(num_less: u32, count: u32) -> usize {
-    if count as u32 > num_less {
+    if count > num_less {
         return 0;
     }
 
