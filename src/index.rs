@@ -19,7 +19,7 @@ pub trait Indexer: IntoIterator + Sized + Clone {
         let item = self.clone().into_iter().next().unwrap();
         let mask_size = mask.get_mask(&item).count_ones() as u8;
         Flatten {
-            inner: self,
+            outer: self,
             proj,
             mask,
             gen: ChooseOne { mask_size },
@@ -34,7 +34,7 @@ pub trait Indexer: IntoIterator + Sized + Clone {
         let item = self.clone().into_iter().next().unwrap();
         let mask_size = mask.get_mask(&item).count_ones() as u8;
         Flatten {
-            inner: self,
+            outer: self,
             proj,
             mask,
             gen: ChooseExact {
@@ -69,7 +69,7 @@ impl<T: Clone> Indexer for Empty<T> {
 
 #[derive(Clone)]
 pub struct Flatten<I, V, M, G> {
-    inner: I,
+    outer: I,
     proj: V,
     mask: M,
     gen: G,
@@ -86,7 +86,7 @@ where
     type IntoIter = impl Iterator<Item = Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.inner.into_iter().flat_map(move |board: I::Item| {
+        self.outer.into_iter().flat_map(move |board: I::Item| {
             let mask: M::Output = self.mask.get_mask(&board);
             self.gen.gen_iter(mask).map(move |field: V::Output| {
                 let mut new = board.clone();
@@ -105,15 +105,15 @@ where
     I::Item: Clone,
 {
     fn index(&self, board: &I::Item) -> usize {
-        let this = self.inner.index(board);
+        let outer_index = self.outer.index(board);
         let mask: M::Output = self.mask.get_mask(board);
         let field: &V::Output = self.proj.proj_ref(board);
-        let other = self.gen.index(mask, field);
-        this * self.gen.total() + other
+        let gen_index = self.gen.index(mask, field);
+        outer_index * self.gen.total() + gen_index
     }
 
     fn total(&self) -> usize {
-        self.inner.total() * self.gen.total()
+        self.outer.total() * self.gen.total()
     }
 }
 

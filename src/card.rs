@@ -6,8 +6,19 @@ use seq_macro::seq;
 #[inline]
 pub(crate) fn cards_mask<const S: bool>(offset: u8, cards: u16) -> u32 {
     let bitmap = get_bitmap::<S>(cards);
-    let new = bitmap & BOARD_MASK[offset as usize];
+    offset_mask(offset, bitmap)
+}
+
+#[inline]
+pub(crate) fn offset_mask(offset: u8, mask: u32) -> u32 {
+    let new = mask & BOARD_MASK[offset as usize];
     ((new as u64) << 12 >> offset) as u32
+}
+
+/// this method is used to get the orginal mask after using [offset_mask]
+#[inline]
+pub(crate) fn undo_offset(offset: u8, mask: u32) -> u32 {
+    ((mask as u64) << offset >> 12) as u32
 }
 
 #[allow(clippy::unusual_byte_groupings)]
