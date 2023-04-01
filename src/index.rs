@@ -165,7 +165,7 @@ macro_rules! gen_impl {
             fn gen_iter(&self, mask: $t) -> Self::GenIter {
                 debug_assert_eq!(mask.count_ones() as u8, self.mask_size);
                 debug_assert!(self.count < 6);
-                assert!(self.count <= mask.count_ones() as u8);
+                debug_assert!(self.count <= mask.count_ones() as u8);
 
                 let mut lookup: [$t; 6] = [0; 6];
                 let mut entry = !mask;

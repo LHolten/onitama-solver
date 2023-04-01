@@ -33,7 +33,7 @@ struct PawnCount {
 impl PawnCount {
     fn indexer(&self) -> impl Indexer<Item = TeamLayout> {
         type L = TeamLayout;
-        let pieces1_mask = |l: &L| TABLE_MASK & !l.pieces0;
+        let pieces1_mask = |l: &L| TABLE_MASK & !(l.pieces0.reverse_bits() >> 7);
         Empty::default()
             .choose(self.count0 + 1, proj!(|l: L| l.pieces0), TABLE_MASK)
             .choose(self.count1 + 1, proj!(|l: L| l.pieces1), pieces1_mask)
@@ -147,8 +147,6 @@ impl AllTables {
             pieces1: old.pieces0 ^ (1 << to) ^ (1 << from),
         };
 
-        let new_slice = self.index(new);
-
         for (i, oldk) in old.indexer().into_iter().enumerate() {
             if oldk.king1 == 24 - to {
                 // king is gone, so old state is not lost
@@ -163,7 +161,7 @@ impl AllTables {
                 newk.king1 = to
             }
             // if new state is not won, then old state is not lost
-            accum.slice[i].0 |= !new_slice[newk].load(Ordering::Relaxed) & accum.mask;
+            accum.slice[i].0 |= !self.index(new)[newk].load(Ordering::Relaxed) & accum.mask;
         }
     }
 
@@ -178,19 +176,17 @@ impl AllTables {
             pieces1: old.pieces0,
         };
 
-        let new_slice = self.index(new);
-
         let mut progress = false;
         for (i, oldk) in old.indexer().into_iter().enumerate() {
             let mut newk = KingPos {
                 king0: oldk.king1,
                 king1: oldk.king0,
             };
-            if oldk.king0 == from {
-                newk.king1 = to
+            if oldk.king1 == from {
+                newk.king0 = to
             }
             // if accum state is lost, then new state is won
-            let fetch = new_slice[newk].fetch_or(!spread.slice[i].0, Ordering::Relaxed);
+            let fetch = self.index(new)[newk].fetch_or(!spread.slice[i].0, Ordering::Relaxed);
             if fetch | !spread.slice[i].0 != fetch {
                 progress = true;
             }
@@ -202,8 +198,6 @@ impl AllTables {
 
         new.pieces1 |= 1 << from;
 
-        let new_slice = self.index(new);
-
         for (i, oldk) in old.indexer().into_iter().enumerate() {
             let mut newk = KingPos {
                 king0: oldk.king1,
@@ -213,7 +207,7 @@ impl AllTables {
                 newk.king1 = to
             }
             // if accum state is lost, then new state is won
-            new_slice[newk].fetch_or(!spread.slice[i].0, Ordering::Relaxed);
+            self.index(new)[newk].fetch_or(!spread.slice[i].0, Ordering::Relaxed);
         }
         progress
     }
@@ -261,9 +255,9 @@ impl AllTables {
 
             for offset in BitIter::from(directions) {
                 // these are backwards moves, so `to` is the where the piece came from
-                let to_mask = offset_mask(offset as u8, pieces0);
+                let to_mask = offset_mask(offset as u8, pieces1);
                 // can not move onto your own pieces or opp pieces
-                let to_mask = to_mask & !pieces0 & !pieces1;
+                let to_mask = to_mask & !(pieces0.reverse_bits() >> 7) & !pieces1;
 
                 for to in BitIter::from(to_mask) {
                     let from = to + offset - 12;
@@ -364,5 +358,22 @@ impl Block {
         let data = data << 10 | data << 20;
         let data = data | data >> 30;
         Self(data as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AllTables, PawnCount};
+
+    #[test]
+    fn build_tb() {
+        let tb = AllTables::build(1, 0b11111);
+    }
+
+    #[test]
+    fn counts0() {
+        for layout in PawnCount::default().indexer() {
+            dbg!(layout);
+        }
     }
 }
