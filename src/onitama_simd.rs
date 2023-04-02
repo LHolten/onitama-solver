@@ -103,6 +103,14 @@ impl AllTables {
         let slice = &self.index_count(counts)[step_size * i..step_size * (i + 1)];
         SubTable { layout, slice }
     }
+
+    fn count_ones(&self) -> u64 {
+        self.list
+            .iter()
+            .flat_map(|l| l.iter())
+            .map(|x| x.load(Ordering::Relaxed).count_ones() as u64)
+            .sum()
+    }
 }
 
 // contains results for only one layout
@@ -271,20 +279,19 @@ impl AllTables {
 
     pub fn mark_ez_win(&self, counts: PawnCount) {
         for layout in counts.indexer() {
-            let inv_layout = layout.invert();
-            let TeamLayout { pieces0, pieces1 } = inv_layout;
+            let TeamLayout { pieces0, pieces1 } = layout;
 
             for (card, mask) in zip(self.cards.iter(), mask_iter()) {
-                let from_mask = offset_mask(22, card.bitmap::<true>());
+                let from_mask = offset_mask(22, card.bitmap::<false>());
 
-                for (i, kpos) in inv_layout.indexer().into_iter().enumerate() {
-                    if 1 << kpos.king0 & !from_mask == 0 {
+                for (i, kpos) in layout.indexer().into_iter().enumerate() {
+                    if 1 << kpos.king1 & !from_mask == 0 {
                         self.index(layout).slice[i]
                             .fetch_or(Block(mask).expand().0, Ordering::Relaxed);
                         continue;
                     }
-                    let from_mask = offset_mask(kpos.king1 as usize, card.bitmap::<true>());
-                    if from_mask & pieces0 != 0 {
+                    let from_mask = offset_mask(kpos.king0 as usize, card.bitmap::<false>());
+                    if from_mask & pieces1 != 0 {
                         self.index(layout).slice[i]
                             .fetch_or(Block(mask).expand().0, Ordering::Relaxed);
                     }
@@ -380,6 +387,8 @@ mod tests {
     #[test]
     fn build_tb() {
         let tb = AllTables::build(2, 0b11111);
+        assert_eq!(tb.count_ones(), 10617550);
+        // println!("{} wins", tb.count_ones())
     }
 
     #[test]
