@@ -15,6 +15,12 @@ pub(crate) fn offset_mask(offset: usize, mask: u32) -> u32 {
     ((new as u64) << 12 >> offset) as u32
 }
 
+#[inline]
+pub(crate) fn offset_mask_fixed(offset: usize, mask: u32) -> u32 {
+    let new = mask & BOARD_MASK[24 - offset];
+    ((new as u64) << offset >> 12) as u32
+}
+
 /// this method is used to get the orginal mask after using [offset_mask]
 // #[inline]
 // pub(crate) fn undo_offset(offset: u8, mask: u32) -> u32 {

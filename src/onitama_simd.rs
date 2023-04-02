@@ -10,7 +10,7 @@ use std::{
 use bit_iter::BitIter;
 
 use crate::{
-    card::{get_one_bitmap, offset_mask},
+    card::{get_one_bitmap, offset_mask_fixed as offset_mask},
     index::{Empty, Indexer},
     onitama2::TABLE_MASK,
     proj,
@@ -204,8 +204,8 @@ impl AllTables {
                 newk.king1 = to as u8
             }
             // if accum state is lost, then new state is won
-            let fetch = self.index(new)[newk].fetch_or(!spread.slice[i], Ordering::Relaxed);
-            if fetch | !spread.slice[i] != fetch {
+            let fetch = self.index(new)[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
+            if fetch | spread.slice[i] != fetch {
                 progress = true;
             }
         }
@@ -224,7 +224,7 @@ impl AllTables {
                 newk.king1 = to as u8
             }
             // if accum state is lost, then new state is won
-            self.index(new)[newk].fetch_or(!spread.slice[i], Ordering::Relaxed);
+            self.index(new)[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
         }
         progress
     }
@@ -254,7 +254,7 @@ impl AllTables {
                 let to_mask = to_mask & !pieces0;
 
                 for to in BitIter::from(to_mask) {
-                    let from = to + offset - 12;
+                    let from = to + 12 - offset;
                     let accum = Accum {
                         layout,
                         step: (from, to),
@@ -266,12 +266,15 @@ impl AllTables {
             }
         }
 
+        // we expand, marking all states that are not lost because it has the card
+        // then we negate to get only the lost states
         status
             .iter_mut()
-            .for_each(|x| *x = Block(*x).invert().expand().invert().0);
+            .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
 
         let mut progress = false;
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
+            // we spread out the loses, these are wins for the previous state
             let tmp: Box<[u32]> = status
                 .iter()
                 .map(|x| Block(x & mask).expand().0 & ((1 << 30) - 1))
@@ -287,7 +290,7 @@ impl AllTables {
                 let to_mask = to_mask & !pieces0 & !pieces1;
 
                 for to in BitIter::from(to_mask) {
-                    let from = to + offset - 12;
+                    let from = to + 12 - offset;
                     let spread = Spread {
                         layout,
                         step: (from, to),
@@ -305,7 +308,7 @@ impl AllTables {
             let TeamLayout { pieces0, pieces1 } = layout;
 
             for (card, mask) in zip(self.cards.iter(), mask_iter()) {
-                let from_mask = offset_mask(22, card.bitmap::<false>());
+                let from_mask = offset_mask(2, card.bitmap::<false>());
 
                 for (i, kpos) in layout.indexer().into_iter().enumerate() {
                     if 1 << kpos.king1 & !from_mask == 0 {
@@ -418,7 +421,7 @@ mod tests {
     #[test]
     fn build_tb() {
         let tb = AllTables::build(2, 0b11111);
-        assert_eq!(tb.count_ones(), 9953940);
+        assert_eq!(tb.count_ones(), 5697226);
         println!("{} total", tb.len() * 30)
     }
 
