@@ -77,6 +77,15 @@ struct KingPos {
     king1: u8,
 }
 
+impl KingPos {
+    fn invert(self) -> Self {
+        Self {
+            king0: 24 - self.king1,
+            king1: 24 - self.king0,
+        }
+    }
+}
+
 // contains all the results up to some number of pieces
 struct AllTables {
     size: u8,
@@ -112,7 +121,7 @@ impl AllTables {
             .sum()
     }
 
-    fn len(self) -> u64 {
+    fn len(&self) -> u64 {
         self.list.iter().map(|l| l.len() as u64).sum()
     }
 }
@@ -139,7 +148,7 @@ struct Accum<'a> {
     layout: TeamLayout,
     mask: u32,
     step: (usize, usize),
-    slice: &'a mut [Block],
+    slice: &'a mut [u32],
 }
 
 struct Spread<'a> {
@@ -162,7 +171,7 @@ impl AllTables {
         for (i, oldk) in old.indexer().into_iter().enumerate() {
             if oldk.king1 as usize == to {
                 // king is gone, so old state is not lost
-                accum.slice[i].0 |= accum.mask;
+                accum.slice[i] |= accum.mask;
                 continue;
             }
 
@@ -171,7 +180,7 @@ impl AllTables {
                 newk.king0 = to as u8
             }
             // if new state is not won, then old state is not lost
-            accum.slice[i].0 |= !self.index(new)[newk].load(Ordering::Relaxed) & accum.mask;
+            accum.slice[i] |= !self.index(new)[newk].load(Ordering::Relaxed) & accum.mask;
         }
     }
 
@@ -227,9 +236,14 @@ impl AllTables {
         // every 0 bit means that it could be anything, win loss or draw
         // every 1 bit means that it must be a draw or win
         // we will gradually flip these to 1s, leaving only losses on 0
-        let layout_indexer = layout.indexer();
-        let mut status =
-            vec![Block(0); layout_indexer.total(&layout_indexer.gen_one())].into_boxed_slice();
+        // it is initialized to the wins, because those are not lost even when they don't have moves
+        let inv_layout = layout.invert();
+        let inv_slice = self.index(inv_layout);
+        let mut status: Box<[u32]> = layout
+            .indexer()
+            .into_iter()
+            .map(|kpos| inv_slice[kpos.invert()].load(Ordering::Relaxed))
+            .collect();
 
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             let directions = card.bitmap::<false>();
@@ -254,13 +268,13 @@ impl AllTables {
 
         status
             .iter_mut()
-            .for_each(|x| *x = x.invert().expand().invert());
+            .for_each(|x| *x = Block(*x).invert().expand().invert().0);
 
         let mut progress = false;
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             let tmp: Box<[u32]> = status
                 .iter()
-                .map(|x| Block(x.0 & mask).expand().0 & ((1 << 30) - 1))
+                .map(|x| Block(x & mask).expand().0 & ((1 << 30) - 1))
                 .collect();
             // same thing, but cards are now inverted
             // but it is also the other team, so not inverted
@@ -327,13 +341,21 @@ impl AllTables {
 
         for counts in count_indexer(size) {
             tb.mark_ez_win(counts);
+        }
+
+        println!("{} wins and {} total", tb.count_ones(), tb.len() * 30);
+
+        for counts in count_indexer(size) {
+            let mut iters = 0;
             let mut progress = true;
             while progress {
                 progress = false;
                 for layout in counts.indexer() {
                     progress |= tb.update_layout(layout);
                 }
+                iters += 1;
             }
+            println!("finished {counts:?} in {iters} iterations");
         }
 
         tb
@@ -396,7 +418,7 @@ mod tests {
     #[test]
     fn build_tb() {
         let tb = AllTables::build(2, 0b11111);
-        assert_eq!(tb.count_ones(), 9953952);
+        assert_eq!(tb.count_ones(), 9953940);
         println!("{} total", tb.len() * 30)
     }
 
