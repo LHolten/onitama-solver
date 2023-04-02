@@ -4,7 +4,7 @@
 mod anf;
 mod card;
 mod index;
-mod onitama;
+// mod onitama;
 // mod ply;
 mod onitama2;
 mod onitama_simd;

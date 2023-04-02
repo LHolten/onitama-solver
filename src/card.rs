@@ -6,20 +6,20 @@ use seq_macro::seq;
 #[inline]
 pub(crate) fn cards_mask<const S: bool>(offset: u8, cards: u16) -> u32 {
     let bitmap = get_bitmap::<S>(cards);
-    offset_mask(offset, bitmap)
+    offset_mask(offset as usize, bitmap)
 }
 
 #[inline]
-pub(crate) fn offset_mask(offset: u8, mask: u32) -> u32 {
-    let new = mask & BOARD_MASK[offset as usize];
+pub(crate) fn offset_mask(offset: usize, mask: u32) -> u32 {
+    let new = mask & BOARD_MASK[offset];
     ((new as u64) << 12 >> offset) as u32
 }
 
 /// this method is used to get the orginal mask after using [offset_mask]
-#[inline]
-pub(crate) fn undo_offset(offset: u8, mask: u32) -> u32 {
-    ((mask as u64) << offset >> 12) as u32
-}
+// #[inline]
+// pub(crate) fn undo_offset(offset: u8, mask: u32) -> u32 {
+//     ((mask as u64) << offset >> 12) as u32
+// }
 
 #[allow(clippy::unusual_byte_groupings)]
 const BOARD_MASK: [u32; 25] = [
@@ -50,8 +50,7 @@ const BOARD_MASK: [u32; 25] = [
     0b11100_11100_11100_00000_00000,
 ];
 
-// card masks are ordered from top to bottom
-pub(crate) fn get_bitmap<const S: bool>(cards: u16) -> u32 {
+pub(crate) fn get_one_bitmap<const S: bool>(card: usize) -> u32 {
     #[allow(clippy::unusual_byte_groupings)]
     const CARD_MAP_0: [u32; 16] = [
         0b00000_00100_00010_00100_00000,
@@ -76,9 +75,13 @@ pub(crate) fn get_bitmap<const S: bool>(cards: u16) -> u32 {
             #(reverse_bitmap(CARD_MAP_0[C]),)*
         ]
     });
+    [CARD_MAP_0, CARD_MAP_1][S as usize][card]
+}
 
+// card masks are ordered from top to bottom
+pub(crate) fn get_bitmap<const S: bool>(cards: u16) -> u32 {
     let mut mask = 0;
-    BitIter::from(cards).for_each(|card| mask |= [CARD_MAP_0, CARD_MAP_1][S as usize][card]);
+    BitIter::from(cards).for_each(|card| mask |= get_one_bitmap::<S>(card));
     mask
 }
 

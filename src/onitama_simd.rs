@@ -10,7 +10,7 @@ use std::{
 use bit_iter::BitIter;
 
 use crate::{
-    card::{cards_mask, get_bitmap, offset_mask, undo_offset},
+    card::{get_one_bitmap, offset_mask},
     index::{Empty, Indexer},
     onitama2::TABLE_MASK,
     proj,
@@ -33,7 +33,7 @@ struct PawnCount {
 impl PawnCount {
     fn indexer(&self) -> impl Indexer<Item = TeamLayout> {
         type L = TeamLayout;
-        let pieces1_mask = |l: &L| TABLE_MASK & !(l.pieces0.reverse_bits() >> 7);
+        let pieces1_mask = |l: &L| TABLE_MASK & !l.pieces0;
         Empty::default()
             .choose(self.count0 + 1, proj!(|l: L| l.pieces0), TABLE_MASK)
             .choose(self.count1 + 1, proj!(|l: L| l.pieces1), pieces1_mask)
@@ -61,6 +61,13 @@ impl TeamLayout {
             count1: self.pieces1.count_ones() as u8 - 1,
         }
     }
+
+    fn invert(self) -> Self {
+        TeamLayout {
+            pieces0: self.pieces1.reverse_bits() >> 7,
+            pieces1: self.pieces0.reverse_bits() >> 7,
+        }
+    }
 }
 
 // the positions of the kings
@@ -70,17 +77,10 @@ struct KingPos {
     king1: u8,
 }
 
-// the cards held by each player
-#[derive(Debug, Default, Clone, Copy)]
-struct CardConfig {
-    cards0: u16,
-    cards1: u16,
-}
-
 // contains all the results up to some number of pieces
 struct AllTables {
     size: u8,
-    cards: u16,
+    cards: Cards,
     list: Box<[Box<[AtomicU32]>]>,
 }
 
@@ -126,13 +126,13 @@ impl Index<KingPos> for SubTable<'_> {
 struct Accum<'a> {
     layout: TeamLayout,
     mask: u32,
-    step: (u8, u8),
+    step: (usize, usize),
     slice: &'a mut [Block],
 }
 
 struct Spread<'a> {
     layout: TeamLayout,
-    step: (u8, u8),
+    step: (usize, usize),
     slice: &'a [Block],
 }
 
@@ -143,22 +143,20 @@ impl AllTables {
         let old = accum.layout;
 
         let new = TeamLayout {
-            pieces0: old.pieces1 & !(1 << 24 >> to),
-            pieces1: old.pieces0 ^ (1 << to) ^ (1 << from),
+            pieces0: old.pieces0 ^ (1 << to) ^ (1 << from),
+            pieces1: old.pieces1 & !(1 << to),
         };
 
         for (i, oldk) in old.indexer().into_iter().enumerate() {
-            if oldk.king1 == 24 - to {
+            if oldk.king1 as usize == to {
                 // king is gone, so old state is not lost
                 accum.slice[i].0 |= accum.mask;
                 continue;
             }
-            let mut newk = KingPos {
-                king0: oldk.king1,
-                king1: oldk.king0,
-            };
-            if oldk.king0 == from {
-                newk.king1 = to
+
+            let mut newk = oldk;
+            if oldk.king0 as usize == from {
+                newk.king0 = to as u8
             }
             // if new state is not won, then old state is not lost
             accum.slice[i].0 |= !self.index(new)[newk].load(Ordering::Relaxed) & accum.mask;
@@ -172,18 +170,17 @@ impl AllTables {
         let old = spread.layout;
 
         let mut new = TeamLayout {
-            pieces0: old.pieces1 ^ (1 << to) ^ (1 << from),
-            pieces1: old.pieces0,
+            pieces0: old.pieces0,
+            pieces1: old.pieces1 ^ (1 << to) ^ (1 << from),
         };
 
         let mut progress = false;
         for (i, oldk) in old.indexer().into_iter().enumerate() {
-            let mut newk = KingPos {
-                king0: oldk.king1,
-                king1: oldk.king0,
-            };
-            if oldk.king1 == from {
-                newk.king0 = to
+            debug_assert_ne!(oldk.king0 as usize, to);
+
+            let mut newk = oldk;
+            if oldk.king1 as usize == from {
+                newk.king1 = to as u8
             }
             // if accum state is lost, then new state is won
             let fetch = self.index(new)[newk].fetch_or(!spread.slice[i].0, Ordering::Relaxed);
@@ -199,12 +196,11 @@ impl AllTables {
         new.pieces1 |= 1 << from;
 
         for (i, oldk) in old.indexer().into_iter().enumerate() {
-            let mut newk = KingPos {
-                king0: oldk.king1,
-                king1: oldk.king0,
-            };
-            if oldk.king0 == from {
-                newk.king1 = to
+            debug_assert_ne!(oldk.king0 as usize, to);
+
+            let mut newk = oldk;
+            if oldk.king1 as usize == from {
+                newk.king1 = to as u8
             }
             // if accum state is lost, then new state is won
             self.index(new)[newk].fetch_or(!spread.slice[i].0, Ordering::Relaxed);
@@ -214,7 +210,6 @@ impl AllTables {
 
     // returns whether there was any progress
     pub fn update_layout(&self, layout: TeamLayout) -> bool {
-        let cards = self.cards;
         let TeamLayout { pieces0, pieces1 } = layout;
 
         // every 0 bit means that it could be anything, win loss or draw
@@ -222,11 +217,11 @@ impl AllTables {
         // we will gradually flip these to 1s, leaving only losses on 0
         let mut status = vec![Block(0); layout.indexer().total()].into_boxed_slice();
 
-        for (card, mask) in zip(BitIter::from(cards), mask_iter()) {
-            let directions = get_bitmap::<false>(1 << card);
+        for (card, mask) in zip(self.cards.iter(), mask_iter()) {
+            let directions = card.bitmap::<false>();
 
             for offset in BitIter::from(directions) {
-                let to_mask = offset_mask(offset as u8, pieces0);
+                let to_mask = offset_mask(offset, pieces0);
                 // can not move onto your own pieces
                 let to_mask = to_mask & !pieces0;
 
@@ -234,7 +229,7 @@ impl AllTables {
                     let from = to + offset - 12;
                     let accum = Accum {
                         layout,
-                        step: (from as u8, to as u8),
+                        step: (from, to),
                         slice: &mut status,
                         mask,
                     };
@@ -248,22 +243,23 @@ impl AllTables {
             .for_each(|x| *x = x.invert().expand().invert());
 
         let mut progress = false;
-        for (card, mask) in zip(BitIter::from(cards), mask_iter()) {
+        for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             let tmp: Box<[Block]> = status.iter().map(|x| Block(x.0 & mask).expand()).collect();
             // same thing, but cards are now inverted
-            let directions = get_bitmap::<true>(1 << card);
+            // but it is also the other team, so not inverted
+            let directions = card.bitmap::<false>();
 
             for offset in BitIter::from(directions) {
                 // these are backwards moves, so `to` is the where the piece came from
-                let to_mask = offset_mask(offset as u8, pieces1);
+                let to_mask = offset_mask(offset, pieces1);
                 // can not move onto your own pieces or opp pieces
-                let to_mask = to_mask & !(pieces0.reverse_bits() >> 7) & !pieces1;
+                let to_mask = to_mask & !pieces0 & !pieces1;
 
                 for to in BitIter::from(to_mask) {
                     let from = to + offset - 12;
                     let spread = Spread {
                         layout,
-                        step: (from as u8, to as u8),
+                        step: (from, to),
                         slice: &tmp,
                     };
                     progress |= self.spreadout(spread);
@@ -274,22 +270,20 @@ impl AllTables {
     }
 
     pub fn mark_ez_win(&self, counts: PawnCount) {
-        let cards = self.cards;
-
         for layout in counts.indexer() {
-            let TeamLayout { pieces0, pieces1 } = layout;
+            let inv_layout = layout.invert();
+            let TeamLayout { pieces0, pieces1 } = inv_layout;
 
-            for (card, mask) in zip(BitIter::from(cards), mask_iter()) {
-                let from_mask = cards_mask::<true>(22, 1 << card);
-                let my_king = from_mask & pieces0;
+            for (card, mask) in zip(self.cards.iter(), mask_iter()) {
+                let from_mask = offset_mask(22, card.bitmap::<true>());
 
-                for (i, kpos) in layout.indexer().into_iter().enumerate() {
-                    if 1 << kpos.king0 == my_king {
+                for (i, kpos) in inv_layout.indexer().into_iter().enumerate() {
+                    if 1 << kpos.king0 & !from_mask == 0 {
                         self.index(layout).slice[i]
                             .fetch_or(Block(mask).expand().0, Ordering::Relaxed);
                         continue;
                     }
-                    let from_mask = cards_mask::<true>(24 - kpos.king1, 1 << card);
+                    let from_mask = offset_mask(kpos.king1 as usize, card.bitmap::<true>());
                     if from_mask & pieces0 != 0 {
                         self.index(layout).slice[i]
                             .fetch_or(Block(mask).expand().0, Ordering::Relaxed);
@@ -302,7 +296,7 @@ impl AllTables {
     pub fn build(size: u8, cards: u16) -> Self {
         let tb = Self {
             size,
-            cards,
+            cards: Cards(cards),
             list: count_indexer(size)
                 .into_iter()
                 .map(|counts| {
@@ -361,13 +355,31 @@ impl Block {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Cards(u16);
+
+impl Cards {
+    fn iter(self) -> impl Iterator<Item = Card> {
+        BitIter::from(self.0).map(Card)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Card(usize);
+
+impl Card {
+    fn bitmap<const S: bool>(self) -> u32 {
+        get_one_bitmap::<S>(self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AllTables, PawnCount};
 
     #[test]
     fn build_tb() {
-        let tb = AllTables::build(1, 0b11111);
+        let tb = AllTables::build(2, 0b11111);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! list of things to prevent:
 //! - temple capture 1 and 2 plies
 //!   - keep in mind that if there is a pawn on the temple it is not a threat
@@ -12,7 +13,7 @@
 use bit_iter::BitIter;
 
 use crate::{
-    card::{cards_mask, get_bitmap},
+    card::cards_mask,
     index::{Empty, Indexer},
     proj,
 };
