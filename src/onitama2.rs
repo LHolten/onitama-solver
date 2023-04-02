@@ -175,14 +175,14 @@ fn count_perft2() {
                     let Some(indexer) = Board::index2(all_cards, board_no_pawns, pawns0_len, false) else {
                         break 'first;
                     };
-                    total += indexer.total();
+                    total += indexer.total(&indexer.gen_one());
                 }
 
                 'second: {
                     let Some(indexer) = Board::index2(all_cards, board_no_pawns, pawns0_len, true) else {
                         break 'second;
                     };
-                    total += indexer.total();
+                    total += indexer.total(&indexer.gen_one());
                 }
             }
         }

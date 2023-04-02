@@ -3,7 +3,7 @@
 use std::{
     iter::zip,
     mem::transmute,
-    ops::{Index, Shr},
+    ops::{BitAnd, Index, Shr},
     sync::atomic::{AtomicU32, Ordering},
 };
 
@@ -98,7 +98,7 @@ impl AllTables {
         let i = indexer.index(&layout);
 
         let king_indexer = layout.indexer();
-        let step_size = king_indexer.total();
+        let step_size = king_indexer.total(&king_indexer.gen_one());
 
         let slice = &self.index_count(counts)[step_size * i..step_size * (i + 1)];
         SubTable { layout, slice }
@@ -108,8 +108,12 @@ impl AllTables {
         self.list
             .iter()
             .flat_map(|l| l.iter())
-            .map(|x| x.load(Ordering::Relaxed).count_ones() as u64)
+            .map(|x| x.load(Ordering::Relaxed).bitand((1 << 30) - 1).count_ones() as u64)
             .sum()
+    }
+
+    fn len(self) -> u64 {
+        self.list.iter().map(|l| l.len() as u64).sum()
     }
 }
 
@@ -141,7 +145,7 @@ struct Accum<'a> {
 struct Spread<'a> {
     layout: TeamLayout,
     step: (usize, usize),
-    slice: &'a [Block],
+    slice: &'a [u32],
 }
 
 impl AllTables {
@@ -191,8 +195,8 @@ impl AllTables {
                 newk.king1 = to as u8
             }
             // if accum state is lost, then new state is won
-            let fetch = self.index(new)[newk].fetch_or(!spread.slice[i].0, Ordering::Relaxed);
-            if fetch | !spread.slice[i].0 != fetch {
+            let fetch = self.index(new)[newk].fetch_or(!spread.slice[i], Ordering::Relaxed);
+            if fetch | !spread.slice[i] != fetch {
                 progress = true;
             }
         }
@@ -211,7 +215,7 @@ impl AllTables {
                 newk.king1 = to as u8
             }
             // if accum state is lost, then new state is won
-            self.index(new)[newk].fetch_or(!spread.slice[i].0, Ordering::Relaxed);
+            self.index(new)[newk].fetch_or(!spread.slice[i], Ordering::Relaxed);
         }
         progress
     }
@@ -223,7 +227,9 @@ impl AllTables {
         // every 0 bit means that it could be anything, win loss or draw
         // every 1 bit means that it must be a draw or win
         // we will gradually flip these to 1s, leaving only losses on 0
-        let mut status = vec![Block(0); layout.indexer().total()].into_boxed_slice();
+        let layout_indexer = layout.indexer();
+        let mut status =
+            vec![Block(0); layout_indexer.total(&layout_indexer.gen_one())].into_boxed_slice();
 
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             let directions = card.bitmap::<false>();
@@ -252,7 +258,10 @@ impl AllTables {
 
         let mut progress = false;
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
-            let tmp: Box<[Block]> = status.iter().map(|x| Block(x.0 & mask).expand()).collect();
+            let tmp: Box<[u32]> = status
+                .iter()
+                .map(|x| Block(x.0 & mask).expand().0 & ((1 << 30) - 1))
+                .collect();
             // same thing, but cards are now inverted
             // but it is also the other team, so not inverted
             let directions = card.bitmap::<false>();
@@ -387,8 +396,8 @@ mod tests {
     #[test]
     fn build_tb() {
         let tb = AllTables::build(2, 0b11111);
-        assert_eq!(tb.count_ones(), 10617550);
-        // println!("{} wins", tb.count_ones())
+        assert_eq!(tb.count_ones(), 9953952);
+        println!("{} total", tb.len() * 30)
     }
 
     #[test]

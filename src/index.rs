@@ -3,26 +3,35 @@ use std::intrinsics::assume;
 use std::iter::{self, once, Once};
 
 use bit_iter::BitIter;
+use seq_macro::seq;
 
 use crate::proj::{CountOnes, Mask, Proj};
 
 pub trait Indexer: IntoIterator + Sized + Clone {
     fn index(&self, item: &Self::Item) -> usize;
 
-    fn total(&self) -> usize;
+    fn total(&self, item: &Self::Item) -> usize;
+
+    fn gen_one(&self) -> Self::Item;
 
     fn choose_one<V, M>(self, proj: V, mask: M) -> Flatten<Self, V, M, ChooseOne>
     where
         V: Proj<Self::Item, Output = u8>,
         M: Mask<Self::Item>,
     {
-        let item = self.clone().into_iter().next().unwrap();
-        let mask_size = mask.get_mask(&item).count_ones() as u8;
+        #[cfg(debug_assertions)]
+        let mask_size = {
+            let item = self.clone().into_iter().next().unwrap();
+            mask.get_mask(&item).count_ones()
+        };
         Flatten {
             outer: self,
             proj,
             mask,
-            gen: ChooseOne { mask_size },
+            gen: ChooseOne {
+                #[cfg(debug_assertions)]
+                mask_size,
+            },
         }
     }
 
@@ -31,14 +40,18 @@ pub trait Indexer: IntoIterator + Sized + Clone {
         V: Proj<Self::Item>,
         M: Mask<Self::Item>,
     {
-        let item = self.clone().into_iter().next().unwrap();
-        let mask_size = mask.get_mask(&item).count_ones() as u8;
+        #[cfg(debug_assertions)]
+        let mask_size = {
+            let item = self.clone().into_iter().next().unwrap();
+            mask.get_mask(&item).count_ones()
+        };
         Flatten {
             outer: self,
             proj,
             mask,
             gen: ChooseExact {
                 count: n,
+                #[cfg(debug_assertions)]
                 mask_size,
             },
         }
@@ -62,8 +75,12 @@ impl<T: Clone> Indexer for Empty<T> {
         0
     }
 
-    fn total(&self) -> usize {
+    fn total(&self, _: &Self::Item) -> usize {
         1
+    }
+
+    fn gen_one(&self) -> Self::Item {
+        self.0.clone()
     }
 }
 
@@ -104,16 +121,25 @@ where
     G: Gen<M::Output, V::Output>,
     I::Item: Clone,
 {
-    fn index(&self, board: &I::Item) -> usize {
-        let outer_index = self.outer.index(board);
-        let mask: M::Output = self.mask.get_mask(board);
-        let field: &V::Output = self.proj.proj_ref(board);
+    fn index(&self, item: &I::Item) -> usize {
+        let outer_index = self.outer.index(item);
+        let mask: M::Output = self.mask.get_mask(item);
+        let field: &V::Output = self.proj.proj_ref(item);
         let gen_index = self.gen.index(mask, field);
-        outer_index * self.gen.total() + gen_index
+        outer_index * self.gen.total(mask) + gen_index
     }
 
-    fn total(&self) -> usize {
-        self.outer.total() * self.gen.total()
+    fn total(&self, item: &I::Item) -> usize {
+        let mask = self.mask.get_mask(item);
+        self.outer.total(item) * self.gen.total(mask)
+    }
+
+    fn gen_one(&self) -> Self::Item {
+        let mut item = self.outer.gen_one();
+        let mask: M::Output = self.mask.get_mask(&item);
+        let field: V::Output = self.gen.gen_iter(mask).next().unwrap();
+        *(self.proj).proj_mut(&mut item) = field;
+        item
     }
 }
 
@@ -121,12 +147,13 @@ trait Gen<M, F>: Clone {
     type GenIter: Iterator<Item = F>;
     fn gen_iter(&self, mask: M) -> Self::GenIter;
     fn index(&self, mask: M, field: &F) -> usize;
-    fn total(&self) -> usize;
+    fn total(&self, mask: M) -> usize;
 }
 
 #[derive(Clone, Copy)]
 pub struct ChooseOne {
-    mask_size: u8,
+    #[cfg(debug_assertions)]
+    mask_size: u32,
 }
 
 impl Gen<u32, u8> for ChooseOne {
@@ -139,22 +166,26 @@ impl Gen<u32, u8> for ChooseOne {
     }
 
     fn index(&self, mask: u32, offset: &u8) -> usize {
-        debug_assert_eq!(mask.count_ones() as u8, self.mask_size);
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(mask.count_ones(), self.mask_size);
         debug_assert_eq!((1 << *offset) & !mask, 0);
 
         let mask_less = (1 << *offset) - 1;
         (mask_less & mask).count_ones() as usize
     }
 
-    fn total(&self) -> usize {
-        self.mask_size as usize
+    fn total(&self, mask: u32) -> usize {
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(self.mask_size, mask.count_ones());
+        mask.count_ones() as usize
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct ChooseExact {
     count: u8,
-    mask_size: u8,
+    #[cfg(debug_assertions)]
+    mask_size: u32,
 }
 
 macro_rules! gen_impl {
@@ -163,7 +194,8 @@ macro_rules! gen_impl {
             type GenIter = impl Iterator<Item = $t>;
 
             fn gen_iter(&self, mask: $t) -> Self::GenIter {
-                debug_assert_eq!(mask.count_ones() as u8, self.mask_size);
+                #[cfg(debug_assertions)]
+                debug_assert_eq!(mask.count_ones(), self.mask_size);
                 debug_assert!(self.count < 6);
                 debug_assert!(self.count <= mask.count_ones() as u8);
 
@@ -201,8 +233,11 @@ macro_rules! gen_impl {
                 index_exact(*vals as u32, mask as u32)
             }
 
-            fn total(&self) -> usize {
-                comb_exact(self.mask_size as u32, self.count as u32)
+            fn total(&self, mask: $t) -> usize {
+                #[cfg(debug_assertions)]
+                debug_assert_eq!(self.mask_size, mask.count_ones());
+
+                comb_exact(mask.count_ones(), self.count as u32)
             }
         }
     )*}
@@ -210,9 +245,7 @@ macro_rules! gen_impl {
 
 gen_impl! { u16 u32 }
 
-pub fn index_exact(vals: u32, mask: u32) -> usize {
-    debug_assert_eq!(vals & !mask, 0);
-
+fn index_exact(vals: u32, mask: u32) -> usize {
     let mut i = 0;
     for (count, offset) in BitIter::from(vals).enumerate() {
         let mask_less = (1 << offset) - 1;
@@ -222,14 +255,28 @@ pub fn index_exact(vals: u32, mask: u32) -> usize {
     i
 }
 
-pub fn comb_exact(num_less: u32, count: u32) -> usize {
-    if count > num_less {
-        return 0;
+fn comb_exact(num_less: u32, count: u32) -> usize {
+    const fn comb_exact_inner(num_less: usize, count: usize) -> usize {
+        if count > num_less {
+            return 0;
+        }
+
+        if count == 0 {
+            return 1;
+        }
+
+        num_less * comb_exact_inner(num_less - 1, count - 1) / count
     }
 
-    let n: u64 = (0..count as u64).map(|i| num_less as u64 - i).product();
-    let d: u64 = (1..=count as u64).product();
-    (n / d) as usize
+    const RES: [[usize; 6]; 26] = seq!(num_less in 0..26 {
+        [#(
+            seq!(count in 0..6 {
+                [#(comb_exact_inner(num_less, count),)*]
+            })
+        ,)*]
+    });
+
+    RES[num_less as usize][count as usize]
 }
 
 #[cfg(test)]
@@ -244,7 +291,8 @@ mod tests {
         let mask = 0b101111u16;
         let indexer = ChooseExact {
             count: 2,
-            mask_size: mask.count_ones() as u8,
+            #[cfg(debug_assertions)]
+            mask_size: mask.count_ones(),
         };
         indexer
             .gen_iter(mask)
@@ -255,7 +303,8 @@ mod tests {
     fn comb_one() {
         let mask = 0b101111u32;
         let indexer = ChooseOne {
-            mask_size: mask.count_ones() as u8,
+            #[cfg(debug_assertions)]
+            mask_size: mask.count_ones(),
         };
         indexer
             .gen_iter(mask)
