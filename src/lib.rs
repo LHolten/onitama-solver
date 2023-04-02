@@ -8,7 +8,7 @@ mod index;
 // mod onitama;
 // mod ply;
 mod onitama2;
-mod onitama_simd;
+pub mod onitama_simd;
 mod proj;
 // mod table;
 

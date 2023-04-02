@@ -43,7 +43,7 @@ macro_rules! proj {
     }};
 }
 
-pub trait Mask<A>: Copy {
+pub(crate) trait Mask<A>: Copy {
     type Output: CountOnes;
     fn get_mask(self, board: &A) -> Self::Output;
     fn get_size(self) -> u32;
@@ -61,13 +61,14 @@ impl<O: CountOnes, F: Fn(&A) -> O + Copy, A> Mask<A> for (F, u32) {
     }
 }
 
-pub trait CountOnes: Copy {
+pub(crate) trait CountOnes: Copy {
     fn count_ones(self) -> u32;
 }
 
 macro_rules! mask_impl {
     ($($t:ty)*) => {$(
         impl CountOnes for $t {
+            #[inline(always)]
             fn count_ones(self) -> u32 {
                 self.count_ones()
             }
@@ -76,10 +77,12 @@ macro_rules! mask_impl {
         impl<A> Mask<A> for $t {
             type Output = $t;
 
+            #[inline(always)]
             fn get_mask(self, _: &A) -> Self::Output {
                 self
             }
 
+            #[inline(always)]
             fn get_size(self) -> u32 {
                 self.count_ones()
             }
@@ -88,10 +91,12 @@ macro_rules! mask_impl {
         impl<A> Mask<A> for ($t, u32) {
             type Output = $t;
 
+            #[inline(always)]
             fn get_mask(self, _: &A) -> Self::Output {
                 self.0
             }
 
+            #[inline(always)]
             fn get_size(self) -> u32 {
                 self.1
             }

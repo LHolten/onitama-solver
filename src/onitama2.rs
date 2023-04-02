@@ -32,7 +32,7 @@ pub const TABLE_MASK: u32 = (1 << 25) - 1;
 pub const NUM_PAWNS_MASK: u32 = 0b11111; // five options, because there can be 0..=4 pawns
 
 impl Board1 {
-    pub fn index1(all_cards: u16, pawns1_len: u8) -> impl Indexer<Item = Self> {
+    pub(crate) fn index1(all_cards: u16, pawns1_len: u8) -> impl Indexer<Item = Self> {
         type B = Board1;
 
         let cards0_mask = move |b: &B| all_cards & !(1 << b.side_card);
@@ -58,7 +58,7 @@ pub struct Board {
 
 impl Board {
     // Second half of the index, the size of this table depends on the first index
-    pub fn index2(
+    pub(crate) fn index2(
         all_cards: u16,
         first: Board1,
         pawns0_len: u8,

@@ -7,7 +7,7 @@ use seq_macro::seq;
 
 use crate::proj::{CountOnes, Mask, Proj};
 
-pub trait Indexer: IntoIterator + Sized + Clone {
+pub(crate) trait Indexer: Sized + Clone + InternalIter {
     fn index(&self, item: &Self::Item) -> usize;
 
     fn total(&self) -> usize;
@@ -42,6 +42,15 @@ pub trait Indexer: IntoIterator + Sized + Clone {
 #[derive(Default, Clone)]
 pub struct Empty<T>(pub T);
 
+impl<T> InternalIter for Empty<T> {
+    fn for_each<F>(&mut self, mut f: F)
+    where
+        F: for<'a> FnMut(&'a mut Self::Item),
+    {
+        (f)(&mut self.0)
+    }
+}
+
 impl<T> IntoIterator for Empty<T> {
     type Item = T;
     type IntoIter = Once<T>;
@@ -67,6 +76,46 @@ pub struct Flatten<I, V, M, G> {
     proj: V,
     mask: M,
     gen: G,
+}
+
+pub trait InternalIter: IntoIterator {
+    fn for_each<F>(&mut self, f: F)
+    where
+        F: for<'a> FnMut(&'a mut Self::Item);
+
+    fn for_enumerate<F>(&mut self, mut f: F)
+    where
+        F: for<'a> FnMut(usize, &'a mut Self::Item),
+    {
+        let mut i = 0;
+        self.for_each(|item| {
+            (f)(i, item);
+            i += 1;
+        })
+    }
+}
+
+impl<I: InternalIter, V, M, G> InternalIter for Flatten<I, V, M, G>
+where
+    V: Proj<I::Item>,
+    M: Mask<I::Item>,
+    G: Gen<M::Output, V::Output>,
+    I::Item: Clone,
+{
+    fn for_each<F>(&mut self, mut f: F)
+    where
+        F: for<'a> FnMut(&'a mut Self::Item),
+    {
+        self.outer.for_each(|board| {
+            let mask: M::Output = self.mask.get_mask(board);
+            debug_assert_eq!(mask.count_ones(), self.mask.get_size());
+
+            self.gen.gen_iter(mask).for_each(|field: V::Output| {
+                *(self.proj).proj_mut(board) = field;
+                (f)(board)
+            })
+        })
+    }
 }
 
 impl<I: IntoIterator, V, M, G> IntoIterator for Flatten<I, V, M, G>
@@ -205,11 +254,11 @@ gen_impl! { u16 u32 }
 
 fn index_exact(vals: u32, mask: u32) -> usize {
     let mut i = 0;
-    for (count, offset) in BitIter::from(vals).enumerate() {
+    BitIter::from(vals).enumerate().for_each(|(count, offset)| {
         let mask_less = (1 << offset) - 1;
         let num_less = (mask_less & mask).count_ones();
         i += comb_exact(num_less, count as u32 + 1);
-    }
+    });
     i
 }
 

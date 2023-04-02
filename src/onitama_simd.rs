@@ -12,7 +12,7 @@ use bit_iter::BitIter;
 
 use crate::{
     card::{get_one_bitmap, offset_mask_fixed as offset_mask},
-    index::{Empty, Indexer},
+    index::{Empty, Indexer, InternalIter},
     onitama2::TABLE_MASK,
     proj,
 };
@@ -191,20 +191,20 @@ impl AllTables {
             self.index(new)
         });
 
-        for (i, oldk) in old.indexer().into_iter().enumerate() {
+        old.indexer().for_enumerate(|i, oldk| {
             if oldk.king1 as usize == to {
                 // king is gone, so old state is not lost
                 accum.slice[i] |= accum.mask;
-                continue;
+                return;
             }
 
-            let mut newk = oldk;
+            let mut newk = *oldk;
             if oldk.king0 as usize == from {
                 newk.king0 = to as u8
             }
             // if new state is not won, then old state is not lost
             accum.slice[i] |= !new_slice[newk].load(Ordering::Relaxed) & accum.mask;
-        }
+        });
     }
 
     // returns whether there was any progress
@@ -221,10 +221,10 @@ impl AllTables {
         let new_slice = LazyCell::new(|| self.index(new));
 
         let mut progress = false;
-        for (i, oldk) in old.indexer().into_iter().enumerate() {
+        old.indexer().for_enumerate(|i, oldk| {
             debug_assert_ne!(oldk.king0 as usize, to);
 
-            let mut newk = oldk;
+            let mut newk = *oldk;
             if oldk.king1 as usize == from {
                 newk.king1 = to as u8
             }
@@ -233,7 +233,7 @@ impl AllTables {
             if fetch | spread.slice[i] != fetch {
                 progress = true;
             }
-        }
+        });
 
         if new.pieces1.count_ones() == self.size as u32 {
             return progress;
@@ -243,16 +243,16 @@ impl AllTables {
         new.counts.count1 += 1;
         let new_slice = LazyCell::new(|| self.index(new));
 
-        for (i, oldk) in old.indexer().into_iter().enumerate() {
+        old.indexer().for_enumerate(|i, oldk| {
             debug_assert_ne!(oldk.king0 as usize, to);
 
-            let mut newk = oldk;
+            let mut newk = *oldk;
             if oldk.king1 as usize == from {
                 newk.king1 = to as u8
             }
             // if accum state is lost, then new state is won
             new_slice[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
-        }
+        });
         progress
     }
 
@@ -334,6 +334,7 @@ impl AllTables {
 
     pub fn mark_ez_win(&self, counts: PawnCount) {
         for layout in counts.indexer() {
+            let layout: TeamLayout = layout;
             let TeamLayout {
                 pieces0, pieces1, ..
             } = layout;
@@ -341,11 +342,11 @@ impl AllTables {
             for (card, mask) in zip(self.cards.iter(), mask_iter()) {
                 let from_mask = offset_mask(2, card.bitmap::<false>());
 
-                for (i, kpos) in layout.indexer().into_iter().enumerate() {
+                layout.indexer().for_enumerate(|i, kpos| {
                     if 1 << kpos.king1 & !from_mask == 0 {
                         self.index(layout).slice[i]
                             .fetch_or(Block(mask).expand().0, Ordering::Relaxed);
-                        continue;
+                        return;
                     }
                     let from_mask = offset_mask(kpos.king0 as usize, card.bitmap::<false>());
                     if from_mask & pieces1 != 0 {
@@ -353,7 +354,7 @@ impl AllTables {
                         let m = layout.indexer().total();
                         r.slice[i].fetch_or(Block(mask).expand().0, Ordering::Relaxed);
                     }
-                }
+                })
             }
         }
     }
