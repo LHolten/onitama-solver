@@ -42,10 +42,10 @@ impl Board1 {
 
         Empty::default()
             .choose_one(proj!(|b: B| b.side_card), all_cards as u32)
-            .choose(2, proj!(|b: B| b.cards0), cards0_mask)
+            .choose(2, proj!(|b: B| b.cards0), (cards0_mask, 4))
             .choose_one(proj!(|b: B| b.kings[1]), king1_mask)
             .choose_one(proj!(|b: B| b.kings[0]), king0_mask)
-            .choose(pawns1_len, proj!(|b: B| b.pawns1), pawns1_mask)
+            .choose(pawns1_len, proj!(|b: B| b.pawns1), (pawns1_mask, 23))
     }
 }
 
@@ -175,14 +175,14 @@ fn count_perft2() {
                     let Some(indexer) = Board::index2(all_cards, board_no_pawns, pawns0_len, false) else {
                         break 'first;
                     };
-                    total += indexer.total(&indexer.gen_one());
+                    total += indexer.total();
                 }
 
                 'second: {
                     let Some(indexer) = Board::index2(all_cards, board_no_pawns, pawns0_len, true) else {
                         break 'second;
                     };
-                    total += indexer.total(&indexer.gen_one());
+                    total += indexer.total();
                 }
             }
         }

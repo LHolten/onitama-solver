@@ -36,7 +36,11 @@ impl PawnCount {
         let pieces1_mask = |l: &L| TABLE_MASK & !l.pieces0;
         Empty::default()
             .choose(self.count0 + 1, proj!(|l: L| l.pieces0), TABLE_MASK)
-            .choose(self.count1 + 1, proj!(|l: L| l.pieces1), pieces1_mask)
+            .choose(
+                self.count1 + 1,
+                proj!(|l: L| l.pieces1),
+                (pieces1_mask, 24 - self.count0 as u32),
+            )
     }
 }
 
@@ -107,7 +111,7 @@ impl AllTables {
         let i = indexer.index(&layout);
 
         let king_indexer = layout.indexer();
-        let step_size = king_indexer.total(&king_indexer.gen_one());
+        let step_size = king_indexer.total();
 
         let slice = &self.index_count(counts)[step_size * i..step_size * (i + 1)];
         SubTable { layout, slice }
@@ -318,8 +322,9 @@ impl AllTables {
                     }
                     let from_mask = offset_mask(kpos.king0 as usize, card.bitmap::<false>());
                     if from_mask & pieces1 != 0 {
-                        self.index(layout).slice[i]
-                            .fetch_or(Block(mask).expand().0, Ordering::Relaxed);
+                        let r = self.index(layout);
+                        let m = layout.indexer().total();
+                        r.slice[i].fetch_or(Block(mask).expand().0, Ordering::Relaxed);
                     }
                 }
             }
@@ -416,7 +421,9 @@ impl Card {
 
 #[cfg(test)]
 mod tests {
-    use super::{AllTables, PawnCount};
+    use crate::index::Indexer;
+
+    use super::{AllTables, PawnCount, TeamLayout};
 
     #[test]
     fn build_tb() {
@@ -430,5 +437,17 @@ mod tests {
         for layout in PawnCount::default().indexer() {
             dbg!(layout);
         }
+    }
+
+    #[test]
+    fn what() {
+        let layout = TeamLayout {
+            pieces0: 1,
+            pieces1: 6,
+        };
+        assert_eq!(
+            layout.indexer().total(),
+            layout.indexer().into_iter().count()
+        )
     }
 }

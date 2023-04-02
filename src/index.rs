@@ -10,28 +10,18 @@ use crate::proj::{CountOnes, Mask, Proj};
 pub trait Indexer: IntoIterator + Sized + Clone {
     fn index(&self, item: &Self::Item) -> usize;
 
-    fn total(&self, item: &Self::Item) -> usize;
-
-    fn gen_one(&self) -> Self::Item;
+    fn total(&self) -> usize;
 
     fn choose_one<V, M>(self, proj: V, mask: M) -> Flatten<Self, V, M, ChooseOne>
     where
         V: Proj<Self::Item, Output = u8>,
         M: Mask<Self::Item>,
     {
-        #[cfg(debug_assertions)]
-        let mask_size = {
-            let item = self.clone().into_iter().next().unwrap();
-            mask.get_mask(&item).count_ones()
-        };
         Flatten {
             outer: self,
             proj,
             mask,
-            gen: ChooseOne {
-                #[cfg(debug_assertions)]
-                mask_size,
-            },
+            gen: ChooseOne,
         }
     }
 
@@ -40,20 +30,11 @@ pub trait Indexer: IntoIterator + Sized + Clone {
         V: Proj<Self::Item>,
         M: Mask<Self::Item>,
     {
-        #[cfg(debug_assertions)]
-        let mask_size = {
-            let item = self.clone().into_iter().next().unwrap();
-            mask.get_mask(&item).count_ones()
-        };
         Flatten {
             outer: self,
             proj,
             mask,
-            gen: ChooseExact {
-                count: n,
-                #[cfg(debug_assertions)]
-                mask_size,
-            },
+            gen: ChooseExact { count: n },
         }
     }
 }
@@ -75,12 +56,8 @@ impl<T: Clone> Indexer for Empty<T> {
         0
     }
 
-    fn total(&self, _: &Self::Item) -> usize {
+    fn total(&self) -> usize {
         1
-    }
-
-    fn gen_one(&self) -> Self::Item {
-        self.0.clone()
     }
 }
 
@@ -105,6 +82,8 @@ where
     fn into_iter(self) -> Self::IntoIter {
         self.outer.into_iter().flat_map(move |board: I::Item| {
             let mask: M::Output = self.mask.get_mask(&board);
+            debug_assert_eq!(mask.count_ones(), self.mask.get_size());
+
             self.gen.gen_iter(mask).map(move |field: V::Output| {
                 let mut new = board.clone();
                 *(self.proj).proj_mut(&mut new) = field;
@@ -124,22 +103,15 @@ where
     fn index(&self, item: &I::Item) -> usize {
         let outer_index = self.outer.index(item);
         let mask: M::Output = self.mask.get_mask(item);
+        debug_assert_eq!(mask.count_ones(), self.mask.get_size());
+
         let field: &V::Output = self.proj.proj_ref(item);
         let gen_index = self.gen.index(mask, field);
-        outer_index * self.gen.total(mask) + gen_index
+        outer_index * self.gen.total(self.mask.get_size()) + gen_index
     }
 
-    fn total(&self, item: &I::Item) -> usize {
-        let mask = self.mask.get_mask(item);
-        self.outer.total(item) * self.gen.total(mask)
-    }
-
-    fn gen_one(&self) -> Self::Item {
-        let mut item = self.outer.gen_one();
-        let mask: M::Output = self.mask.get_mask(&item);
-        let field: V::Output = self.gen.gen_iter(mask).next().unwrap();
-        *(self.proj).proj_mut(&mut item) = field;
-        item
+    fn total(&self) -> usize {
+        self.outer.total() * self.gen.total(self.mask.get_size())
     }
 }
 
@@ -147,14 +119,11 @@ trait Gen<M, F>: Clone {
     type GenIter: Iterator<Item = F>;
     fn gen_iter(&self, mask: M) -> Self::GenIter;
     fn index(&self, mask: M, field: &F) -> usize;
-    fn total(&self, mask: M) -> usize;
+    fn total(&self, mask_size: u32) -> usize;
 }
 
 #[derive(Clone, Copy)]
-pub struct ChooseOne {
-    #[cfg(debug_assertions)]
-    mask_size: u32,
-}
+pub struct ChooseOne;
 
 impl Gen<u32, u8> for ChooseOne {
     type GenIter = impl Iterator<Item = u8>;
@@ -166,26 +135,20 @@ impl Gen<u32, u8> for ChooseOne {
     }
 
     fn index(&self, mask: u32, offset: &u8) -> usize {
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(mask.count_ones(), self.mask_size);
         debug_assert_eq!((1 << *offset) & !mask, 0);
 
         let mask_less = (1 << *offset) - 1;
         (mask_less & mask).count_ones() as usize
     }
 
-    fn total(&self, mask: u32) -> usize {
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(self.mask_size, mask.count_ones());
-        mask.count_ones() as usize
+    fn total(&self, mask_size: u32) -> usize {
+        mask_size as usize
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct ChooseExact {
     count: u8,
-    #[cfg(debug_assertions)]
-    mask_size: u32,
 }
 
 macro_rules! gen_impl {
@@ -194,8 +157,6 @@ macro_rules! gen_impl {
             type GenIter = impl Iterator<Item = $t>;
 
             fn gen_iter(&self, mask: $t) -> Self::GenIter {
-                #[cfg(debug_assertions)]
-                debug_assert_eq!(mask.count_ones(), self.mask_size);
                 debug_assert!(self.count < 6);
                 debug_assert!(self.count <= mask.count_ones() as u8);
 
@@ -233,11 +194,8 @@ macro_rules! gen_impl {
                 index_exact(*vals as u32, mask as u32)
             }
 
-            fn total(&self, mask: $t) -> usize {
-                #[cfg(debug_assertions)]
-                debug_assert_eq!(self.mask_size, mask.count_ones());
-
-                comb_exact(mask.count_ones(), self.count as u32)
+            fn total(&self, mask_size: u32) -> usize {
+                comb_exact(mask_size, self.count as u32)
             }
         }
     )*}
@@ -289,11 +247,7 @@ mod tests {
     #[test]
     fn comb_some() {
         let mask = 0b101111u16;
-        let indexer = ChooseExact {
-            count: 2,
-            #[cfg(debug_assertions)]
-            mask_size: mask.count_ones(),
-        };
+        let indexer = ChooseExact { count: 2 };
         indexer
             .gen_iter(mask)
             .for_each(|x| println!("{x:06b} with id {}", indexer.index(mask, &x)))
@@ -302,10 +256,7 @@ mod tests {
     #[test]
     fn comb_one() {
         let mask = 0b101111u32;
-        let indexer = ChooseOne {
-            #[cfg(debug_assertions)]
-            mask_size: mask.count_ones(),
-        };
+        let indexer = ChooseOne;
         indexer
             .gen_iter(mask)
             .for_each(|x| println!("{x} with id {}", indexer.index(mask, &x)))
@@ -321,10 +272,12 @@ mod tests {
         }
         let indexer = Empty::default()
             .choose(0, proj!(|b: Two| b.one), 0b1111u32)
-            .choose(2, proj!(|b: Two| b.two), |b: &Two| 0b1111u32 & !b.one)
-            .choose(0, proj!(|b: Two| b.three), |b: &Two| {
-                0b1111u32 & !b.one & !b.two
-            });
+            .choose(2, proj!(|b: Two| b.two), (|b: &Two| 0b1111u32 & !b.one, 4))
+            .choose(
+                0,
+                proj!(|b: Two| b.three),
+                (|b: &Two| 0b1111u32 & !b.one & !b.two, 2),
+            );
         for (i, x) in indexer.clone().into_iter().enumerate() {
             assert_eq!(i, indexer.index(&x))
         }
