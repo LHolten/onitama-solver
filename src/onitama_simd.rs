@@ -1,6 +1,7 @@
 #![allow(unused)]
 
 use std::{
+    cell::LazyCell,
     iter::zip,
     mem::transmute,
     ops::{BitAnd, Index, Shr},
@@ -19,8 +20,8 @@ use crate::{
 fn count_indexer(size: u8) -> impl Indexer<Item = PawnCount> {
     let count_mask = (1u32 << size) - 1;
     Empty::default()
-        .choose_one(proj!(|c: PawnCount| c.count0), count_mask)
-        .choose_one(proj!(|c: PawnCount| c.count1), count_mask)
+        .choose_one(proj!(|c: PawnCount| c.count0), (count_mask, size as u32))
+        .choose_one(proj!(|c: PawnCount| c.count1), (count_mask, size as u32))
 }
 
 // number of pawns of each player
@@ -31,16 +32,26 @@ struct PawnCount {
 }
 
 impl PawnCount {
+    fn invert(self) -> Self {
+        Self {
+            count0: self.count1,
+            count1: self.count0,
+        }
+    }
+
     fn indexer(&self) -> impl Indexer<Item = TeamLayout> {
         type L = TeamLayout;
         let pieces1_mask = |l: &L| TABLE_MASK & !l.pieces0;
-        Empty::default()
-            .choose(self.count0 + 1, proj!(|l: L| l.pieces0), TABLE_MASK)
-            .choose(
-                self.count1 + 1,
-                proj!(|l: L| l.pieces1),
-                (pieces1_mask, 24 - self.count0 as u32),
-            )
+        Empty(TeamLayout {
+            counts: *self,
+            ..Default::default()
+        })
+        .choose(self.count0 + 1, proj!(|l: L| l.pieces0), (TABLE_MASK, 25))
+        .choose(
+            self.count1 + 1,
+            proj!(|l: L| l.pieces1),
+            (pieces1_mask, 24 - self.count0 as u32),
+        )
     }
 }
 
@@ -48,6 +59,7 @@ impl PawnCount {
 // we don't know which pieces are the kings
 #[derive(Debug, Default, Clone, Copy)]
 struct TeamLayout {
+    counts: PawnCount,
     pieces0: u32,
     pieces1: u32,
 }
@@ -55,19 +67,19 @@ struct TeamLayout {
 impl TeamLayout {
     fn indexer(self) -> impl Indexer<Item = KingPos> {
         Empty::default()
-            .choose_one(proj!(|p: KingPos| p.king0), self.pieces0)
-            .choose_one(proj!(|p: KingPos| p.king1), self.pieces1)
-    }
-
-    fn counts(self) -> PawnCount {
-        PawnCount {
-            count0: self.pieces0.count_ones() as u8 - 1,
-            count1: self.pieces1.count_ones() as u8 - 1,
-        }
+            .choose_one(
+                proj!(|p: KingPos| p.king0),
+                (self.pieces0, self.counts.count0 as u32 + 1),
+            )
+            .choose_one(
+                proj!(|p: KingPos| p.king1),
+                (self.pieces1, self.counts.count1 as u32 + 1),
+            )
     }
 
     fn invert(self) -> Self {
         TeamLayout {
+            counts: self.counts.invert(),
             pieces0: self.pieces1.reverse_bits() >> 7,
             pieces1: self.pieces0.reverse_bits() >> 7,
         }
@@ -105,7 +117,7 @@ impl AllTables {
     }
 
     fn index(&self, layout: TeamLayout) -> SubTable<'_> {
-        let counts = layout.counts();
+        let counts = layout.counts;
 
         let indexer = counts.indexer();
         let i = indexer.index(&layout);
@@ -167,10 +179,17 @@ impl AllTables {
 
         let old = accum.layout;
 
-        let new = TeamLayout {
-            pieces0: old.pieces0 ^ (1 << to) ^ (1 << from),
-            pieces1: old.pieces1 & !(1 << to),
-        };
+        let new_slice = LazyCell::new(|| {
+            let new = TeamLayout {
+                counts: PawnCount {
+                    count0: old.counts.count0,
+                    count1: old.counts.count1 - (old.pieces1 & 1 << to != 0) as u8,
+                },
+                pieces0: old.pieces0 ^ (1 << to) ^ (1 << from),
+                pieces1: old.pieces1 & !(1 << to),
+            };
+            self.index(new)
+        });
 
         for (i, oldk) in old.indexer().into_iter().enumerate() {
             if oldk.king1 as usize == to {
@@ -184,7 +203,7 @@ impl AllTables {
                 newk.king0 = to as u8
             }
             // if new state is not won, then old state is not lost
-            accum.slice[i] |= !self.index(new)[newk].load(Ordering::Relaxed) & accum.mask;
+            accum.slice[i] |= !new_slice[newk].load(Ordering::Relaxed) & accum.mask;
         }
     }
 
@@ -195,9 +214,11 @@ impl AllTables {
         let old = spread.layout;
 
         let mut new = TeamLayout {
+            counts: old.counts,
             pieces0: old.pieces0,
             pieces1: old.pieces1 ^ (1 << to) ^ (1 << from),
         };
+        let new_slice = LazyCell::new(|| self.index(new));
 
         let mut progress = false;
         for (i, oldk) in old.indexer().into_iter().enumerate() {
@@ -208,7 +229,7 @@ impl AllTables {
                 newk.king1 = to as u8
             }
             // if accum state is lost, then new state is won
-            let fetch = self.index(new)[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
+            let fetch = new_slice[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
             if fetch | spread.slice[i] != fetch {
                 progress = true;
             }
@@ -219,6 +240,8 @@ impl AllTables {
         }
 
         new.pieces1 |= 1 << from;
+        new.counts.count1 += 1;
+        let new_slice = LazyCell::new(|| self.index(new));
 
         for (i, oldk) in old.indexer().into_iter().enumerate() {
             debug_assert_ne!(oldk.king0 as usize, to);
@@ -228,14 +251,16 @@ impl AllTables {
                 newk.king1 = to as u8
             }
             // if accum state is lost, then new state is won
-            self.index(new)[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
+            new_slice[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
         }
         progress
     }
 
     // returns whether there was any progress
     pub fn update_layout(&self, layout: TeamLayout) -> bool {
-        let TeamLayout { pieces0, pieces1 } = layout;
+        let TeamLayout {
+            pieces0, pieces1, ..
+        } = layout;
 
         // every 0 bit means that it could be anything, win loss or draw
         // every 1 bit means that it must be a draw or win
@@ -309,7 +334,9 @@ impl AllTables {
 
     pub fn mark_ez_win(&self, counts: PawnCount) {
         for layout in counts.indexer() {
-            let TeamLayout { pieces0, pieces1 } = layout;
+            let TeamLayout {
+                pieces0, pieces1, ..
+            } = layout;
 
             for (card, mask) in zip(self.cards.iter(), mask_iter()) {
                 let from_mask = offset_mask(2, card.bitmap::<false>());
@@ -442,6 +469,10 @@ mod tests {
     #[test]
     fn what() {
         let layout = TeamLayout {
+            counts: PawnCount {
+                count0: 0,
+                count1: 1,
+            },
             pieces0: 1,
             pieces1: 6,
         };

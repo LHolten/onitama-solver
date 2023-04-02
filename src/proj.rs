@@ -84,6 +84,18 @@ macro_rules! mask_impl {
                 self.count_ones()
             }
         }
+
+        impl<A> Mask<A> for ($t, u32) {
+            type Output = $t;
+
+            fn get_mask(self, _: &A) -> Self::Output {
+                self.0
+            }
+
+            fn get_size(self) -> u32 {
+                self.1
+            }
+        }
     )*}
 }
 

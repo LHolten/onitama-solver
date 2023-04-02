@@ -1,5 +1,6 @@
 #![feature(type_alias_impl_trait)]
 #![feature(core_intrinsics)]
+#![feature(lazy_cell)]
 
 mod anf;
 mod card;
