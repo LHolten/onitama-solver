@@ -181,7 +181,7 @@ impl Index<KingPos> for SubTable<'_> {
 pub struct Accum<'a> {
     layout: TeamLayout,
     current: &'a Table,
-    take_one: &'a Table,
+    take_one: Option<&'a Table>,
     mask: u32,
     step: (usize, usize),
     slice: &'a mut [u32],
@@ -190,7 +190,7 @@ pub struct Accum<'a> {
 pub struct Spread<'a> {
     layout: TeamLayout,
     current: &'a Table,
-    leave_one: &'a Table,
+    leave_one: Option<&'a Table>,
     step: (usize, usize),
     slice: &'a [u32],
 }
@@ -208,7 +208,7 @@ impl AllTables {
             };
             if old.pieces1 & 1 << to != 0 {
                 // we are taking a piece
-                accum.take_one.index(new)
+                accum.take_one.unwrap().index(new)
             } else {
                 // not taking a piece
                 accum.current.index(new)
@@ -260,12 +260,12 @@ impl AllTables {
             }
         });
 
-        if new.pieces1.count_ones() == self.size {
+        if new.pieces0.count_ones() == self.size {
             return progress;
         }
 
-        new.pieces1 |= 1 << from;
-        let new_slice = LazyCell::new(|| spread.leave_one.index(new));
+        new.pieces0 |= 1 << from;
+        let new_slice = spread.leave_one.unwrap().index(new);
 
         old.indexer(spread.current.counts).for_enumerate(|i, oldk| {
             debug_assert_ne!(oldk.king0 as usize, to);
@@ -288,13 +288,17 @@ impl AllTables {
         let PawnCount { count0, count1 } = layout.counts();
 
         let current = self.index_count(PawnCount { count0, count1 });
-        let take_one = self.index_count(PawnCount {
-            count0,
-            count1: count0.saturating_sub(1),
+        let take_one = (count1 != 0).then(|| {
+            self.index_count(PawnCount {
+                count0,
+                count1: count1 - 1,
+            })
         });
-        let leave_one = self.index_count(PawnCount {
-            count0,
-            count1: (count1 + 1).min(self.size - 1),
+        let leave_one = (count0 + 1 != self.size).then(|| {
+            self.index_count(PawnCount {
+                count0: count0 + 1,
+                count1,
+            })
         });
 
         // every 0 bit means that it could be anything, win loss or draw
@@ -506,7 +510,7 @@ mod tests {
     #[test]
     fn build_tb() {
         let tb = AllTables::build(2, 0b11111);
-        assert_eq!(tb.count_ones(), 5697226);
+        assert_eq!(tb.count_ones(), 6067625);
         println!("{} total", tb.len() * 30)
     }
 
