@@ -26,9 +26,9 @@ fn count_indexer(size: u8) -> impl Indexer<Item = PawnCount> {
 
 // number of pawns of each player
 #[derive(Debug, Default, Clone, Copy)]
-struct PawnCount {
-    count0: u8,
-    count1: u8,
+pub struct PawnCount {
+    pub(crate) count0: u8,
+    pub(crate) count1: u8,
 }
 
 impl PawnCount {
@@ -39,7 +39,7 @@ impl PawnCount {
         }
     }
 
-    fn indexer(&self) -> impl Indexer<Item = TeamLayout> {
+    pub(crate) fn indexer(&self) -> impl Indexer<Item = TeamLayout> {
         type L = TeamLayout;
         let pieces1_mask = |l: &L| TABLE_MASK & !l.pieces0;
         Empty(TeamLayout {
@@ -58,10 +58,10 @@ impl PawnCount {
 // only contains erased piece positions
 // we don't know which pieces are the kings
 #[derive(Debug, Default, Clone, Copy)]
-struct TeamLayout {
+pub struct TeamLayout {
     counts: PawnCount,
-    pieces0: u32,
-    pieces1: u32,
+    pub(crate) pieces0: u32,
+    pub(crate) pieces1: u32,
 }
 
 impl TeamLayout {
@@ -103,42 +103,55 @@ impl KingPos {
 }
 
 // contains all the results up to some number of pieces
-struct AllTables {
+pub struct AllTables {
     size: u8,
     cards: Cards,
-    list: Box<[Box<[AtomicU32]>]>,
+    list: Box<[Table]>,
 }
 
 impl AllTables {
-    fn index_count(&self, counts: PawnCount) -> &[AtomicU32] {
+    fn index_count(&self, counts: PawnCount) -> &Table {
         let indexer = count_indexer(self.size);
         let i = indexer.index(&counts);
-        &self.list[i]
+        unsafe { self.list.get(i).unwrap_unchecked() }
     }
 
     fn index(&self, layout: TeamLayout) -> SubTable<'_> {
         let counts = layout.counts;
+        self.index_count(counts).index(layout)
+    }
 
+    fn count_ones(&self) -> u64 {
+        self.list
+            .iter()
+            .flat_map(|l| l.list.iter())
+            .map(|x| x.load(Ordering::Relaxed).bitand((1 << 30) - 1).count_ones() as u64)
+            .sum()
+    }
+
+    fn len(&self) -> u64 {
+        self.list.iter().map(|l| l.list.len() as u64).sum()
+    }
+}
+
+pub struct Table {
+    counts: PawnCount,
+    chunk_size: usize,
+    list: Box<[AtomicU32]>,
+}
+
+impl Table {
+    fn index(&self, layout: TeamLayout) -> SubTable<'_> {
+        let counts = layout.counts;
         let indexer = counts.indexer();
         let i = indexer.index(&layout);
 
         let king_indexer = layout.indexer();
         let step_size = king_indexer.total();
 
-        let slice = &self.index_count(counts)[step_size * i..step_size * (i + 1)];
+        let slice = self.list.get(step_size * i..step_size * (i + 1));
+        let slice = unsafe { slice.unwrap_unchecked() };
         SubTable { layout, slice }
-    }
-
-    fn count_ones(&self) -> u64 {
-        self.list
-            .iter()
-            .flat_map(|l| l.iter())
-            .map(|x| x.load(Ordering::Relaxed).bitand((1 << 30) - 1).count_ones() as u64)
-            .sum()
-    }
-
-    fn len(&self) -> u64 {
-        self.list.iter().map(|l| l.len() as u64).sum()
     }
 }
 
@@ -155,19 +168,19 @@ impl Index<KingPos> for SubTable<'_> {
     fn index(&self, index: KingPos) -> &Self::Output {
         let indexer = self.layout.indexer();
         let i = indexer.index(&index);
-        &self.slice[i]
+        unsafe { self.slice.get(i).unwrap_unchecked() }
     }
 }
 
 #[derive(Debug)]
-struct Accum<'a> {
+pub struct Accum<'a> {
     layout: TeamLayout,
     mask: u32,
     step: (usize, usize),
     slice: &'a mut [u32],
 }
 
-struct Spread<'a> {
+pub struct Spread<'a> {
     layout: TeamLayout,
     step: (usize, usize),
     slice: &'a [u32],
@@ -191,10 +204,12 @@ impl AllTables {
             self.index(new)
         });
 
+        // for
         old.indexer().for_enumerate(|i, oldk| {
+            let s = unsafe { accum.slice.get_mut(i).unwrap_unchecked() };
             if oldk.king1 as usize == to {
                 // king is gone, so old state is not lost
-                accum.slice[i] |= accum.mask;
+                *s |= accum.mask;
                 return;
             }
 
@@ -203,7 +218,7 @@ impl AllTables {
                 newk.king0 = to as u8
             }
             // if new state is not won, then old state is not lost
-            accum.slice[i] |= !new_slice[newk].load(Ordering::Relaxed) & accum.mask;
+            *s |= !new_slice[newk].load(Ordering::Relaxed) & accum.mask;
         });
     }
 
@@ -366,11 +381,16 @@ impl AllTables {
             list: count_indexer(size)
                 .into_iter()
                 .map(|counts| {
-                    counts
+                    let list = counts
                         .indexer()
                         .into_iter()
                         .flat_map(|layout| layout.indexer().into_iter().map(|_| AtomicU32::new(0)))
-                        .collect()
+                        .collect();
+                    Table {
+                        counts,
+                        chunk_size: counts.indexer().total(),
+                        list,
+                    }
                 })
                 .collect(),
         };

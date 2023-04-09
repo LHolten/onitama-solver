@@ -111,8 +111,9 @@ where
             debug_assert_eq!(mask.count_ones(), self.mask.get_size());
 
             self.gen.gen_iter(mask).for_each(|field: V::Output| {
-                *(self.proj).proj_mut(board) = field;
-                (f)(board)
+                let mut new = board.clone();
+                *(self.proj).proj_mut(&mut new) = field;
+                (f)(&mut new)
             })
         })
     }
