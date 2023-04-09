@@ -14,7 +14,7 @@ pub(crate) trait Indexer: Sized + Clone + InternalIter {
 
     fn choose_one<V, M>(self, proj: V, mask: M) -> Flatten<Self, V, M, ChooseOne>
     where
-        V: Proj<Self::Item, Output = u8>,
+        V: Proj<Self::Item, Output = u32>,
         M: Mask<Self::Item>,
     {
         Flatten {
@@ -25,7 +25,7 @@ pub(crate) trait Indexer: Sized + Clone + InternalIter {
         }
     }
 
-    fn choose<V, M>(self, n: u8, proj: V, mask: M) -> Flatten<Self, V, M, ChooseExact>
+    fn choose<V, M>(self, n: u32, proj: V, mask: M) -> Flatten<Self, V, M, ChooseExact>
     where
         V: Proj<Self::Item>,
         M: Mask<Self::Item>,
@@ -71,7 +71,7 @@ impl<T: Clone> Indexer for Empty<T> {
 }
 
 #[derive(Clone)]
-pub struct Flatten<I, V, M, G> {
+pub struct Flatten<I: InternalIter, V, M, G> {
     outer: I,
     proj: V,
     mask: M,
@@ -119,7 +119,7 @@ where
     }
 }
 
-impl<I: IntoIterator, V, M, G> IntoIterator for Flatten<I, V, M, G>
+impl<I: InternalIter, V, M, G> IntoIterator for Flatten<I, V, M, G>
 where
     V: Proj<I::Item>,
     M: Mask<I::Item>,
@@ -175,16 +175,16 @@ trait Gen<M, F>: Clone {
 #[derive(Clone, Copy)]
 pub struct ChooseOne;
 
-impl Gen<u32, u8> for ChooseOne {
-    type GenIter = impl Iterator<Item = u8>;
+impl Gen<u32, u32> for ChooseOne {
+    type GenIter = impl Iterator<Item = u32>;
 
     fn gen_iter(&self, mask: u32) -> Self::GenIter {
         debug_assert_ne!(mask, 0);
 
-        BitIter::from(mask).map(|offset| offset as u8)
+        BitIter::from(mask).map(|offset| offset as u32)
     }
 
-    fn index(&self, mask: u32, offset: &u8) -> usize {
+    fn index(&self, mask: u32, offset: &u32) -> usize {
         debug_assert_eq!((1 << *offset) & !mask, 0);
 
         let mask_less = (1 << *offset) - 1;
@@ -198,7 +198,7 @@ impl Gen<u32, u8> for ChooseOne {
 
 #[derive(Clone, Copy)]
 pub struct ChooseExact {
-    count: u8,
+    count: u32,
 }
 
 macro_rules! gen_impl {
@@ -208,7 +208,7 @@ macro_rules! gen_impl {
 
             fn gen_iter(&self, mask: $t) -> Self::GenIter {
                 debug_assert!(self.count < 6);
-                debug_assert!(self.count <= mask.count_ones() as u8);
+                debug_assert!(self.count <= mask.count_ones());
 
                 let mut lookup: [$t; 6] = [0; 6];
                 let mut entry = !mask;
@@ -238,7 +238,7 @@ macro_rules! gen_impl {
             }
 
             fn index(&self, mask: $t, vals: &$t) -> usize {
-                debug_assert_eq!(vals.count_ones() as u8, self.count);
+                debug_assert_eq!(vals.count_ones(), self.count);
                 debug_assert_eq!(vals & !mask, 0);
 
                 index_exact(*vals as u32, mask as u32)

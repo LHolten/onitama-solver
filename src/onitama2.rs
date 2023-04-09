@@ -21,18 +21,18 @@ use crate::{
 #[derive(PartialEq, Eq, Default, Clone, Copy)]
 pub struct Board1 {
     cards0: u16,
-    side_card: u8,
-    kings: [u8; 2],
+    side_card: u32,
+    kings: [u32; 2],
     pawns1: u32,
 }
 
 // team 0 is at the bottom, so that they can use the cards unrotated
-pub const TEMPLES: [u8; 2] = [22, 2];
+pub const TEMPLES: [u32; 2] = [22, 2];
 pub const TABLE_MASK: u32 = (1 << 25) - 1;
 pub const NUM_PAWNS_MASK: u32 = 0b11111; // five options, because there can be 0..=4 pawns
 
 impl Board1 {
-    pub(crate) fn index1(all_cards: u16, pawns1_len: u8) -> impl Indexer<Item = Self> {
+    pub(crate) fn index1(all_cards: u16, pawns1_len: u32) -> impl Indexer<Item = Self> {
         type B = Board1;
 
         let cards0_mask = move |b: &B| all_cards & !(1 << b.side_card);
@@ -53,7 +53,7 @@ impl Board1 {
 pub struct Board {
     pawns: [u32; 2],
     cards: [u16; 2],
-    kings: [u8; 2],
+    kings: [u32; 2],
 }
 
 impl Board {
@@ -61,7 +61,7 @@ impl Board {
     pub(crate) fn index2(
         all_cards: u16,
         first: Board1,
-        pawns0_len: u8,
+        pawns0_len: u32,
         has_pawn0_on_temple1: bool,
     ) -> Option<impl Indexer<Item = Self> + Clone> {
         type B = Board;
@@ -89,7 +89,7 @@ impl Board {
         // make sure opp doesn't have double attack with any old cards on our king
         let pieces1 = first.pawns1 | king1;
         let pieces1_attack = BitIter::from(pieces1).fold(0, |union, offset| {
-            union | cards_mask::<true>(offset as u8, cards1)
+            union | cards_mask::<true>(offset as u32, cards1)
         });
 
         // check if previous state must have been a win in 1 by king capture
@@ -140,7 +140,7 @@ impl Board {
         }
 
         // we can not have to many pieces
-        let pawns0_required = pawns0.count_ones() as u8;
+        let pawns0_required = pawns0.count_ones();
         if pawns0_required > pawns0_len {
             return None;
         }
