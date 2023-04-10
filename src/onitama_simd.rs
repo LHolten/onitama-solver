@@ -192,6 +192,15 @@ impl Index<KingPos> for SubTable<'_> {
     }
 }
 
+pub struct Update<'a> {
+    inv_layout: TeamLayout,
+    layout: TeamLayout,
+    inv_slice: &'a Table,
+    current: &'a Table,
+    take_one: Option<&'a Table>,
+    leave_one: Option<&'a Table>,
+}
+
 #[derive(Debug)]
 pub struct Accum<'a> {
     layout: TeamLayout,
@@ -234,19 +243,19 @@ impl AllTables {
         old.indexer(accum.current.counts).for_enumerate(|i, oldk| {
             let s = unsafe { accum.slice.get_mut(i).unwrap_unchecked() };
             if oldk.king1 as usize == to {
-                // king is gone, so old state is not lost
-                debug_assert_eq!(*s | accum.mask, *s);
+                // we take the opp king, we win
+                *s |= accum.mask;
                 return;
             }
 
             let mut newk = *oldk;
             if oldk.king0 as usize == from {
-                newk.king0 = to as u32
-            }
-            if newk.king0 == 22 {
-                // we take the opp temple, we win
-                debug_assert_eq!(*s | accum.mask, *s);
-                return;
+                newk.king0 = to as u32;
+                if newk.king0 == 22 {
+                    // we take the opp temple, we win
+                    *s |= accum.mask;
+                    return;
+                }
             }
 
             // if new state is not won, then old state is not lost
@@ -272,10 +281,10 @@ impl AllTables {
 
             let mut newk = *oldk;
             if oldk.king1 as usize == from {
-                newk.king1 = to as u32
-            }
-            if newk.king1 == 2 {
-                return;
+                newk.king1 = to as u32;
+                if newk.king1 == 2 {
+                    return;
+                }
             }
             // if accum state is lost, then new state is won
             let fetch = new_slice[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
@@ -296,10 +305,10 @@ impl AllTables {
 
             let mut newk = *oldk;
             if oldk.king1 as usize == from {
-                newk.king1 = to as u32
-            }
-            if newk.king1 == 2 {
-                return;
+                newk.king1 = to as u32;
+                if newk.king1 == 2 {
+                    return;
+                }
             }
             // if accum state is lost, then new state is won
             new_slice[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
@@ -351,14 +360,6 @@ impl AllTables {
             .into_iter()
             .map(|kpos| 0)
             .collect();
-        self.ez_win_for_each(
-            current.counts.invert(),
-            layout.invert(),
-            &mut |kpos, mask| {
-                let i = layout.indexer(current.counts).index(&kpos.invert());
-                status[i] |= mask;
-            },
-        );
 
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             let directions = card.bitmap::<false>();
@@ -397,16 +398,12 @@ impl AllTables {
                 debug_assert_eq!(w & l, 0);
                 if (w | l) & BLOCK_MASK == BLOCK_MASK {
                     inv_slice[kpos.invert()].fetch_or(RESOLVED_BIT, Ordering::Relaxed);
+                    self.is_done.fetch_add(1, Ordering::Relaxed);
                 } else {
                     all_done = false;
+                    self.is_not_done.fetch_add(1, Ordering::Relaxed);
                 }
             });
-
-            if all_done {
-                self.is_done.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.is_not_done.fetch_add(1, Ordering::Relaxed);
-            }
         }
 
         let mut progress = false;
@@ -463,10 +460,10 @@ impl AllTables {
 
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             // from where can you attack the temple?
-            let from_mask = offset_mask(2, card.bitmap::<false>()) | 1 << 2;
+            let from_mask = offset_mask(2, card.bitmap::<false>());
 
             layout.indexer(counts).for_enumerate(|i, kpos| {
-                if 1 << kpos.king1 & from_mask == 0 {
+                if 1 << kpos.king1 & from_mask == 0 || 1 << 2 & pieces1 != 0 {
                     // no attack on temple
                     let from_mask = offset_mask(kpos.king0 as usize, card.bitmap::<false>());
                     if from_mask & pieces1 == 0 {
@@ -614,7 +611,7 @@ mod tests {
     #[test]
     fn build_tb() {
         let tb = AllTables::build(2, 0b11111);
-        assert_eq!(tb.count_ones(), 6763785);
+        assert_eq!(tb.count_ones(), 6752579);
         println!("{} total", tb.len() * 30);
         println!(
             "{} done, {} not done",
