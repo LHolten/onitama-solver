@@ -179,8 +179,6 @@ impl Gen<u32, u32> for ChooseOne {
     type GenIter = impl Iterator<Item = u32>;
 
     fn gen_iter(&self, mask: u32) -> Self::GenIter {
-        debug_assert_ne!(mask, 0);
-
         BitIter::from(mask).map(|offset| offset as u32)
     }
 

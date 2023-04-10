@@ -4,7 +4,7 @@ use seq_macro::seq;
 // TODO: precalculate with every possible offset if that is faster
 
 #[inline]
-pub(crate) fn cards_mask<const S: bool>(offset: u8, cards: u16) -> u32 {
+pub(crate) fn cards_mask<const S: bool>(offset: u32, cards: u16) -> u32 {
     let bitmap = get_bitmap::<S>(cards);
     offset_mask(offset as usize, bitmap)
 }

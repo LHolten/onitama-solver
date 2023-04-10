@@ -1,11 +1,13 @@
 #![allow(unused)]
 
 use std::{
+    alloc::Layout,
     cell::LazyCell,
-    iter::zip,
+    iter::{repeat, repeat_with, zip},
     mem::transmute,
     ops::{BitAnd, Index, Shr},
-    sync::atomic::{AtomicU32, Ordering},
+    process::exit,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use bit_iter::BitIter;
@@ -69,11 +71,17 @@ impl TeamLayout {
         Empty::default()
             .choose_one(
                 proj!(|p: KingPos| p.king0),
-                (self.pieces0, counts.count0 + 1),
+                (
+                    self.pieces0 & !(1 << 22),
+                    counts.count0 + (self.pieces0 & 1 << 22 == 0) as u32,
+                ),
             )
             .choose_one(
                 proj!(|p: KingPos| p.king1),
-                (self.pieces1, counts.count1 + 1),
+                (
+                    self.pieces1 & !(1 << 2),
+                    counts.count1 + (self.pieces1 & 1 << 2 == 0) as u32,
+                ),
             )
     }
 
@@ -94,7 +102,7 @@ impl TeamLayout {
 
 // the positions of the kings
 #[derive(Debug, Default, Clone, Copy)]
-struct KingPos {
+pub struct KingPos {
     king0: u32,
     king1: u32,
 }
@@ -113,6 +121,8 @@ pub struct AllTables {
     size: u32,
     cards: Cards,
     list: Box<[Table]>,
+    is_done: AtomicU64,
+    is_not_done: AtomicU64,
 }
 
 impl AllTables {
@@ -123,11 +133,7 @@ impl AllTables {
     }
 
     fn count_ones(&self) -> u64 {
-        self.list
-            .iter()
-            .flat_map(|l| l.list.iter())
-            .map(|x| x.load(Ordering::Relaxed).bitand((1 << 30) - 1).count_ones() as u64)
-            .sum()
+        self.list.iter().map(|x| x.count_ones()).sum()
     }
 
     fn len(&self) -> u64 {
@@ -156,6 +162,13 @@ impl Table {
             slice,
             counts: self.counts,
         }
+    }
+
+    fn count_ones(&self) -> u64 {
+        self.list
+            .iter()
+            .map(|x| x.load(Ordering::Relaxed).bitand((1 << 30) - 1).count_ones() as u64)
+            .sum()
     }
 }
 
@@ -220,7 +233,7 @@ impl AllTables {
             let s = unsafe { accum.slice.get_mut(i).unwrap_unchecked() };
             if oldk.king1 as usize == to {
                 // king is gone, so old state is not lost
-                *s |= accum.mask;
+                debug_assert_eq!(*s | accum.mask, *s);
                 return;
             }
 
@@ -228,6 +241,12 @@ impl AllTables {
             if oldk.king0 as usize == from {
                 newk.king0 = to as u32
             }
+            if newk.king0 == 22 {
+                // we take the opp temple, we win
+                debug_assert_eq!(*s | accum.mask, *s);
+                return;
+            }
+
             // if new state is not won, then old state is not lost
             *s |= !new_slice[newk].load(Ordering::Relaxed) & accum.mask;
         });
@@ -253,6 +272,9 @@ impl AllTables {
             if oldk.king1 as usize == from {
                 newk.king1 = to as u32
             }
+            if newk.king1 == 2 {
+                return;
+            }
             // if accum state is lost, then new state is won
             let fetch = new_slice[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
             if fetch | spread.slice[i] != fetch {
@@ -273,6 +295,9 @@ impl AllTables {
             let mut newk = *oldk;
             if oldk.king1 as usize == from {
                 newk.king1 = to as u32
+            }
+            if newk.king1 == 2 {
+                return;
             }
             // if accum state is lost, then new state is won
             new_slice[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
@@ -305,13 +330,19 @@ impl AllTables {
         // every 1 bit means that it must be a draw or win
         // we will gradually flip these to 1s, leaving only losses on 0
         // it is initialized to the wins, because those are not lost even when they don't have moves
-        let inv_layout = layout.invert();
-        let inv_slice = self.index_count(inv_layout.counts()).index(inv_layout);
         let mut status: Box<[u32]> = layout
             .indexer(current.counts)
             .into_iter()
-            .map(|kpos| inv_slice[kpos.invert()].load(Ordering::Relaxed))
+            .map(|kpos| 0)
             .collect();
+        self.ez_win_for_each(
+            current.counts.invert(),
+            layout.invert(),
+            &mut |kpos, mask| {
+                let i = layout.indexer(current.counts).index(&kpos.invert());
+                status[i] |= mask;
+            },
+        );
 
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             let directions = card.bitmap::<false>();
@@ -341,6 +372,30 @@ impl AllTables {
         status
             .iter_mut()
             .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
+
+        #[cfg(debug_assertions)]
+        {
+            let inv_slice = self
+                .index_count(current.counts.invert())
+                .index(layout.invert());
+            let mut wins: Box<[u32]> = layout
+                .indexer(current.counts)
+                .into_iter()
+                .map(|kpos| inv_slice[kpos.invert()].load(Ordering::Relaxed))
+                .map(|mask| Block(mask).invert().0)
+                .collect();
+
+            for (i, (l, w)) in zip(status.iter(), wins.iter()).enumerate() {
+                // let l = !Block(*x).invert().expand().invert().0;
+                let win_loss = w & l;
+                if win_loss != 0 {
+                    let kpos = layout.indexer(current.counts).into_iter().nth(i).unwrap();
+                    pretty(layout, kpos);
+                    println!("wins: {:030b}, loss: {:030b}", w, l);
+                    exit(1)
+                }
+            }
+        }
 
         let mut progress = false;
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
@@ -372,34 +427,52 @@ impl AllTables {
                 }
             }
         }
+
+        if progress {
+            self.is_not_done.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.is_done.fetch_add(1, Ordering::Relaxed);
+        }
+
         progress
     }
 
     pub fn mark_ez_win(&self, counts: PawnCount) {
         for layout in counts.indexer() {
-            let layout: TeamLayout = layout;
-            let TeamLayout {
-                pieces0, pieces1, ..
-            } = layout;
-            let counts = layout.counts();
+            self.ez_win_for_each(counts, layout, &mut |i, mask| {
+                // mask is the future cards
+                self.index_count(counts).index(layout)[i]
+                    .fetch_or(Block(mask).invert().expand().0, Ordering::Relaxed);
+            })
+        }
+    }
 
-            for (card, mask) in zip(self.cards.iter(), mask_iter()) {
-                // from where can you attack the temple?
-                let from_mask = offset_mask(2, card.bitmap::<false>());
+    pub fn ez_win_for_each(
+        &self,
+        counts: PawnCount,
+        layout: TeamLayout,
+        f: &mut impl FnMut(KingPos, u32),
+    ) {
+        let layout: TeamLayout = layout;
+        let TeamLayout {
+            pieces0, pieces1, ..
+        } = layout;
 
-                layout.indexer(counts).for_enumerate(|i, kpos| {
-                    if 1 << kpos.king1 & !from_mask == 0 {
-                        self.index_count(counts).index(layout).slice[i]
-                            .fetch_or(Block(mask).expand().0, Ordering::Relaxed);
+        for (card, mask) in zip(self.cards.iter(), mask_iter()) {
+            // from where can you attack the temple?
+            let from_mask = offset_mask(2, card.bitmap::<false>()) | 1 << 2;
+
+            layout.indexer(counts).for_enumerate(|i, kpos| {
+                if 1 << kpos.king1 & from_mask == 0 {
+                    // no attack on temple
+                    let from_mask = offset_mask(kpos.king0 as usize, card.bitmap::<false>());
+                    if from_mask & pieces1 == 0 {
+                        // no attack on king
                         return;
                     }
-                    let from_mask = offset_mask(kpos.king0 as usize, card.bitmap::<false>());
-                    if from_mask & pieces1 != 0 {
-                        let r = self.index_count(counts).index(layout);
-                        r.slice[i].fetch_or(Block(mask).expand().0, Ordering::Relaxed);
-                    }
-                })
-            }
+                }
+                f(*kpos, mask);
+            })
         }
     }
 
@@ -410,23 +483,21 @@ impl AllTables {
             list: count_indexer(size)
                 .into_iter()
                 .map(|counts: PawnCount| {
+                    let chunk_size = (counts.count0 + 1) as usize * (counts.count1 + 1) as usize;
                     let list = counts
                         .indexer()
                         .into_iter()
-                        .flat_map(|layout| {
-                            layout
-                                .indexer(counts)
-                                .into_iter()
-                                .map(|_| AtomicU32::new(0))
-                        })
+                        .flat_map(|layout| repeat_with(|| AtomicU32::new(0)).take(chunk_size))
                         .collect();
                     Table {
                         counts,
-                        chunk_size: (counts.count0 + 1) as usize * (counts.count1 + 1) as usize,
+                        chunk_size,
                         list,
                     }
                 })
                 .collect(),
+            is_done: Default::default(),
+            is_not_done: Default::default(),
         };
 
         for counts in count_indexer(size) {
@@ -446,6 +517,7 @@ impl AllTables {
                 iters += 1;
             }
             println!("finished {counts:?} in {iters} iterations");
+            println!("{} wins", tb.index_count(counts).count_ones());
         }
 
         tb
@@ -457,7 +529,7 @@ fn mask_iter() -> impl Iterator<Item = u32> {
     std::iter::repeat_with(move || {
         let res = mask;
         mask = mask << 6 | mask >> 24;
-        res
+        res & ((1 << 30) - 1)
     })
 }
 
@@ -469,7 +541,7 @@ impl Block {
         let data = self.0;
         const MASK0: u32 = 0b001001_001001_001001_001001_001001;
         const MASK1: u32 = 0b000111_000111_000111_000111_000111;
-        let data = (data & MASK0) << 1 | (data & MASK0 << 1) >> 1 | (data & MASK0 << 2);
+        let data = (data & MASK0 << 1) << 1 | (data & MASK0 << 2) >> 1 | (data & MASK0);
         let data = (data & MASK1) << 3 | (data & MASK1 << 3) >> 3;
         Self(data)
     }
@@ -501,23 +573,65 @@ impl Card {
     }
 }
 
+fn pretty(layout: TeamLayout, kpos: KingPos) {
+    let TeamLayout { pieces0, pieces1 } = layout;
+    let KingPos { king0, king1 } = kpos;
+    debug_assert_eq!(pieces0 & pieces1, 0);
+    debug_assert_ne!(1 << king0 & pieces0, 0);
+    debug_assert_ne!(1 << king1 & pieces1, 0);
+
+    println!("----- x side");
+    for y in 0..5 {
+        for x in 0..5 {
+            let i = 24 - 5 * y - x;
+            if king0 == i {
+                print!("O")
+            } else if king1 == i {
+                print!("X")
+            } else if 1 << i & pieces0 != 0 {
+                print!("o")
+            } else if 1 << i & pieces1 != 0 {
+                print!("x")
+            } else {
+                print!(".")
+            }
+        }
+        println!()
+    }
+    println!("----- o side")
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::index::Indexer;
+    use std::sync::atomic::Ordering;
 
-    use super::{AllTables, PawnCount, TeamLayout};
+    use crate::{index::Indexer, onitama_simd::Block};
+
+    use super::{mask_iter, AllTables, PawnCount, TeamLayout};
 
     #[test]
     fn build_tb() {
         let tb = AllTables::build(2, 0b11111);
-        assert_eq!(tb.count_ones(), 6067625);
-        println!("{} total", tb.len() * 30)
+        assert_eq!(tb.count_ones(), 6763785);
+        println!("{} total", tb.len() * 30);
+        println!(
+            "{} done, {} not done",
+            tb.is_done.load(Ordering::Relaxed),
+            tb.is_not_done.load(Ordering::Relaxed)
+        )
     }
 
     #[test]
     fn counts0() {
         for layout in PawnCount::default().indexer() {
             dbg!(layout);
+        }
+    }
+
+    #[test]
+    fn mask_test() {
+        for mask in mask_iter().take(5) {
+            assert_eq!(mask, Block(mask).invert().0)
         }
     }
 
