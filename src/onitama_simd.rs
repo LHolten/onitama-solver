@@ -198,6 +198,8 @@ pub struct Update<'a> {
     current: &'a Table,
     take_one: Option<&'a Table>,
     leave_one: Option<&'a Table>,
+    wins: Vec<u32>,
+    status: Vec<u32>,
 }
 
 #[derive(Debug)]
@@ -316,14 +318,15 @@ impl AllTables {
     }
 
     // returns whether there was any progress
-    pub fn update_layout(&self, update: Update<'_>) -> bool {
+    pub fn update_layout(&self, update: &mut Update<'_>) -> bool {
         let Update {
             layout,
             inv_current,
             current,
             take_one,
             leave_one,
-        } = update;
+            ..
+        } = *update;
         let TeamLayout {
             pieces0, pieces1, ..
         } = layout;
@@ -331,12 +334,14 @@ impl AllTables {
 
         let inv_slice = inv_current.index(layout.invert());
         // wins are still inverted here :/
-        let mut wins: Box<[u32]> = layout
-            .indexer(current.counts)
-            .into_iter()
-            .map(|kpos| inv_slice[kpos.invert()].load(Ordering::Relaxed))
-            .collect();
-        let mut win_and = wins.iter().fold(RESOLVED_BIT, |a, b| a & *b);
+        update.wins.clear();
+        update.wins.extend(
+            layout
+                .indexer(current.counts)
+                .into_iter()
+                .map(|kpos| inv_slice[kpos.invert()].load(Ordering::Relaxed)),
+        );
+        let mut win_and = update.wins.iter().fold(RESOLVED_BIT, |a, b| a & *b);
         if win_and == RESOLVED_BIT {
             return false;
         }
@@ -345,11 +350,10 @@ impl AllTables {
         // every 1 bit means that it must be a draw or win
         // we will gradually flip these to 1s, leaving only losses on 0
         // it is initialized to the wins, because those are not lost even when they don't have moves
-        let mut status: Box<[u32]> = layout
-            .indexer(current.counts)
-            .into_iter()
-            .map(|kpos| 0)
-            .collect();
+        update.status.clear();
+        update
+            .status
+            .extend(repeat(0).take(layout.indexer(current.counts).total()));
 
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             let directions = card.bitmap::<false>();
@@ -366,7 +370,7 @@ impl AllTables {
                         current,
                         take_one,
                         step: (from, to),
-                        slice: &mut status,
+                        slice: &mut update.status,
                         mask,
                     };
                     self.accumulate(accum);
@@ -376,15 +380,16 @@ impl AllTables {
 
         // we expand, marking all states that are not lost because it has the card
         // then we negate to get only the lost states
-        status
+        update
+            .status
             .iter_mut()
             .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
 
         {
             let mut all_done = true;
             layout.indexer(current.counts).for_enumerate(|i, kpos| {
-                let w = Block(wins[i]).invert().0;
-                let l = status[i];
+                let w = Block(update.wins[i]).invert().0;
+                let l = update.status[i];
                 debug_assert_eq!(w & l, 0);
                 if (w | l) & BLOCK_MASK == BLOCK_MASK {
                     inv_slice[kpos.invert()].fetch_or(RESOLVED_BIT, Ordering::Relaxed);
@@ -399,7 +404,10 @@ impl AllTables {
         let mut progress = false;
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             // we spread out the loses, these are wins for the previous state
-            let tmp: Box<[u32]> = status.iter().map(|x| Block(x & mask).expand().0).collect();
+            update.wins.clear();
+            update
+                .wins
+                .extend(update.status.iter().map(|x| Block(x & mask).expand().0));
             // same thing, but cards are now inverted
             // but it is also the other team, so not inverted
             let directions = card.bitmap::<false>();
@@ -417,7 +425,7 @@ impl AllTables {
                         current,
                         leave_one,
                         step: (from, to),
-                        slice: &tmp,
+                        slice: &update.wins,
                     };
                     progress |= self.spreadout(spread);
                 }
@@ -443,7 +451,6 @@ impl AllTables {
         layout: TeamLayout,
         f: &mut impl FnMut(KingPos, u32),
     ) {
-        let layout: TeamLayout = layout;
         let TeamLayout {
             pieces0, pieces1, ..
         } = layout;
@@ -474,10 +481,9 @@ impl AllTables {
                 .into_iter()
                 .map(|counts: PawnCount| {
                     let chunk_size = (counts.count0 + 1) as usize * (counts.count1 + 1) as usize;
-                    let list = counts
-                        .indexer()
-                        .into_iter()
-                        .flat_map(|layout| repeat_with(|| AtomicU32::new(0)).take(chunk_size))
+                    let num_chunks = counts.indexer().total();
+                    let list = repeat_with(|| AtomicU32::new(0))
+                        .take(chunk_size * num_chunks)
                         .collect();
                     Table {
                         counts,
@@ -498,35 +504,34 @@ impl AllTables {
 
         for counts in count_indexer(size) {
             let PawnCount { count0, count1 } = counts;
-            let current = tb.index_count(counts);
-            let take_one = (count1 != 0).then(|| {
-                tb.index_count(PawnCount {
-                    count0,
-                    count1: count1 - 1,
-                })
-            });
-            let leave_one = (count0 + 1 != tb.size).then(|| {
-                tb.index_count(PawnCount {
-                    count0: count0 + 1,
-                    count1,
-                })
-            });
-            let inv_current = tb.index_count(counts.invert());
+
+            let mut update = Update {
+                layout: Default::default(),
+                current: tb.index_count(counts),
+                inv_current: tb.index_count(counts.invert()),
+                take_one: (count1 != 0).then(|| {
+                    tb.index_count(PawnCount {
+                        count0,
+                        count1: count1 - 1,
+                    })
+                }),
+                leave_one: (count0 + 1 != tb.size).then(|| {
+                    tb.index_count(PawnCount {
+                        count0: count0 + 1,
+                        count1,
+                    })
+                }),
+                wins: vec![],
+                status: vec![],
+            };
 
             let mut iters = 0;
             let mut progress = true;
             while progress {
                 progress = false;
                 for layout in counts.indexer() {
-                    let mut update = Update {
-                        layout,
-                        inv_current,
-                        current,
-                        take_one,
-                        leave_one,
-                    };
-
-                    progress |= tb.update_layout(update);
+                    update.layout = layout;
+                    progress |= tb.update_layout(&mut update);
                 }
                 iters += 1;
             }
