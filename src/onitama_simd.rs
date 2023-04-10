@@ -19,6 +19,8 @@ use crate::{
 };
 
 pub const TABLE_MASK: u32 = (1 << 25) - 1;
+pub const BLOCK_MASK: u32 = (1 << 30) - 1;
+pub const RESOLVED_BIT: u32 = 1 << 30;
 
 fn count_indexer(size: u32) -> impl Indexer<Item = PawnCount> {
     let count_mask = (1u32 << size) - 1;
@@ -167,7 +169,7 @@ impl Table {
     fn count_ones(&self) -> u64 {
         self.list
             .iter()
-            .map(|x| x.load(Ordering::Relaxed).bitand((1 << 30) - 1).count_ones() as u64)
+            .map(|x| x.load(Ordering::Relaxed).bitand(BLOCK_MASK).count_ones() as u64)
             .sum()
     }
 }
@@ -326,6 +328,20 @@ impl AllTables {
             })
         });
 
+        let inv_slice = self
+            .index_count(current.counts.invert())
+            .index(layout.invert());
+        // wins are still inverted here :/
+        let mut wins: Box<[u32]> = layout
+            .indexer(current.counts)
+            .into_iter()
+            .map(|kpos| inv_slice[kpos.invert()].load(Ordering::Relaxed))
+            .collect();
+        let mut win_and = wins.iter().fold(RESOLVED_BIT, |a, b| a & *b);
+        if win_and == RESOLVED_BIT {
+            return false;
+        }
+
         // every 0 bit means that it could be anything, win loss or draw
         // every 1 bit means that it must be a draw or win
         // we will gradually flip these to 1s, leaving only losses on 0
@@ -373,37 +389,30 @@ impl AllTables {
             .iter_mut()
             .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
 
-        #[cfg(debug_assertions)]
         {
-            let inv_slice = self
-                .index_count(current.counts.invert())
-                .index(layout.invert());
-            let mut wins: Box<[u32]> = layout
-                .indexer(current.counts)
-                .into_iter()
-                .map(|kpos| inv_slice[kpos.invert()].load(Ordering::Relaxed))
-                .map(|mask| Block(mask).invert().0)
-                .collect();
-
-            for (i, (l, w)) in zip(status.iter(), wins.iter()).enumerate() {
-                // let l = !Block(*x).invert().expand().invert().0;
-                let win_loss = w & l;
-                if win_loss != 0 {
-                    let kpos = layout.indexer(current.counts).into_iter().nth(i).unwrap();
-                    pretty(layout, kpos);
-                    println!("wins: {:030b}, loss: {:030b}", w, l);
-                    exit(1)
+            let mut all_done = true;
+            layout.indexer(current.counts).for_enumerate(|i, kpos| {
+                let w = Block(wins[i]).invert().0;
+                let l = status[i];
+                debug_assert_eq!(w & l, 0);
+                if (w | l) & BLOCK_MASK == BLOCK_MASK {
+                    inv_slice[kpos.invert()].fetch_or(RESOLVED_BIT, Ordering::Relaxed);
+                } else {
+                    all_done = false;
                 }
+            });
+
+            if all_done {
+                self.is_done.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.is_not_done.fetch_add(1, Ordering::Relaxed);
             }
         }
 
         let mut progress = false;
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             // we spread out the loses, these are wins for the previous state
-            let tmp: Box<[u32]> = status
-                .iter()
-                .map(|x| Block(x & mask).expand().0 & ((1 << 30) - 1))
-                .collect();
+            let tmp: Box<[u32]> = status.iter().map(|x| Block(x & mask).expand().0).collect();
             // same thing, but cards are now inverted
             // but it is also the other team, so not inverted
             let directions = card.bitmap::<false>();
@@ -426,12 +435,6 @@ impl AllTables {
                     progress |= self.spreadout(spread);
                 }
             }
-        }
-
-        if progress {
-            self.is_not_done.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.is_done.fetch_add(1, Ordering::Relaxed);
         }
 
         progress
@@ -529,7 +532,7 @@ fn mask_iter() -> impl Iterator<Item = u32> {
     std::iter::repeat_with(move || {
         let res = mask;
         mask = mask << 6 | mask >> 24;
-        res & ((1 << 30) - 1)
+        res & BLOCK_MASK
     })
 }
 
@@ -548,10 +551,9 @@ impl Block {
 
     pub fn expand(self) -> Self {
         let data = self.0 as u64;
-        // debug_assert_eq!(data & ((1 << 30) - 1), 0);
         let data = data << 10 | data << 20;
         let data = data | data >> 30;
-        Self(data as u32)
+        Self(data as u32 & BLOCK_MASK)
     }
 }
 
