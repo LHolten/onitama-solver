@@ -193,9 +193,8 @@ impl Index<KingPos> for SubTable<'_> {
 }
 
 pub struct Update<'a> {
-    inv_layout: TeamLayout,
     layout: TeamLayout,
-    inv_slice: &'a Table,
+    inv_current: &'a Table,
     current: &'a Table,
     take_one: Option<&'a Table>,
     leave_one: Option<&'a Table>,
@@ -317,29 +316,20 @@ impl AllTables {
     }
 
     // returns whether there was any progress
-    pub fn update_layout(&self, layout: TeamLayout) -> bool {
+    pub fn update_layout(&self, update: Update<'_>) -> bool {
+        let Update {
+            layout,
+            inv_current,
+            current,
+            take_one,
+            leave_one,
+        } = update;
         let TeamLayout {
             pieces0, pieces1, ..
         } = layout;
-        let PawnCount { count0, count1 } = layout.counts();
+        let PawnCount { count0, count1 } = current.counts;
 
-        let current = self.index_count(PawnCount { count0, count1 });
-        let take_one = (count1 != 0).then(|| {
-            self.index_count(PawnCount {
-                count0,
-                count1: count1 - 1,
-            })
-        });
-        let leave_one = (count0 + 1 != self.size).then(|| {
-            self.index_count(PawnCount {
-                count0: count0 + 1,
-                count1,
-            })
-        });
-
-        let inv_slice = self
-            .index_count(current.counts.invert())
-            .index(layout.invert());
+        let inv_slice = inv_current.index(layout.invert());
         // wins are still inverted here :/
         let mut wins: Box<[u32]> = layout
             .indexer(current.counts)
@@ -507,12 +497,36 @@ impl AllTables {
         println!("{} wins and {} total", tb.count_ones(), tb.len() * 30);
 
         for counts in count_indexer(size) {
+            let PawnCount { count0, count1 } = counts;
+            let current = tb.index_count(counts);
+            let take_one = (count1 != 0).then(|| {
+                tb.index_count(PawnCount {
+                    count0,
+                    count1: count1 - 1,
+                })
+            });
+            let leave_one = (count0 + 1 != tb.size).then(|| {
+                tb.index_count(PawnCount {
+                    count0: count0 + 1,
+                    count1,
+                })
+            });
+            let inv_current = tb.index_count(counts.invert());
+
             let mut iters = 0;
             let mut progress = true;
             while progress {
                 progress = false;
                 for layout in counts.indexer() {
-                    progress |= tb.update_layout(layout);
+                    let mut update = Update {
+                        layout,
+                        inv_current,
+                        current,
+                        take_one,
+                        leave_one,
+                    };
+
+                    progress |= tb.update_layout(update);
                 }
                 iters += 1;
             }
