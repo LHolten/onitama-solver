@@ -245,6 +245,7 @@ pub struct Spread<'a> {
     go_up: bool,
     step: (usize, usize),
     slice: &'a [u32],
+    king_lookup: &'a KingLookup,
 }
 
 impl AllTables {
@@ -302,28 +303,38 @@ impl AllTables {
         if spread.go_up {
             new.pieces0 |= 1 << from;
         }
-        let new_slice = LazyCell::new(|| {
-            if spread.go_up {
-                spread.leave_one.unwrap().index(new)
-            } else {
-                spread.current.index(new)
-            }
-        });
+        let table = if spread.go_up {
+            let Some(table) = spread.leave_one else { 
+                // there is no larger table, so no progress
+                return false
+            };
+            table
+        } else {
+            spread.current
+        };
+        let new_slice = table.index(new);
 
         let mut progress = false;
-        old.indexer(spread.current.counts).for_enumerate(|i, oldk| {
-            debug_assert_ne!(oldk.king0 as usize, to);
-
-            let mut newk = *oldk;
-            if oldk.king1 as usize == from {
-                newk.king1 = to as u32;
-                if newk.king1 == 2 {
+        new.indexer(table.counts).for_enumerate(|new_i, newk| {
+            let mut oldk = *newk;
+            if newk.king1 as usize == to {
+                oldk.king1 = from as u32;
+                if oldk.king1 == 2 {
                     return;
                 }
             }
+
+            if oldk.king0 as usize == from {
+                // this king was added, so this oldk did not exist
+                return;
+            }
+
+            let old_i = spread.king_lookup[oldk] as usize;
+            let new_val = unsafe { new_slice.slice.get(new_i).unwrap_unchecked() };
             // if accum state is lost, then new state is won
-            let fetch = new_slice[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
-            if fetch | spread.slice[i] != fetch {
+            let fetch = new_val.fetch_or(spread.slice[old_i], Ordering::Relaxed);
+
+            if fetch | spread.slice[old_i] != fetch {
                 progress = true;
             }
         });
@@ -349,13 +360,13 @@ impl AllTables {
 
         let inv_slice = inv_current.index(layout.invert());
         // wins are still inverted here :/
-        update.wins.clear();
-        update.wins.extend(
-            layout
-                .indexer(current.counts)
-                .into_iter()
-                .map(|kpos| inv_slice[kpos.invert()].load(Ordering::Relaxed)),
-        );
+        update
+            .wins
+            .resize(layout.indexer(current.counts).total(), 0);
+        layout.indexer(current.counts).for_enumerate(|i, kpos| {
+            let s = unsafe { update.wins.get_mut(i).unwrap_unchecked() };
+            *s = inv_slice[kpos.invert()].load(Ordering::Relaxed);
+        });
         let mut win_and = update.wins.iter().fold(RESOLVED_BIT, |a, b| a & *b);
         if win_and == RESOLVED_BIT && !go_up {
             return false;
@@ -463,6 +474,7 @@ impl AllTables {
                         go_up,
                         step: (from, to),
                         slice: &update.wins,
+                        king_lookup: &update.king_lookup,
                     };
                     progress |= self.spreadout(spread);
                 }
