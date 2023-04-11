@@ -198,6 +198,7 @@ pub struct Update<'a> {
     current: &'a Table,
     take_one: Option<&'a Table>,
     leave_one: Option<&'a Table>,
+    go_up: bool,
     wins: Vec<u32>,
     status: Vec<u32>,
 }
@@ -216,6 +217,7 @@ pub struct Spread<'a> {
     layout: TeamLayout,
     current: &'a Table,
     leave_one: Option<&'a Table>,
+    go_up: bool,
     step: (usize, usize),
     slice: &'a [u32],
 }
@@ -274,7 +276,16 @@ impl AllTables {
             pieces0: old.pieces0,
             pieces1: old.pieces1 ^ (1 << to) ^ (1 << from),
         };
-        let new_slice = LazyCell::new(|| spread.current.index(new));
+        if spread.go_up {
+            new.pieces0 |= 1 << from;
+        }
+        let new_slice = LazyCell::new(|| {
+            if spread.go_up {
+                spread.leave_one.unwrap().index(new)
+            } else {
+                spread.current.index(new)
+            }
+        });
 
         let mut progress = false;
         old.indexer(spread.current.counts).for_enumerate(|i, oldk| {
@@ -294,26 +305,6 @@ impl AllTables {
             }
         });
 
-        if new.pieces0.count_ones() == self.size {
-            return progress;
-        }
-
-        new.pieces0 |= 1 << from;
-        let new_slice = spread.leave_one.unwrap().index(new);
-
-        old.indexer(spread.current.counts).for_enumerate(|i, oldk| {
-            debug_assert_ne!(oldk.king0 as usize, to);
-
-            let mut newk = *oldk;
-            if oldk.king1 as usize == from {
-                newk.king1 = to as u32;
-                if newk.king1 == 2 {
-                    return;
-                }
-            }
-            // if accum state is lost, then new state is won
-            new_slice[newk].fetch_or(spread.slice[i], Ordering::Relaxed);
-        });
         progress
     }
 
@@ -325,6 +316,7 @@ impl AllTables {
             current,
             take_one,
             leave_one,
+            go_up,
             ..
         } = *update;
         let TeamLayout {
@@ -342,7 +334,7 @@ impl AllTables {
                 .map(|kpos| inv_slice[kpos.invert()].load(Ordering::Relaxed)),
         );
         let mut win_and = update.wins.iter().fold(RESOLVED_BIT, |a, b| a & *b);
-        if win_and == RESOLVED_BIT {
+        if win_and == RESOLVED_BIT && !go_up {
             return false;
         }
 
@@ -424,6 +416,7 @@ impl AllTables {
                         layout,
                         current,
                         leave_one,
+                        go_up,
                         step: (from, to),
                         slice: &update.wins,
                     };
@@ -521,6 +514,7 @@ impl AllTables {
                         count1,
                     })
                 }),
+                go_up: false,
                 wins: vec![],
                 status: vec![],
             };
@@ -535,6 +529,15 @@ impl AllTables {
                 }
                 iters += 1;
             }
+
+            if update.leave_one.is_some() {
+                update.go_up = true;
+                for layout in counts.indexer() {
+                    update.layout = layout;
+                    progress |= tb.update_layout(&mut update);
+                }
+            }
+
             println!("finished {counts:?} in {iters} iterations");
             println!("{} wins", tb.index_count(counts).count_ones());
         }
