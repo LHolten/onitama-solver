@@ -5,7 +5,7 @@ use std::{
     cell::LazyCell,
     iter::{repeat, repeat_with, zip},
     mem::transmute,
-    ops::{BitAnd, Index, Shr},
+    ops::{BitAnd, Index, IndexMut, Shr},
     process::exit,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
@@ -123,8 +123,10 @@ pub struct AllTables {
     size: u32,
     cards: Cards,
     list: Box<[Table]>,
-    is_done: AtomicU64,
-    is_not_done: AtomicU64,
+    block_done: AtomicU64,
+    block_not_done: AtomicU64,
+    card_done: AtomicU64,
+    card_not_done: AtomicU64,
 }
 
 impl AllTables {
@@ -192,6 +194,27 @@ impl Index<KingPos> for SubTable<'_> {
     }
 }
 
+#[derive(Debug)]
+struct KingLookup {
+    list: [u8; 25 * 25],
+}
+
+impl Index<KingPos> for KingLookup {
+    type Output = u8;
+
+    fn index(&self, index: KingPos) -> &Self::Output {
+        let i = index.king0 * 25 + index.king1;
+        unsafe { self.list.get(i as usize).unwrap_unchecked() }
+    }
+}
+
+impl IndexMut<KingPos> for KingLookup {
+    fn index_mut(&mut self, index: KingPos) -> &mut Self::Output {
+        let i = index.king0 * 25 + index.king1;
+        unsafe { self.list.get_mut(i as usize).unwrap_unchecked() }
+    }
+}
+
 pub struct Update<'a> {
     layout: TeamLayout,
     inv_current: &'a Table,
@@ -201,6 +224,7 @@ pub struct Update<'a> {
     go_up: bool,
     wins: Vec<u32>,
     status: Vec<u32>,
+    king_lookup: KingLookup,
 }
 
 #[derive(Debug)]
@@ -211,6 +235,7 @@ pub struct Accum<'a> {
     mask: u32,
     step: (usize, usize),
     slice: &'a mut [u32],
+    king_lookup: &'a KingLookup,
 }
 
 pub struct Spread<'a> {
@@ -228,41 +253,39 @@ impl AllTables {
 
         let old = accum.layout;
 
-        let new_slice = LazyCell::new(|| {
-            let new = TeamLayout {
-                pieces0: old.pieces0 ^ (1 << to) ^ (1 << from),
-                pieces1: old.pieces1 & !(1 << to),
+        let new = TeamLayout {
+            pieces0: old.pieces0 ^ (1 << to) ^ (1 << from),
+            pieces1: old.pieces1 & !(1 << to),
+        };
+
+        // check if we are taking a piece
+        let table = if old.pieces1 & 1 << to != 0 {
+            let Some(table) = accum.take_one else {
+                // there is no way to take a piece when there is only a king to take
+                return
             };
-            if old.pieces1 & 1 << to != 0 {
-                // we are taking a piece
-                accum.take_one.unwrap().index(new)
-            } else {
-                // not taking a piece
-                accum.current.index(new)
-            }
-        });
+            table
+        } else {
+            accum.current
+        };
+        let new_slice = table.index(new);
 
-        // for
-        old.indexer(accum.current.counts).for_enumerate(|i, oldk| {
-            let s = unsafe { accum.slice.get_mut(i).unwrap_unchecked() };
-            if oldk.king1 as usize == to {
-                // we take the opp king, we win
-                *s |= accum.mask;
-                return;
-            }
-
-            let mut newk = *oldk;
-            if oldk.king0 as usize == from {
-                newk.king0 = to as u32;
-                if newk.king0 == 22 {
-                    // we take the opp temple, we win
-                    *s |= accum.mask;
+        new.indexer(table.counts).for_enumerate(|new_i, newk| {
+            let mut oldk = *newk;
+            if newk.king0 as usize == to {
+                oldk.king0 = from as u32;
+                if oldk.king0 == 22 {
+                    // there is no way we came from the temple
                     return;
                 }
             }
 
+            let new_val = unsafe { new_slice.slice.get(new_i).unwrap_unchecked() };
+            let old_i = accum.king_lookup[oldk] as usize;
+            debug_assert_eq!(old_i, old.indexer(accum.current.counts).index(&oldk));
+            let s = unsafe { accum.slice.get_mut(old_i).unwrap_unchecked() };
             // if new state is not won, then old state is not lost
-            *s |= !new_slice[newk].load(Ordering::Relaxed) & accum.mask;
+            *s |= !new_val.load(Ordering::Relaxed) & accum.mask;
         });
     }
 
@@ -347,6 +370,10 @@ impl AllTables {
             .status
             .extend(repeat(0).take(layout.indexer(current.counts).total()));
 
+        layout
+            .indexer(current.counts)
+            .for_enumerate(|i, oldk| update.king_lookup[*oldk] = i as u8);
+
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             let directions = card.bitmap::<false>();
 
@@ -364,6 +391,7 @@ impl AllTables {
                         step: (from, to),
                         slice: &mut update.status,
                         mask,
+                        king_lookup: &update.king_lookup,
                     };
                     self.accumulate(accum);
                 }
@@ -378,19 +406,35 @@ impl AllTables {
             .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
 
         {
-            let mut all_done = true;
+            let mut all_done = BLOCK_MASK;
+            let mut num_done = 0;
+            let mut num_not_done = 0;
             layout.indexer(current.counts).for_enumerate(|i, kpos| {
                 let w = Block(update.wins[i]).invert().0;
+                update.status[i] &= !w;
                 let l = update.status[i];
-                debug_assert_eq!(w & l, 0);
+                // debug_assert_eq!(w & l, 0);
+                all_done &= (w | l);
                 if (w | l) & BLOCK_MASK == BLOCK_MASK {
                     inv_slice[kpos.invert()].fetch_or(RESOLVED_BIT, Ordering::Relaxed);
-                    self.is_done.fetch_add(1, Ordering::Relaxed);
+                    num_done += 1;
                 } else {
-                    all_done = false;
-                    self.is_not_done.fetch_add(1, Ordering::Relaxed);
+                    num_not_done += 1;
                 }
             });
+            // if all_done != BLOCK_MASK {
+            //     for mask in mask_iter().take(5) {
+            //         let mask = Block(mask).invert().expand().invert().0;
+            //         if all_done & mask == mask {
+            //             self.card_done.fetch_add(1, Ordering::Relaxed);
+            //         } else {
+            //             self.card_not_done.fetch_add(1, Ordering::Relaxed);
+            //         }
+            //     }
+            //     self.block_done.fetch_add(num_done, Ordering::Relaxed);
+            //     self.block_not_done
+            //         .fetch_add(num_not_done, Ordering::Relaxed);
+            // }
         }
 
         let mut progress = false;
@@ -485,8 +529,10 @@ impl AllTables {
                     }
                 })
                 .collect(),
-            is_done: Default::default(),
-            is_not_done: Default::default(),
+            block_done: Default::default(),
+            block_not_done: Default::default(),
+            card_done: Default::default(),
+            card_not_done: Default::default(),
         };
 
         for counts in count_indexer(size) {
@@ -517,6 +563,7 @@ impl AllTables {
                 go_up: false,
                 wins: vec![],
                 status: vec![],
+                king_lookup: KingLookup { list: [0; 25 * 25] },
             };
 
             let mut iters = 0;
@@ -633,13 +680,18 @@ mod tests {
     #[test]
     fn build_tb() {
         let tb = AllTables::build(2, 0b11111);
-        assert_eq!(tb.count_ones(), 6752579);
         println!("{} total", tb.len() * 30);
         println!(
-            "{} done, {} not done",
-            tb.is_done.load(Ordering::Relaxed),
-            tb.is_not_done.load(Ordering::Relaxed)
-        )
+            "{} blocks done, {} blocks not done",
+            tb.block_done.load(Ordering::Relaxed),
+            tb.block_not_done.load(Ordering::Relaxed)
+        );
+        println!(
+            "{} cards done, {} cards not done",
+            tb.card_done.load(Ordering::Relaxed),
+            tb.card_not_done.load(Ordering::Relaxed)
+        );
+        assert_eq!(tb.count_ones(), 6752579);
     }
 
     #[test]
