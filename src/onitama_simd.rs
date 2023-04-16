@@ -1,13 +1,14 @@
 #![allow(unused)]
+use rayon::prelude::*;
 
 use std::{
     alloc::Layout,
-    cell::LazyCell,
+    cell::{LazyCell, RefCell},
     iter::{repeat, repeat_with, zip},
     mem::transmute,
     ops::{BitAnd, Index, IndexMut, Shr},
     process::exit,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering, AtomicBool},
 };
 
 use bit_iter::BitIter;
@@ -215,16 +216,24 @@ impl IndexMut<KingPos> for KingLookup {
     }
 }
 
-pub struct Update<'a> {
-    layout: TeamLayout,
+thread_local! {
+    static UPDATE: RefCell<(Vec<u32>, Vec<u32>, KingLookup)> = RefCell::new((Vec::new(), Vec::new(), KingLookup { list: [0; 25 * 25] }));
+}
+
+pub struct ImmutableUpdate<'a> {
     inv_current: &'a Table,
     current: &'a Table,
     take_one: Option<&'a Table>,
     leave_one: Option<&'a Table>,
     go_up: bool,
-    wins: Vec<u32>,
-    status: Vec<u32>,
-    king_lookup: KingLookup,
+}
+
+pub struct Update<'a> {
+    layout: TeamLayout,
+    immutable: &'a ImmutableUpdate<'a>,
+    wins: &'a mut Vec<u32>,
+    status: &'a mut Vec<u32>,
+    king_lookup: &'a mut KingLookup,
 }
 
 #[derive(Debug)]
@@ -349,15 +358,14 @@ impl AllTables {
 
     // returns whether there was any progress
     pub fn update_layout(&self, update: &mut Update<'_>) -> bool {
-        let Update {
-            layout,
+        let layout = update.layout;
+        let ImmutableUpdate {
             inv_current,
             current,
             take_one,
             leave_one,
-            go_up,
-            ..
-        } = *update;
+            go_up
+        } = *update.immutable;
         let TeamLayout {
             pieces0, pieces1, ..
         } = layout;
@@ -413,9 +421,9 @@ impl AllTables {
                         current,
                         take_one,
                         step: (from, to),
-                        slice: &mut update.status,
+                        slice: update.status,
                         mask,
-                        king_lookup: &update.king_lookup,
+                        king_lookup: update.king_lookup,
                     };
                     self.accumulate(accum);
                 }
@@ -486,8 +494,8 @@ impl AllTables {
                         leave_one,
                         go_up,
                         step: (from, to),
-                        slice: &update.wins,
-                        king_lookup: &update.king_lookup,
+                        slice: update.wins,
+                        king_lookup: update.king_lookup,
                     };
                     progress |= self.spreadout(spread);
                 }
@@ -569,8 +577,7 @@ impl AllTables {
         for counts in count_indexer(size) {
             let PawnCount { count0, count1 } = counts;
 
-            let mut update = Update {
-                layout: Default::default(),
+            let mut update = ImmutableUpdate {
                 current: tb.index_count(counts),
                 inv_current: tb.index_count(counts.invert()),
                 take_one: (count1 != 0).then(|| {
@@ -586,28 +593,35 @@ impl AllTables {
                     })
                 }),
                 go_up: false,
-                wins: vec![],
-                status: vec![],
-                king_lookup: KingLookup { list: [0; 25 * 25] },
             };
+            let layouts: Vec<TeamLayout> = counts.indexer().into_iter().collect();
 
             let mut iters = 0;
-            let mut progress = true;
-            while progress {
-                progress = false;
-                for layout in counts.indexer() {
-                    update.layout = layout;
-                    progress |= tb.update_layout(&mut update);
-                }
+            let mut progress = AtomicBool::new(true);
+            while progress.load(Ordering::Relaxed) {
+                progress.store(false, Ordering::Relaxed);
+                layouts.par_iter().for_each(|layout|{
+                    UPDATE.with(|vals|{
+                        let (wins, status, king_lookup) = &mut *vals.borrow_mut();
+                        let mut update = Update {layout: *layout, immutable: &update, wins, status, king_lookup };
+                        let tmp = tb.update_layout(&mut update);
+                        progress.fetch_or(tmp, Ordering::Relaxed);
+                    });
+
+                });
                 iters += 1;
             }
 
             if update.leave_one.is_some() {
                 update.go_up = true;
-                for layout in counts.indexer() {
-                    update.layout = layout;
-                    progress |= tb.update_layout(&mut update);
-                }
+                layouts.par_iter().for_each(|layout|{
+                    UPDATE.with(|vals|{
+                        let (wins, status, king_lookup) = &mut *vals.borrow_mut();
+                        let mut update = Update {layout: *layout, immutable: &update, wins, status, king_lookup };
+                        tb.update_layout(&mut update);
+                    });
+
+                });
             }
 
             println!("finished {counts:?} in {iters} iterations");
@@ -704,7 +718,7 @@ mod tests {
 
     #[test]
     fn build_tb() {
-        let tb = AllTables::build(2, 0b11111);
+        let tb = AllTables::build(3, 0b11111);
         println!("{} total", tb.len() * 30);
         println!(
             "{} blocks done, {} blocks not done",
@@ -716,7 +730,8 @@ mod tests {
             tb.card_done.load(Ordering::Relaxed),
             tb.card_not_done.load(Ordering::Relaxed)
         );
-        assert_eq!(tb.count_ones(), 6752579);
+        // assert_eq!(tb.count_ones(), 6752579);
+        assert_eq!(tb.count_ones(), 831344251);
     }
 
     #[test]
