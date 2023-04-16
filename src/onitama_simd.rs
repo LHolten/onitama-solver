@@ -3,12 +3,13 @@ use rayon::prelude::*;
 
 use std::{
     alloc::Layout,
+    array,
     cell::{LazyCell, RefCell},
     iter::{repeat, repeat_with, zip},
     mem::transmute,
     ops::{BitAnd, Index, IndexMut, Shr},
     process::exit,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering, AtomicBool},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 use bit_iter::BitIter;
@@ -216,8 +217,26 @@ impl IndexMut<KingPos> for KingLookup {
     }
 }
 
+pub struct LocalMem {
+    wins: Vec<u32>,
+    status: Vec<u32>,
+    king_lookup: KingLookup,
+    lookup: [Vec<u32>; 5],
+}
+
+impl LocalMem {
+    const fn new() -> Self {
+        Self {
+            wins: vec![],
+            status: vec![],
+            king_lookup: KingLookup { list: [0; 25 * 25] },
+            lookup: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        }
+    }
+}
+
 thread_local! {
-    static UPDATE: RefCell<(Vec<u32>, Vec<u32>, KingLookup)> = RefCell::new((Vec::new(), Vec::new(), KingLookup { list: [0; 25 * 25] }));
+    static UPDATE: RefCell<LocalMem> = RefCell::new(LocalMem::new());
 }
 
 pub struct ImmutableUpdate<'a> {
@@ -231,9 +250,7 @@ pub struct ImmutableUpdate<'a> {
 pub struct Update<'a> {
     layout: TeamLayout,
     immutable: &'a ImmutableUpdate<'a>,
-    wins: &'a mut Vec<u32>,
-    status: &'a mut Vec<u32>,
-    king_lookup: &'a mut KingLookup,
+    mem: &'a mut LocalMem,
 }
 
 #[derive(Debug)]
@@ -289,7 +306,7 @@ impl AllTables {
                     return;
                 }
             }
-            
+
             let new_val = unsafe { new_slice.slice.get(new_i).unwrap_unchecked() };
             let old_i = accum.king_lookup[oldk] as usize;
             debug_assert_eq!(old_i, old.indexer(accum.current.counts).index(&oldk));
@@ -341,13 +358,13 @@ impl AllTables {
             let old_i = spread.king_lookup[oldk] as usize;
 
             let tmp = spread.slice[old_i];
-            
+
             let new_val = unsafe { new_slice.slice.get(new_i).unwrap_unchecked() };
             let fetch = new_val.load(Ordering::Relaxed);
             if fetch | tmp == fetch {
                 return;
             }
-            
+
             // if accum state is lost, then new state is won
             new_val.fetch_or(tmp, Ordering::Relaxed);
             progress = true;
@@ -359,12 +376,13 @@ impl AllTables {
     // returns whether there was any progress
     pub fn update_layout(&self, update: &mut Update<'_>) -> bool {
         let layout = update.layout;
+        let mem = &mut *update.mem;
         let ImmutableUpdate {
             inv_current,
             current,
             take_one,
             leave_one,
-            go_up
+            go_up,
         } = *update.immutable;
         let TeamLayout {
             pieces0, pieces1, ..
@@ -373,15 +391,13 @@ impl AllTables {
 
         let inv_slice = inv_current.index(layout.invert());
         // wins are still inverted here :/
-        update
-            .wins
-            .resize(layout.indexer(current.counts).total(), 0);
+        mem.wins.resize(layout.indexer(current.counts).total(), 0);
         layout.indexer(current.counts).for_enumerate(|i, kpos| {
-            let s = unsafe { update.wins.get_mut(i).unwrap_unchecked() };
+            let s = unsafe { mem.wins.get_mut(i).unwrap_unchecked() };
             *s = inv_slice[kpos.invert()].load(Ordering::Relaxed);
         });
         let mut resolved: u32 = 0;
-        for (i, win) in update.wins.iter().enumerate() {
+        for (i, win) in mem.wins.iter().enumerate() {
             if *win & RESOLVED_BIT != 0 {
                 resolved |= 1 << i;
             }
@@ -389,22 +405,21 @@ impl AllTables {
         if go_up {
             resolved = 0;
         }
-        if resolved.count_ones() as usize == update.wins.len() {
-            return false
+        if resolved.count_ones() as usize == mem.wins.len() {
+            return false;
         }
 
         // every 0 bit means that it could be anything, win loss or draw
         // every 1 bit means that it must be a draw or win
         // we will gradually flip these to 1s, leaving only losses on 0
         // it is initialized to the wins, because those are not lost even when they don't have moves
-        update.status.clear();
-        update
-            .status
+        mem.status.clear();
+        mem.status
             .extend(repeat(0).take(layout.indexer(current.counts).total()));
 
         layout
             .indexer(current.counts)
-            .for_enumerate(|i, oldk| update.king_lookup[*oldk] = i as u8);
+            .for_enumerate(|i, oldk| mem.king_lookup[*oldk] = i as u8);
 
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             let directions = card.bitmap::<false>();
@@ -421,9 +436,9 @@ impl AllTables {
                         current,
                         take_one,
                         step: (from, to),
-                        slice: update.status,
+                        slice: &mut mem.status,
                         mask,
-                        king_lookup: update.king_lookup,
+                        king_lookup: &mem.king_lookup,
                     };
                     self.accumulate(accum);
                 }
@@ -432,8 +447,7 @@ impl AllTables {
 
         // we expand, marking all states that are not lost because it has the card
         // then we negate to get only the lost states
-        update
-            .status
+        mem.status
             .iter_mut()
             .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
 
@@ -442,9 +456,9 @@ impl AllTables {
             let mut num_done = 0;
             let mut num_not_done = 0;
             layout.indexer(current.counts).for_enumerate(|i, kpos| {
-                let w = Block(update.wins[i]).invert().0;
-                update.status[i] &= !w;
-                let l = update.status[i];
+                let w = Block(mem.wins[i]).invert().0;
+                mem.status[i] &= !w;
+                let l = mem.status[i];
                 // debug_assert_eq!(w & l, 0);
                 all_done &= (w | l);
                 if (w | l) & BLOCK_MASK == BLOCK_MASK {
@@ -472,10 +486,9 @@ impl AllTables {
         let mut progress = false;
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             // we spread out the loses, these are wins for the previous state
-            update.wins.clear();
-            update
-                .wins
-                .extend(update.status.iter().map(|x| Block(x & mask).expand().0));
+            mem.wins.clear();
+            mem.wins
+                .extend(mem.status.iter().map(|x| Block(x & mask).expand().0));
             // same thing, but cards are now inverted
             // but it is also the other team, so not inverted
             let directions = card.bitmap::<false>();
@@ -494,8 +507,8 @@ impl AllTables {
                         leave_one,
                         go_up,
                         step: (from, to),
-                        slice: update.wins,
-                        king_lookup: update.king_lookup,
+                        slice: &mem.wins,
+                        king_lookup: &mem.king_lookup,
                     };
                     progress |= self.spreadout(spread);
                 }
@@ -600,27 +613,33 @@ impl AllTables {
             let mut progress = AtomicBool::new(true);
             while progress.load(Ordering::Relaxed) {
                 progress.store(false, Ordering::Relaxed);
-                layouts.par_iter().for_each(|layout|{
-                    UPDATE.with(|vals|{
-                        let (wins, status, king_lookup) = &mut *vals.borrow_mut();
-                        let mut update = Update {layout: *layout, immutable: &update, wins, status, king_lookup };
+                layouts.par_iter().for_each(|layout| {
+                    UPDATE.with(|vals| {
+                        let mem = &mut *vals.borrow_mut();
+                        let mut update = Update {
+                            layout: *layout,
+                            immutable: &update,
+                            mem,
+                        };
                         let tmp = tb.update_layout(&mut update);
                         progress.fetch_or(tmp, Ordering::Relaxed);
                     });
-
                 });
                 iters += 1;
             }
 
             if update.leave_one.is_some() {
                 update.go_up = true;
-                layouts.par_iter().for_each(|layout|{
-                    UPDATE.with(|vals|{
-                        let (wins, status, king_lookup) = &mut *vals.borrow_mut();
-                        let mut update = Update {layout: *layout, immutable: &update, wins, status, king_lookup };
+                layouts.par_iter().for_each(|layout| {
+                    UPDATE.with(|vals| {
+                        let mem = &mut *vals.borrow_mut();
+                        let mut update = Update {
+                            layout: *layout,
+                            immutable: &update,
+                            mem,
+                        };
                         tb.update_layout(&mut update);
                     });
-
                 });
             }
 
