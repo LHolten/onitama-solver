@@ -280,7 +280,7 @@ impl AllTables {
                     return;
                 }
             }
-
+            
             let new_val = unsafe { new_slice.slice.get(new_i).unwrap_unchecked() };
             let old_i = accum.king_lookup[oldk] as usize;
             debug_assert_eq!(old_i, old.indexer(accum.current.counts).index(&oldk));
@@ -330,13 +330,18 @@ impl AllTables {
             }
 
             let old_i = spread.king_lookup[oldk] as usize;
-            let new_val = unsafe { new_slice.slice.get(new_i).unwrap_unchecked() };
-            // if accum state is lost, then new state is won
-            let fetch = new_val.fetch_or(spread.slice[old_i], Ordering::Relaxed);
 
-            if fetch | spread.slice[old_i] != fetch {
-                progress = true;
+            let tmp = spread.slice[old_i];
+            
+            let new_val = unsafe { new_slice.slice.get(new_i).unwrap_unchecked() };
+            let fetch = new_val.load(Ordering::Relaxed);
+            if fetch | tmp == fetch {
+                return;
             }
+            
+            // if accum state is lost, then new state is won
+            new_val.fetch_or(tmp, Ordering::Relaxed);
+            progress = true;
         });
 
         progress
@@ -367,9 +372,17 @@ impl AllTables {
             let s = unsafe { update.wins.get_mut(i).unwrap_unchecked() };
             *s = inv_slice[kpos.invert()].load(Ordering::Relaxed);
         });
-        let mut win_and = update.wins.iter().fold(RESOLVED_BIT, |a, b| a & *b);
-        if win_and == RESOLVED_BIT && !go_up {
-            return false;
+        let mut resolved: u32 = 0;
+        for (i, win) in update.wins.iter().enumerate() {
+            if *win & RESOLVED_BIT != 0 {
+                resolved |= 1 << i;
+            }
+        }
+        if go_up {
+            resolved = 0;
+        }
+        if resolved.count_ones() as usize == update.wins.len() {
+            return false
         }
 
         // every 0 bit means that it could be anything, win loss or draw
