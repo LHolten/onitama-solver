@@ -587,67 +587,94 @@ impl AllTables {
 
         println!("{} wins and {} total", tb.count_ones(), tb.len() * 30);
 
+
         for counts in count_indexer(size) {
-            let PawnCount { count0, count1 } = counts;
-
-            let mut update = ImmutableUpdate {
-                current: tb.index_count(counts),
-                inv_current: tb.index_count(counts.invert()),
-                take_one: (count1 != 0).then(|| {
-                    tb.index_count(PawnCount {
-                        count0,
-                        count1: count1 - 1,
-                    })
-                }),
-                leave_one: (count0 + 1 != tb.size).then(|| {
-                    tb.index_count(PawnCount {
-                        count0: count0 + 1,
-                        count1,
-                    })
-                }),
-                go_up: false,
-            };
-            let layouts: Vec<TeamLayout> = counts.indexer().into_iter().collect();
-
-            let mut iters = 0;
-            let mut progress = AtomicBool::new(true);
-            while progress.load(Ordering::Relaxed) {
-                progress.store(false, Ordering::Relaxed);
-                layouts.par_iter().for_each(|layout| {
-                    UPDATE.with(|vals| {
-                        let mem = &mut *vals.borrow_mut();
-                        let mut update = Update {
-                            layout: *layout,
-                            immutable: &update,
-                            mem,
-                        };
-                        let tmp = tb.update_layout(&mut update);
-                        progress.fetch_or(tmp, Ordering::Relaxed);
-                    });
-                });
-                iters += 1;
+            let counts: PawnCount = counts;
+            if counts.count0 < counts.count1 {
+                continue;
+            }
+            let mut jobs = vec![TableJob::new(&tb, counts)];
+            if counts.count0 > counts.count1 {
+                jobs.push(TableJob::new(&tb, counts.invert()));
             }
 
-            if update.leave_one.is_some() {
-                update.go_up = true;
-                layouts.par_iter().for_each(|layout| {
-                    UPDATE.with(|vals| {
-                        let mem = &mut *vals.borrow_mut();
-                        let mut update = Update {
-                            layout: *layout,
-                            immutable: &update,
-                            mem,
-                        };
-                        tb.update_layout(&mut update);
-                    });
-                });
+            let mut any_progress = true;
+            while any_progress {
+                any_progress = false;
+                for job in &mut jobs {
+                    any_progress |= job.next().is_some();
+                }
             }
 
-            println!("finished {counts:?} in {iters} iterations");
+
+            // println!("finished {counts:?} in {iters} iterations");
             println!("{} wins", tb.index_count(counts).count_ones());
         }
 
         tb
+    }
+}
+
+struct TableJob<'a> {
+    tb: &'a AllTables,
+    layouts: Vec<TeamLayout>,
+    update: ImmutableUpdate<'a>,
+    done: bool
+}
+
+impl<'a> TableJob<'a> {
+    fn new(tb: &'a AllTables, counts: PawnCount) -> Self {
+        let PawnCount { count0, count1 } = counts;
+
+        let mut update = ImmutableUpdate {
+            current: tb.index_count(counts),
+            inv_current: tb.index_count(counts.invert()),
+            take_one: (count1 != 0).then(|| {
+                tb.index_count(PawnCount {
+                    count0,
+                    count1: count1 - 1,
+                })
+            }),
+            leave_one: (count0 + 1 != tb.size).then(|| {
+                tb.index_count(PawnCount {
+                    count0: count0 + 1,
+                    count1,
+                })
+            }),
+            go_up: false,
+        };
+
+        let layouts = counts.indexer().into_iter().collect();
+        Self { layouts, update, done: false, tb }
+    }
+}
+
+impl Iterator for TableJob<'_> {
+    type Item = ();
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None
+        };
+        let mut progress = AtomicBool::new(false);
+        self.layouts.par_iter().for_each(|layout| {
+            UPDATE.with(|vals| {
+                let mem = &mut *vals.borrow_mut();
+                let mut update = Update {
+                    layout: *layout,
+                    immutable: &self.update,
+                    mem,
+                };
+                let tmp = self.tb.update_layout(&mut update);
+                progress.fetch_or(tmp, Ordering::Relaxed);
+            });
+        });
+        if self.update.go_up {
+            self.done = true;
+        } else if !progress.load(Ordering::Relaxed) {
+            self.update.go_up = true;
+        }
+        Some(())
     }
 }
 
