@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 use std::{
     cell::RefCell,
     sync::atomic::{AtomicBool, Ordering},
@@ -28,6 +30,7 @@ impl<'a> TableJob<'a> {
             }),
             go_up: false,
             mask_lookup: &tb.mask_lookup,
+            directions: tb.directions,
         };
 
         let layouts = counts.indexer().into_iter().collect();

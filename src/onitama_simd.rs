@@ -2,8 +2,6 @@
 mod accum_spread;
 mod job;
 
-use rayon::prelude::*;
-
 use std::{
     alloc::Layout,
     array,
@@ -128,6 +126,7 @@ pub struct AllTables {
     size: u32,
     cards: Cards,
     mask_lookup: [u32; 25],
+    directions: u32,
     list: Box<[Table]>,
     block_done: AtomicU64,
     block_not_done: AtomicU64,
@@ -248,6 +247,7 @@ pub struct ImmutableUpdate<'a> {
     leave_one: Option<&'a Table>,
     go_up: bool,
     mask_lookup: &'a [u32; 25],
+    directions: u32,
 }
 
 pub struct Update<'a> {
@@ -289,6 +289,7 @@ impl AllTables {
             leave_one,
             go_up,
             mask_lookup,
+            directions,
         } = *update.immutable;
         let TeamLayout {
             pieces0, pieces1, ..
@@ -327,27 +328,24 @@ impl AllTables {
             .indexer(current.counts)
             .for_enumerate(|i, oldk| mem.king_lookup[*oldk] = i as u8);
 
-        for (card, mask) in zip(self.cards.iter(), mask_iter()) {
-            let directions = card.bitmap::<false>();
+        for offset in BitIter::from(directions) {
+            let mask = mask_lookup[offset];
+            let to_mask = offset_mask(offset, pieces0);
+            // can not move onto your own pieces
+            let to_mask = to_mask & !pieces0;
 
-            for offset in BitIter::from(directions) {
-                let to_mask = offset_mask(offset, pieces0);
-                // can not move onto your own pieces
-                let to_mask = to_mask & !pieces0;
-
-                for to in BitIter::from(to_mask) {
-                    let from = to + 12 - offset;
-                    let accum = Accum {
-                        layout,
-                        current,
-                        take_one,
-                        step: (from, to),
-                        slice: &mut mem.status,
-                        mask,
-                        king_lookup: &mem.king_lookup,
-                    };
-                    accum.accumulate();
-                }
+            for to in BitIter::from(to_mask) {
+                let from = to + 12 - offset;
+                let accum = Accum {
+                    layout,
+                    current,
+                    take_one,
+                    step: (from, to),
+                    slice: &mut mem.status,
+                    mask,
+                    king_lookup: &mem.king_lookup,
+                };
+                accum.accumulate();
             }
         }
 
@@ -390,34 +388,33 @@ impl AllTables {
         }
 
         let mut progress = false;
-        for (card, mask) in zip(self.cards.iter(), mask_iter()) {
+        // same thing, but cards are now inverted
+        // but it is also the other team, so not inverted
+        for offset in BitIter::from(directions) {
+            let mask = mask_lookup[offset];
+
             // we spread out the loses, these are wins for the previous state
             mem.wins.clear();
             mem.wins
                 .extend(mem.status.iter().map(|x| Block(x & mask).expand().0));
-            // same thing, but cards are now inverted
-            // but it is also the other team, so not inverted
-            let directions = card.bitmap::<false>();
 
-            for offset in BitIter::from(directions) {
-                // these are backwards moves, so `to` is the where the piece came from
-                let to_mask = offset_mask(offset, pieces1);
-                // can not move onto your own pieces or opp pieces
-                let to_mask = to_mask & !pieces0 & !pieces1;
+            // these are backwards moves, so `to` is the where the piece came from
+            let to_mask = offset_mask(offset, pieces1);
+            // can not move onto your own pieces or opp pieces
+            let to_mask = to_mask & !pieces0 & !pieces1;
 
-                for to in BitIter::from(to_mask) {
-                    let from = to + 12 - offset;
-                    let spread = Spread {
-                        layout,
-                        current,
-                        leave_one,
-                        go_up,
-                        step: (from, to),
-                        slice: &mem.wins,
-                        king_lookup: &mem.king_lookup,
-                    };
-                    progress |= spread.spreadout();
-                }
+            for to in BitIter::from(to_mask) {
+                let from = to + 12 - offset;
+                let spread = Spread {
+                    layout,
+                    current,
+                    leave_one,
+                    go_up,
+                    step: (from, to),
+                    slice: &mem.wins,
+                    king_lookup: &mem.king_lookup,
+                };
+                progress |= spread.spreadout();
             }
         }
 
@@ -464,15 +461,18 @@ impl AllTables {
 
     pub fn build(size: u32, cards: u16) -> Self {
         let mut mask_lookup = [0; 25];
+        let mut directions = 0;
         for (mask, card) in zip(mask_iter(), Cards(cards).iter()) {
             for offset in BitIter::from(card.bitmap::<false>()) {
                 mask_lookup[offset] |= mask
             }
+            directions |= card.bitmap::<false>();
         }
         let tb = Self {
             size,
             cards: Cards(cards),
             mask_lookup,
+            directions,
             list: count_indexer(size)
                 .into_iter()
                 .map(|counts: PawnCount| {
