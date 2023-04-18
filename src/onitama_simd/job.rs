@@ -63,12 +63,12 @@ impl Iterator for TableJob<'_> {
         iter.for_each(|layout| {
             UPDATE.with(|vals| {
                 let mem = &mut *vals.borrow_mut();
-                let mut update = Update {
+                let update = Update {
                     layout: *layout,
                     immutable: &self.update,
                     mem,
                 };
-                let tmp = self.tb.update_layout(&mut update);
+                let tmp = update.update_layout();
                 progress.fetch_or(tmp, Ordering::Relaxed);
             });
         });
