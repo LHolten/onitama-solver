@@ -1,4 +1,7 @@
 #![allow(unused)]
+mod accum_spread;
+mod job;
+
 use rayon::prelude::*;
 
 use std::{
@@ -124,6 +127,7 @@ impl KingPos {
 pub struct AllTables {
     size: u32,
     cards: Cards,
+    mask_lookup: [u32; 25],
     list: Box<[Table]>,
     block_done: AtomicU64,
     block_not_done: AtomicU64,
@@ -198,22 +202,22 @@ impl Index<KingPos> for SubTable<'_> {
 
 #[derive(Debug)]
 struct KingLookup {
-    list: [u8; 25 * 25],
+    list: [[u8; 25]; 25],
 }
 
 impl Index<KingPos> for KingLookup {
     type Output = u8;
 
     fn index(&self, index: KingPos) -> &Self::Output {
-        let i = index.king0 * 25 + index.king1;
-        unsafe { self.list.get(i as usize).unwrap_unchecked() }
+        let t = unsafe { self.list.get(index.king0 as usize).unwrap_unchecked() };
+        unsafe { t.get(index.king1 as usize).unwrap_unchecked() }
     }
 }
 
 impl IndexMut<KingPos> for KingLookup {
     fn index_mut(&mut self, index: KingPos) -> &mut Self::Output {
-        let i = index.king0 * 25 + index.king1;
-        unsafe { self.list.get_mut(i as usize).unwrap_unchecked() }
+        let t = unsafe { self.list.get_mut(index.king0 as usize).unwrap_unchecked() };
+        unsafe { t.get_mut(index.king1 as usize).unwrap_unchecked() }
     }
 }
 
@@ -229,14 +233,12 @@ impl LocalMem {
         Self {
             wins: vec![],
             status: vec![],
-            king_lookup: KingLookup { list: [0; 25 * 25] },
+            king_lookup: KingLookup {
+                list: [[0; 25]; 25],
+            },
             lookup: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         }
     }
-}
-
-thread_local! {
-    static UPDATE: RefCell<LocalMem> = RefCell::new(LocalMem::new());
 }
 
 pub struct ImmutableUpdate<'a> {
@@ -245,6 +247,7 @@ pub struct ImmutableUpdate<'a> {
     take_one: Option<&'a Table>,
     leave_one: Option<&'a Table>,
     go_up: bool,
+    mask_lookup: &'a [u32; 25],
 }
 
 pub struct Update<'a> {
@@ -275,104 +278,6 @@ pub struct Spread<'a> {
 }
 
 impl AllTables {
-    pub fn accumulate(&self, mut accum: Accum<'_>) {
-        let (from, to) = accum.step;
-
-        let old = accum.layout;
-
-        let new = TeamLayout {
-            pieces0: old.pieces0 ^ (1 << to) ^ (1 << from),
-            pieces1: old.pieces1 & !(1 << to),
-        };
-
-        // check if we are taking a piece
-        let table = if old.pieces1 & 1 << to != 0 {
-            let Some(table) = accum.take_one else {
-                // there is no way to take a piece when there is only a king to take
-                return
-            };
-            table
-        } else {
-            accum.current
-        };
-        let new_slice = table.index(new);
-
-        new.indexer(table.counts).for_enumerate(|new_i, newk| {
-            let mut oldk = *newk;
-            if newk.king0 as usize == to {
-                oldk.king0 = from as u32;
-                if oldk.king0 == 22 {
-                    // there is no way we came from the temple
-                    return;
-                }
-            }
-
-            let new_val = unsafe { new_slice.slice.get(new_i).unwrap_unchecked() };
-            let old_i = accum.king_lookup[oldk] as usize;
-            debug_assert_eq!(old_i, old.indexer(accum.current.counts).index(&oldk));
-            let s = unsafe { accum.slice.get_mut(old_i).unwrap_unchecked() };
-            // if new state is not won, then old state is not lost
-            *s |= !new_val.load(Ordering::Relaxed) & accum.mask;
-        });
-    }
-
-    // returns whether there was any progress
-    pub fn spreadout(&self, mut spread: Spread<'_>) -> bool {
-        let (from, to) = spread.step;
-
-        let old = spread.layout;
-
-        let mut new = TeamLayout {
-            pieces0: old.pieces0,
-            pieces1: old.pieces1 ^ (1 << to) ^ (1 << from),
-        };
-        if spread.go_up {
-            new.pieces0 |= 1 << from;
-        }
-        let table = if spread.go_up {
-            let Some(table) = spread.leave_one else { 
-                // there is no larger table, so no progress
-                return false
-            };
-            table
-        } else {
-            spread.current
-        };
-        let new_slice = table.index(new);
-
-        let mut progress = false;
-        new.indexer(table.counts).for_enumerate(|new_i, newk| {
-            let mut oldk = *newk;
-            if newk.king1 as usize == to {
-                oldk.king1 = from as u32;
-                if oldk.king1 == 2 {
-                    return;
-                }
-            }
-
-            if oldk.king0 as usize == from {
-                // this king was added, so this oldk did not exist
-                return;
-            }
-
-            let old_i = spread.king_lookup[oldk] as usize;
-
-            let tmp = spread.slice[old_i];
-
-            let new_val = unsafe { new_slice.slice.get(new_i).unwrap_unchecked() };
-            let fetch = new_val.load(Ordering::Relaxed);
-            if fetch | tmp == fetch {
-                return;
-            }
-
-            // if accum state is lost, then new state is won
-            new_val.fetch_or(tmp, Ordering::Relaxed);
-            progress = true;
-        });
-
-        progress
-    }
-
     // returns whether there was any progress
     pub fn update_layout(&self, update: &mut Update<'_>) -> bool {
         let layout = update.layout;
@@ -383,6 +288,7 @@ impl AllTables {
             take_one,
             leave_one,
             go_up,
+            mask_lookup,
         } = *update.immutable;
         let TeamLayout {
             pieces0, pieces1, ..
@@ -440,7 +346,7 @@ impl AllTables {
                         mask,
                         king_lookup: &mem.king_lookup,
                     };
-                    self.accumulate(accum);
+                    accum.accumulate();
                 }
             }
         }
@@ -466,17 +372,17 @@ impl AllTables {
                     num_done += 1;
                 } else {
                     num_not_done += 1;
+                    // for mask in mask_iter().take(5) {
+                    //     let mask = Block(mask).invert().expand().invert().0;
+                    //     if (w | l) & mask == mask {
+                    //         self.card_done.fetch_add(1, Ordering::Relaxed);
+                    //     } else {
+                    //         self.card_not_done.fetch_add(1, Ordering::Relaxed);
+                    //     }
+                    // }
                 }
             });
             // if all_done != BLOCK_MASK {
-            //     for mask in mask_iter().take(5) {
-            //         let mask = Block(mask).invert().expand().invert().0;
-            //         if all_done & mask == mask {
-            //             self.card_done.fetch_add(1, Ordering::Relaxed);
-            //         } else {
-            //             self.card_not_done.fetch_add(1, Ordering::Relaxed);
-            //         }
-            //     }
             //     self.block_done.fetch_add(num_done, Ordering::Relaxed);
             //     self.block_not_done
             //         .fetch_add(num_not_done, Ordering::Relaxed);
@@ -510,7 +416,7 @@ impl AllTables {
                         slice: &mem.wins,
                         king_lookup: &mem.king_lookup,
                     };
-                    progress |= self.spreadout(spread);
+                    progress |= spread.spreadout();
                 }
             }
         }
@@ -557,9 +463,16 @@ impl AllTables {
     }
 
     pub fn build(size: u32, cards: u16) -> Self {
+        let mut mask_lookup = [0; 25];
+        for (mask, card) in zip(mask_iter(), Cards(cards).iter()) {
+            for offset in BitIter::from(card.bitmap::<false>()) {
+                mask_lookup[offset] |= mask
+            }
+        }
         let tb = Self {
             size,
             cards: Cards(cards),
+            mask_lookup,
             list: count_indexer(size)
                 .into_iter()
                 .map(|counts: PawnCount| {
@@ -587,7 +500,6 @@ impl AllTables {
 
         println!("{} wins and {} total", tb.count_ones(), tb.len() * 30);
 
-
         for counts in count_indexer(size) {
             let counts: PawnCount = counts;
             if counts.count0 < counts.count1 {
@@ -599,15 +511,16 @@ impl AllTables {
             }
 
             let mut any_progress = true;
+            let mut iters = 0;
             while any_progress {
                 any_progress = false;
                 for job in &mut jobs {
                     any_progress |= job.next().is_some();
                 }
+                iters += 1;
             }
 
-
-            // println!("finished {counts:?} in {iters} iterations");
+            println!("finished {counts:?} in {iters} iterations");
             println!("{} wins", tb.index_count(counts).count_ones());
         }
 
@@ -619,63 +532,7 @@ struct TableJob<'a> {
     tb: &'a AllTables,
     layouts: Vec<TeamLayout>,
     update: ImmutableUpdate<'a>,
-    done: bool
-}
-
-impl<'a> TableJob<'a> {
-    fn new(tb: &'a AllTables, counts: PawnCount) -> Self {
-        let PawnCount { count0, count1 } = counts;
-
-        let mut update = ImmutableUpdate {
-            current: tb.index_count(counts),
-            inv_current: tb.index_count(counts.invert()),
-            take_one: (count1 != 0).then(|| {
-                tb.index_count(PawnCount {
-                    count0,
-                    count1: count1 - 1,
-                })
-            }),
-            leave_one: (count0 + 1 != tb.size).then(|| {
-                tb.index_count(PawnCount {
-                    count0: count0 + 1,
-                    count1,
-                })
-            }),
-            go_up: false,
-        };
-
-        let layouts = counts.indexer().into_iter().collect();
-        Self { layouts, update, done: false, tb }
-    }
-}
-
-impl Iterator for TableJob<'_> {
-    type Item = ();
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None
-        };
-        let mut progress = AtomicBool::new(false);
-        self.layouts.par_iter().for_each(|layout| {
-            UPDATE.with(|vals| {
-                let mem = &mut *vals.borrow_mut();
-                let mut update = Update {
-                    layout: *layout,
-                    immutable: &self.update,
-                    mem,
-                };
-                let tmp = self.tb.update_layout(&mut update);
-                progress.fetch_or(tmp, Ordering::Relaxed);
-            });
-        });
-        if self.update.go_up {
-            self.done = true;
-        } else if !progress.load(Ordering::Relaxed) {
-            self.update.go_up = true;
-        }
-        Some(())
-    }
+    done: bool,
 }
 
 fn mask_iter() -> impl Iterator<Item = u32> {
