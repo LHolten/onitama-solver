@@ -1,7 +1,9 @@
+#[cfg(feature = "parallell")]
 use rayon::prelude::*;
 
 use std::{
     cell::RefCell,
+    mem::take,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -33,9 +35,10 @@ impl<'a> TableJob<'a> {
             directions: tb.directions,
         };
 
-        let layouts = counts.indexer().into_iter().collect();
+        let layouts = counts.into_iter().collect();
         Self {
             layouts,
+            resolved: Vec::new(),
             update,
             done: false,
             tb,
@@ -54,13 +57,16 @@ impl Iterator for TableJob<'_> {
         if self.done {
             return None;
         };
-        let mut progress = AtomicBool::new(false);
+        if self.update.go_up {
+            self.layouts.extend(take(&mut self.resolved));
+        }
         #[cfg(feature = "parallell")]
-        let iter = self.layouts.par_iter();
+        let iter = take(&mut self.layouts).into_par_iter();
         #[cfg(not(feature = "parallell"))]
-        let iter = self.layouts.iter();
+        let iter = take(&mut self.layouts).into_iter();
 
-        iter.for_each(|layout| {
+        let mut progress = AtomicBool::new(false);
+        let (resolved, unresolved): (Vec<_>, Vec<_>) = iter.partition(|layout| {
             UPDATE.with(|vals| {
                 let mem = &mut *vals.borrow_mut();
                 let update = Update {
@@ -69,9 +75,13 @@ impl Iterator for TableJob<'_> {
                     mem,
                 };
                 let tmp = update.update_layout();
-                progress.fetch_or(tmp, Ordering::Relaxed);
-            });
+                progress.fetch_or(tmp.progress, Ordering::Relaxed);
+                tmp.resolved
+            })
         });
+        self.layouts = unresolved;
+        self.resolved.extend(resolved);
+
         if self.update.go_up {
             self.done = true;
         } else if !progress.load(Ordering::Relaxed) {

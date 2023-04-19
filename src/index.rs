@@ -7,7 +7,7 @@ use seq_macro::seq;
 
 use crate::proj::{CountOnes, Mask, Proj};
 
-pub(crate) trait Indexer: Sized + Clone + InternalIter {
+pub(crate) trait Indexer: Clone + InternalIter {
     fn index(&self, item: &Self::Item) -> usize;
 
     fn total(&self) -> usize;
@@ -43,7 +43,7 @@ pub(crate) trait Indexer: Sized + Clone + InternalIter {
 pub struct Empty<T>(pub T);
 
 impl<T> InternalIter for Empty<T> {
-    fn for_each<F>(&mut self, mut f: F)
+    fn for_each<F>(mut self, mut f: F)
     where
         F: for<'a> FnMut(&'a mut Self::Item),
     {
@@ -78,12 +78,12 @@ pub struct Flatten<I: InternalIter, V, M, G> {
     gen: G,
 }
 
-pub trait InternalIter: IntoIterator {
-    fn for_each<F>(&mut self, f: F)
+pub trait InternalIter: Sized + IntoIterator {
+    fn for_each<F>(self, f: F)
     where
         F: for<'a> FnMut(&'a mut Self::Item);
 
-    fn for_enumerate<F>(&mut self, mut f: F)
+    fn for_enumerate<F>(self, mut f: F)
     where
         F: for<'a> FnMut(usize, &'a mut Self::Item),
     {
@@ -102,7 +102,7 @@ where
     G: Gen<M::Output, V::Output>,
     I::Item: Clone,
 {
-    fn for_each<F>(&mut self, mut f: F)
+    fn for_each<F>(self, mut f: F)
     where
         F: for<'a> FnMut(&'a mut Self::Item),
     {

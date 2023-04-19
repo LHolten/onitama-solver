@@ -1,17 +1,14 @@
 #![allow(unused)]
+#![warn(unused_imports)]
 mod accum_spread;
+mod iter;
 mod job;
 mod update;
 
 use std::{
-    alloc::Layout,
-    array,
-    cell::{LazyCell, RefCell},
-    iter::{repeat, repeat_with, zip},
-    mem::transmute,
-    ops::{BitAnd, Index, IndexMut, Shr},
-    process::exit,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    iter::{repeat_with, zip},
+    ops::{BitAnd, Index, IndexMut},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use bit_iter::BitIter;
@@ -46,18 +43,6 @@ impl PawnCount {
             count0: self.count1,
             count1: self.count0,
         }
-    }
-
-    pub(crate) fn indexer(self) -> impl Indexer<Item = TeamLayout> {
-        type L = TeamLayout;
-        let pieces1_mask = |l: &L| TABLE_MASK & !l.pieces0;
-        Empty(Default::default())
-            .choose(self.count0 + 1, proj!(|l: L| l.pieces0), (TABLE_MASK, 25))
-            .choose(
-                self.count1 + 1,
-                proj!(|l: L| l.pieces1),
-                (pieces1_mask, 24 - self.count0),
-            )
     }
 }
 
@@ -160,8 +145,7 @@ pub struct Table {
 
 impl Table {
     fn index(&self, layout: TeamLayout) -> SubTable<'_> {
-        let indexer = self.counts.indexer();
-        let i = indexer.index(&layout);
+        let i = self.counts.index(&layout);
 
         let slice = self
             .list
@@ -184,7 +168,7 @@ impl Table {
 
 // contains results for only one layout
 #[derive(Debug, Clone, Copy)]
-struct SubTable<'a> {
+pub struct SubTable<'a> {
     counts: PawnCount,
     layout: TeamLayout,
     slice: &'a [AtomicU32],
@@ -280,7 +264,7 @@ pub struct Spread<'a> {
 
 impl AllTables {
     pub fn mark_ez_win(&self, counts: PawnCount) {
-        for layout in counts.indexer() {
+        for layout in counts {
             self.ez_win_for_each(counts, layout, &mut |i, mask| {
                 // mask is the future cards
                 self.index_count(counts).index(layout)[i]
@@ -335,7 +319,7 @@ impl AllTables {
                 .into_iter()
                 .map(|counts: PawnCount| {
                     let chunk_size = (counts.count0 + 1) as usize * (counts.count1 + 1) as usize;
-                    let num_chunks = counts.indexer().total();
+                    let num_chunks = counts.total();
                     let list = repeat_with(|| AtomicU32::new(0))
                         .take(chunk_size * num_chunks)
                         .collect();
@@ -389,6 +373,7 @@ impl AllTables {
 struct TableJob<'a> {
     tb: &'a AllTables,
     layouts: Vec<TeamLayout>,
+    resolved: Vec<TeamLayout>,
     update: ImmutableUpdate<'a>,
     done: bool,
 }
@@ -473,9 +458,9 @@ fn pretty(layout: TeamLayout, kpos: KingPos) {
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use crate::{index::Indexer, onitama_simd::Block};
+    use crate::onitama_simd::Block;
 
-    use super::{mask_iter, AllTables, PawnCount, TeamLayout};
+    use super::{mask_iter, AllTables, PawnCount};
 
     #[test]
     fn build_tb() {
@@ -497,7 +482,7 @@ mod tests {
 
     #[test]
     fn counts0() {
-        for layout in PawnCount::default().indexer() {
+        for layout in PawnCount::default() {
             dbg!(layout);
         }
     }
