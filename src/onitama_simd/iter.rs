@@ -155,19 +155,18 @@ impl IntExt for u32 {
 }
 
 fn ranking(s_1: u32, s_2: u32) -> usize {
-    let mut r = 0;
-    let mut twos = 0;
-    let mut ones = 0;
+    let mut r: usize = 0;
+    let mut ctr = 0usize;
 
     BitIter::from(s_1 | s_2).for_each(|i| {
-        if s_1 & (1 << i) != 0 {
-            ones += 1;
-            r += combinations(i as i32, ones, twos);
-        } else {
-            twos += 1;
-            r += combinations(i as i32, ones, twos);
-            r += combinations(i as i32, ones - 1, twos);
+        let cond = s_1 & (1 << i) != 0;
+        ctr += if cond { 27 } else { 27 * 7 };
+        let j = 1 + i + ctr + 27 * (1 + 7);
+        let mut x = unsafe { *COMB.get(j).unwrap_unchecked() as usize };
+        if !cond {
+            x = x >> 32;
         }
+        r += x & ((1 << 32) - 1);
     });
     r
 }
@@ -203,39 +202,59 @@ fn combinations_old(n: i32, k1: i32, k2: i32) -> i32 {
     res
 }
 
-fn combinations(n: i32, k1: i32, k2: i32) -> usize {
-    const fn comb_exact_inner(n: i32, k1: i32, k2: i32) -> usize {
-        let k3 = n - k1 - k2;
-        if k1 < 0 || k2 < 0 || k3 < 0 {
-            return 0;
-        }
-
-        if k1 > 0 {
-            return n as usize * comb_exact_inner(n - 1, k1 - 1, k2) / k1 as usize;
-        }
-        if k2 > 0 {
-            return n as usize * comb_exact_inner(n - 1, k1, k2 - 1) / k2 as usize;
-        }
-        1
+const fn comb_exact_inner(n: i32, k1: i32, k2: i32) -> usize {
+    let k3 = n - k1 - k2;
+    if k1 < 0 || k2 < 0 || k3 < 0 {
+        return 0;
     }
 
-    const RES: [[[u32; 27]; 7]; 7] = seq!(k1 in 0..7 {
-        [#(
-            seq!(k2 in 0..7 {
-                [#(
-                    seq!(n in 0..27 {
-                        #[allow(clippy::eq_op)]
-                        [#(comb_exact_inner(n - 1, k1 - 1, k2 - 1) as u32,)*]
-                    })
-                ,)*]
-            })
-        ,)*]
-    });
+    if k1 > 0 {
+        return n as usize * comb_exact_inner(n - 1, k1 - 1, k2) / k1 as usize;
+    }
+    if k2 > 0 {
+        return n as usize * comb_exact_inner(n - 1, k1, k2 - 1) / k2 as usize;
+    }
+    1
+}
 
-    let res = unsafe { RES.get((k1 + 1) as usize).unwrap_unchecked() };
-    let res = unsafe { res.get((k2 + 1) as usize).unwrap_unchecked() };
-    let res = unsafe { res.get((n + 1) as usize).unwrap_unchecked() };
-    *res as usize
+const fn comb_exact_inner2(i: i32) -> u64 {
+    let n = i % 27;
+    let k1 = i / 27 % 7;
+    let k2 = i / 27 / 7;
+    comb_exact_inner(n - 1, k1 - 1, k2 - 1) as u64
+}
+
+const COMB: [u64; 27 * 7 * 7 + 27] = seq!(i in 0..1350 {
+    [#(
+        #[allow(clippy::identity_op)]
+        #[allow(clippy::erasing_op)]
+        #[allow(clippy::eq_op)]
+        {
+            let v1 = comb_exact_inner2(i);
+            let v2 = comb_exact_inner2(i - 27) + comb_exact_inner2(i);
+            v2 << 32 | v1
+        }
+    ,)*]
+});
+
+// const COMB2: [u32; 27 * 7 * 7 + 27] = seq!(i in 0..1350 {
+//     [#(
+//         #[allow(clippy::identity_op)]
+//         #[allow(clippy::erasing_op)]
+//         #[allow(clippy::eq_op)]
+//         {
+//             if i < 27 || i >= 1323 {
+//                 0
+//             } else {
+//                 comb_exact_inner2(i - 27) + comb_exact_inner2(i)
+//             }
+//         }
+//     ,)*]
+// });
+
+fn combinations(n: i32, k1: i32, k2: i32) -> usize {
+    let i = 1 + n + 27 * (1 + k1 + 7 * (1 + k2));
+    (unsafe { *COMB.get(i as usize).unwrap_unchecked() & ((1 << 32) - 1) }) as usize
 }
 
 fn iter(s_1: u32, s_2: u32, i: i32, ones: i32, twos: i32, f: &mut impl FnMut(u32, u32)) {
