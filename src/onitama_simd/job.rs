@@ -81,8 +81,9 @@ impl<'a> TableJob<'a> {
         iter.for_each(|layout| {
             self.tb.ez_win_for_each(counts, *layout, &mut |i, mask| {
                 // mask is the future cards
-                self.tb.index_count(counts).index(*layout)[i]
-                    .fetch_or(Block(mask).invert().expand().0, Ordering::Relaxed);
+                let val = self.tb.index_count(counts).index(*layout).slice.get(i);
+                let val = unsafe { val.unwrap_unchecked() };
+                val.fetch_or(Block(mask).invert().expand().0, Ordering::Relaxed);
             })
         });
     }

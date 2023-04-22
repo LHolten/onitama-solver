@@ -275,7 +275,7 @@ impl AllTables {
         &self,
         counts: PawnCount,
         layout: TeamLayout,
-        f: &mut impl FnMut(KingPos, u32),
+        f: &mut impl FnMut(usize, u32),
     ) {
         let TeamLayout {
             pieces0, pieces1, ..
@@ -294,7 +294,7 @@ impl AllTables {
                         return;
                     }
                 }
-                f(*kpos, mask);
+                f(i, mask);
             })
         }
     }
@@ -337,7 +337,7 @@ impl AllTables {
         };
 
         let mut win_in1 = 0;
-        let mut total_unresolved = 0;
+        let mut schedule = vec![];
         for counts in count_indexer(size) {
             let counts: PawnCount = counts;
             if counts.count0 < counts.count1 {
@@ -347,12 +347,15 @@ impl AllTables {
             if counts.count0 > counts.count1 {
                 jobs.push(TableJob::new(&tb, counts.invert()));
             }
-
             for job in &jobs {
                 job.mark_ez_win();
                 win_in1 += job.update.current.count_ones();
             }
+            schedule.push(jobs)
+        }
 
+        let mut total_unresolved = 0;
+        for mut jobs in schedule {
             let mut any_progress = true;
             let mut iters = 0;
             while any_progress {
@@ -368,7 +371,10 @@ impl AllTables {
                 total_unresolved += job.total_unresolved.load(Ordering::Relaxed);
             }
 
-            println!("finished {counts:?} in {iters} iterations");
+            println!(
+                "finished {:?} in {iters} iterations",
+                jobs[0].update.current.counts
+            );
         }
 
         tb.total_unresolved = total_unresolved;
