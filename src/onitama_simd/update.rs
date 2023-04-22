@@ -13,12 +13,11 @@ use super::{
 
 pub struct UpdateStatus {
     pub(crate) progress: bool,
-    pub(crate) resolved: bool,
+    pub(crate) unresolved: u64,
 }
 
 impl Update<'_> {
-    // returns whether there was any progress
-    pub fn update_layout(mut self) -> UpdateStatus {
+    pub fn get_unresolved<const COUNT: bool>(&mut self) -> u64 {
         let layout = self.layout;
         let mem = &mut *self.mem;
         let ImmutableUpdate {
@@ -30,9 +29,7 @@ impl Update<'_> {
             mask_lookup,
             directions,
         } = *self.immutable;
-        let TeamLayout {
-            pieces0, pieces1, ..
-        } = layout;
+        let TeamLayout { pieces0, pieces1 } = layout;
         let PawnCount { count0, count1 } = current.counts;
 
         layout
@@ -79,7 +76,25 @@ impl Update<'_> {
             .iter_mut()
             .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
 
-        let resolved = self.check_resolved(&inv_slice);
+        self.check_unresolved::<COUNT>(&inv_slice)
+    }
+
+    // returns whether there was any progress
+    pub fn update_layout(mut self) -> UpdateStatus {
+        let layout = self.layout;
+        let ImmutableUpdate {
+            inv_current,
+            current,
+            take_one,
+            leave_one,
+            go_up,
+            mask_lookup,
+            directions,
+        } = *self.immutable;
+        let TeamLayout { pieces0, pieces1 } = layout;
+        let PawnCount { count0, count1 } = current.counts;
+
+        let unresolved = self.get_unresolved::<false>();
         let mem = &mut *self.mem;
 
         let mut progress = false;
@@ -113,23 +128,30 @@ impl Update<'_> {
             }
         }
 
-        UpdateStatus { progress, resolved }
+        UpdateStatus {
+            progress,
+            unresolved,
+        }
     }
 
-    pub fn check_resolved(&mut self, inv_slice: &SubTable) -> bool {
+    pub fn check_unresolved<const COUNT: bool>(&mut self, inv_slice: &SubTable) -> u64 {
         let layout = self.layout;
         let mem = &mut *self.mem;
         let current = self.immutable.current;
 
         let mut all_done = BLOCK_MASK;
-        let mut num_done = 0;
-        let mut num_not_done = 0;
+        let mut total_unresolved = 0;
+        // let mut num_done = 0;
+        // let mut num_not_done = 0;
         layout.indexer(current.counts).for_enumerate(|i, kpos| {
             let w = Block(mem.wins[i]).invert().0;
-            mem.status[i] &= !w;
             let l = mem.status[i];
-            debug_assert_eq!(w & l, 0);
-            all_done &= (w | l);
+            mem.status[i] &= !w;
+            if COUNT {
+                total_unresolved += 30 - ((w | l) & BLOCK_MASK).count_ones() as u64
+            } else {
+                all_done &= (w | l);
+            }
             // if (w | l) & BLOCK_MASK == BLOCK_MASK {
             //     inv_slice[kpos.invert()].fetch_or(RESOLVED_BIT, Ordering::Relaxed);
             //     num_done += 1;
@@ -150,7 +172,11 @@ impl Update<'_> {
         //     self.block_not_done
         //         .fetch_add(num_not_done, Ordering::Relaxed);
         // }
-        all_done == BLOCK_MASK
+        if COUNT {
+            total_unresolved
+        } else {
+            (all_done != BLOCK_MASK) as u64
+        }
     }
 
     fn load_stuff(&mut self, inv_slice: &SubTable) {

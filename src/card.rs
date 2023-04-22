@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use bit_iter::BitIter;
 use seq_macro::seq;
 

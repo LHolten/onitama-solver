@@ -118,6 +118,8 @@ pub struct AllTables {
     block_not_done: AtomicU64,
     card_done: AtomicU64,
     card_not_done: AtomicU64,
+    total_unresolved: u64,
+    win_in1: u64,
 }
 
 impl AllTables {
@@ -132,7 +134,13 @@ impl AllTables {
     }
 
     fn len(&self) -> u64 {
-        self.list.iter().map(|l| l.list.len() as u64).sum()
+        let mut total = 0;
+        for table in self.list.iter() {
+            for layout in table.counts {
+                total += layout.indexer(table.counts).total() as u64;
+            }
+        }
+        total
     }
 }
 
@@ -310,7 +318,7 @@ impl AllTables {
             }
             directions |= card.bitmap::<false>();
         }
-        let tb = Self {
+        let mut tb = Self {
             size,
             cards: Cards(cards),
             mask_lookup,
@@ -334,14 +342,17 @@ impl AllTables {
             block_not_done: Default::default(),
             card_done: Default::default(),
             card_not_done: Default::default(),
+            total_unresolved: 0,
+            win_in1: 0,
         };
 
         for counts in count_indexer(size) {
             tb.mark_ez_win(counts);
         }
 
-        println!("{} wins and {} total", tb.count_ones(), tb.len() * 30);
+        tb.win_in1 = tb.count_ones();
 
+        let mut total_unresolved = 0;
         for counts in count_indexer(size) {
             let counts: PawnCount = counts;
             if counts.count0 < counts.count1 {
@@ -362,10 +373,15 @@ impl AllTables {
                 iters += 1;
             }
 
+            for job in &jobs {
+                job.count_unresolved();
+                total_unresolved += job.total_unresolved.load(Ordering::Relaxed);
+            }
+
             println!("finished {counts:?} in {iters} iterations");
-            println!("{} wins", tb.index_count(counts).count_ones());
         }
 
+        tb.total_unresolved = total_unresolved;
         tb
     }
 }
@@ -376,6 +392,7 @@ struct TableJob<'a> {
     is_resolved: Vec<bool>,
     resolved: Vec<TeamLayout>,
     update: ImmutableUpdate<'a>,
+    total_unresolved: AtomicU64,
     done: bool,
 }
 
@@ -466,7 +483,16 @@ mod tests {
     #[test]
     fn build_tb() {
         let tb = AllTables::build(3, 0b11111);
-        println!("{} total", tb.len() * 30);
+        let wins = tb.count_ones();
+        let total = tb.len() * 30;
+        println!("{wins} total wins");
+        println!("{} wins in 1", tb.win_in1);
+        println!("{} not win in 1", total - tb.win_in1);
+        println!("{} unresolved states", tb.total_unresolved);
+        println!(
+            "{} resolved, not win in 1",
+            total - tb.win_in1 - tb.total_unresolved
+        );
         println!(
             "{} blocks done, {} blocks not done",
             tb.block_done.load(Ordering::Relaxed),
@@ -477,8 +503,9 @@ mod tests {
             tb.card_done.load(Ordering::Relaxed),
             tb.card_not_done.load(Ordering::Relaxed)
         );
-        // assert_eq!(tb.count_ones(), 6752579);
-        assert_eq!(tb.count_ones(), 831344251);
+        // assert_eq!(wins, 6752579);
+        assert_eq!(wins, 831344251);
+        // assert_eq!(wins, 27126107221);
     }
 
     #[test]

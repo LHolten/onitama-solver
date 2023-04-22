@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use std::{
     cell::RefCell,
     mem::take,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use crate::{index::Indexer, onitama_simd::LocalMem};
@@ -44,8 +44,30 @@ impl<'a> TableJob<'a> {
             resolved: Vec::with_capacity(counts.total()),
             update,
             done: false,
+            total_unresolved: AtomicU64::new(0),
             tb,
         }
+    }
+
+    pub fn count_unresolved(&self) {
+        #[cfg(feature = "parallell")]
+        let iter = self.layouts.par_iter();
+        #[cfg(not(feature = "parallell"))]
+        let iter = self.layouts.iter();
+
+        iter.for_each(|layout| {
+            UPDATE.with(|vals| {
+                let mem = &mut *vals.borrow_mut();
+                let mut update = Update {
+                    layout: *layout,
+                    immutable: &self.update,
+                    mem,
+                };
+                let unresolved = update.get_unresolved::<true>();
+                self.total_unresolved
+                    .fetch_add(unresolved, Ordering::Relaxed);
+            })
+        });
     }
 }
 
@@ -60,9 +82,6 @@ impl Iterator for TableJob<'_> {
         if self.done {
             return None;
         };
-        if self.update.go_up {
-            self.layouts.extend(take(&mut self.resolved));
-        }
         #[cfg(feature = "parallell")]
         let iter = self.layouts.par_iter();
         #[cfg(not(feature = "parallell"))]
@@ -79,7 +98,7 @@ impl Iterator for TableJob<'_> {
                 };
                 let tmp = update.update_layout();
                 progress.fetch_or(tmp.progress, Ordering::Relaxed);
-                tmp.resolved
+                tmp.unresolved == 0
             })
         });
 
@@ -102,6 +121,7 @@ impl Iterator for TableJob<'_> {
         if self.update.go_up {
             self.done = true;
         } else if !progress.load(Ordering::Relaxed) {
+            self.layouts.extend(take(&mut self.resolved));
             self.update.go_up = true;
         }
         Some(())
