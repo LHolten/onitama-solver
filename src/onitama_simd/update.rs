@@ -7,9 +7,7 @@ use crate::{
     index::{Indexer, InternalIter},
 };
 
-use super::{
-    Accum, Block, ImmutableUpdate, PawnCount, Spread, SubTable, TeamLayout, Update, BLOCK_MASK,
-};
+use super::{Accum, Block, ImmutableUpdate, Spread, SubTable, TeamLayout, Update, BLOCK_MASK};
 
 pub struct UpdateStatus {
     pub(crate) progress: bool,
@@ -24,13 +22,11 @@ impl Update<'_> {
             inv_current,
             current,
             take_one,
-            leave_one,
-            go_up,
             mask_lookup,
             directions,
+            ..
         } = *self.immutable;
-        let TeamLayout { pieces0, pieces1 } = layout;
-        let PawnCount { count0, count1 } = current.counts;
+        let pieces0 = layout.pieces0;
 
         layout
             .indexer(current.counts)
@@ -43,11 +39,6 @@ impl Update<'_> {
         mem.status.clear();
         mem.status
             .extend(repeat(0).take(layout.indexer(current.counts).total()));
-
-        let inv_slice = inv_current.index(layout.invert());
-        mem.wins.resize(layout.indexer(current.counts).total(), 0);
-        self.load_stuff(&inv_slice);
-        let mem = &mut *self.mem;
 
         for offset in BitIter::from(directions) {
             let mask = mask_lookup[offset];
@@ -76,23 +67,25 @@ impl Update<'_> {
             .iter_mut()
             .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
 
-        self.check_unresolved::<COUNT>(&inv_slice)
+        let inv_slice = inv_current.index(layout.invert());
+        mem.wins.resize(layout.indexer(current.counts).total(), 0);
+        self.load_stuff(&inv_slice);
+
+        self.check_unresolved::<COUNT>()
     }
 
     // returns whether there was any progress
     pub fn update_layout(mut self) -> UpdateStatus {
         let layout = self.layout;
         let ImmutableUpdate {
-            inv_current,
             current,
-            take_one,
             leave_one,
             go_up,
             mask_lookup,
             directions,
+            ..
         } = *self.immutable;
         let TeamLayout { pieces0, pieces1 } = layout;
-        let PawnCount { count0, count1 } = current.counts;
 
         let unresolved = self.get_unresolved::<false>();
         let mem = &mut *self.mem;
@@ -134,7 +127,7 @@ impl Update<'_> {
         }
     }
 
-    pub fn check_unresolved<const COUNT: bool>(&mut self, inv_slice: &SubTable) -> u64 {
+    pub fn check_unresolved<const COUNT: bool>(&mut self) -> u64 {
         let layout = self.layout;
         let mem = &mut *self.mem;
         let current = self.immutable.current;
@@ -143,14 +136,14 @@ impl Update<'_> {
         let mut total_unresolved = 0;
         // let mut num_done = 0;
         // let mut num_not_done = 0;
-        layout.indexer(current.counts).for_enumerate(|i, kpos| {
-            let w = Block(mem.wins[i]).invert().0;
+        layout.indexer(current.counts).for_enumerate(|i, _kpos| {
+            let w = mem.wins[i];
             let l = mem.status[i];
             mem.status[i] &= !w;
             if COUNT {
                 total_unresolved += 30 - ((w | l) & BLOCK_MASK).count_ones() as u64
             } else {
-                all_done &= (w | l);
+                all_done &= w | l;
             }
             // if (w | l) & BLOCK_MASK == BLOCK_MASK {
             //     inv_slice[kpos.invert()].fetch_or(RESOLVED_BIT, Ordering::Relaxed);
@@ -180,9 +173,7 @@ impl Update<'_> {
     }
 
     fn load_stuff(&mut self, inv_slice: &SubTable) {
-        let layout = self.layout;
-        let mem = &mut self.mem;
-        let current = self.immutable.current;
+        let mem = &mut *self.mem;
 
         let inv_indexer = inv_slice.layout.indexer(inv_slice.counts);
         inv_indexer.for_enumerate(|inv_i, kpos| {
@@ -190,7 +181,7 @@ impl Update<'_> {
             let s = unsafe { mem.wins.get_mut(i).unwrap_unchecked() };
             let x = unsafe { inv_slice.slice.get(inv_i).unwrap_unchecked() };
             let tmp = x.load(Ordering::Relaxed);
-            *s = tmp;
+            *s = Block(tmp).invert().0;
         });
     }
 }

@@ -162,7 +162,7 @@ fn ranking(s_1: u32, s_2: u32) -> usize {
         let cond = s_1 & (1 << i) != 0;
         ctr += if cond { 27 } else { 27 * 7 };
         let j = 1 + i + ctr + 27 * (1 + 7);
-        let mut x = unsafe { *COMB.get(j).unwrap_unchecked() };
+        let x = unsafe { *COMB.get(j).unwrap_unchecked() };
         r += if cond { x.0 } else { x.1 } as usize;
     });
     r

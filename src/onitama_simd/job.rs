@@ -17,7 +17,7 @@ impl<'a> TableJob<'a> {
     pub fn new(tb: &'a AllTables, counts: PawnCount) -> Self {
         let PawnCount { count0, count1 } = counts;
 
-        let mut update = ImmutableUpdate {
+        let update = ImmutableUpdate {
             current: tb.index_count(counts),
             inv_current: tb.index_count(counts.invert()),
             take_one: (count1 != 0).then(|| {
@@ -37,7 +37,8 @@ impl<'a> TableJob<'a> {
             directions: tb.directions,
         };
 
-        let layouts = counts.into_iter().collect();
+        let mut layouts = Vec::with_capacity(counts.total());
+        layouts.extend(counts);
         Self {
             layouts,
             is_resolved: Vec::with_capacity(counts.total()),
@@ -105,7 +106,7 @@ impl Iterator for TableJob<'_> {
         #[cfg(not(feature = "parallell"))]
         let iter = self.layouts.iter();
 
-        let mut progress = AtomicBool::new(false);
+        let progress = AtomicBool::new(false);
         let iter = iter.map(|layout| {
             UPDATE.with(|vals| {
                 let mem = &mut *vals.borrow_mut();

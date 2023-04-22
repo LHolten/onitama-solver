@@ -1,5 +1,4 @@
-#![allow(unused)]
-#![warn(unused_imports)]
+#![allow(dead_code)]
 mod accum_spread;
 mod iter;
 mod job;
@@ -217,7 +216,6 @@ pub struct LocalMem {
     wins: Vec<u32>,
     status: Vec<u32>,
     king_lookup: KingLookup,
-    lookup: [Vec<u32>; 5],
 }
 
 impl LocalMem {
@@ -228,7 +226,6 @@ impl LocalMem {
             king_lookup: KingLookup {
                 list: [[0; 25]; 25],
             },
-            lookup: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         }
     }
 }
@@ -277,9 +274,7 @@ impl AllTables {
         layout: TeamLayout,
         f: &mut impl FnMut(usize, u32),
     ) {
-        let TeamLayout {
-            pieces0, pieces1, ..
-        } = layout;
+        let pieces1 = layout.pieces1;
 
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             // from where can you attack the temple?
@@ -518,20 +513,4 @@ mod tests {
             assert_eq!(mask, Block(mask).invert().0)
         }
     }
-
-    // #[test]
-    // fn what() {
-    //     let layout = TeamLayout {
-    //         counts: PawnCount {
-    //             count0: 0,
-    //             count1: 1,
-    //         },
-    //         pieces0: 1,
-    //         pieces1: 6,
-    //     };
-    //     assert_eq!(
-    //         layout.indexer().total(),
-    //         layout.indexer().into_iter().count()
-    //     )
-    // }
 }
