@@ -1,4 +1,6 @@
 #[cfg(feature = "parallell")]
+use rayon::prelude::ParallelExtend;
+#[cfg(feature = "parallell")]
 use rayon::prelude::*;
 
 use std::{
@@ -7,7 +9,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use crate::onitama_simd::LocalMem;
+use crate::{index::Indexer, onitama_simd::LocalMem};
 
 use super::{AllTables, ImmutableUpdate, PawnCount, TableJob, Update};
 
@@ -38,7 +40,8 @@ impl<'a> TableJob<'a> {
         let layouts = counts.into_iter().collect();
         Self {
             layouts,
-            resolved: Vec::new(),
+            is_resolved: Vec::with_capacity(counts.total()),
+            resolved: Vec::with_capacity(counts.total()),
             update,
             done: false,
             tb,
@@ -61,12 +64,12 @@ impl Iterator for TableJob<'_> {
             self.layouts.extend(take(&mut self.resolved));
         }
         #[cfg(feature = "parallell")]
-        let iter = take(&mut self.layouts).into_par_iter();
+        let iter = self.layouts.par_iter();
         #[cfg(not(feature = "parallell"))]
-        let iter = take(&mut self.layouts).into_iter();
+        let iter = self.layouts.iter();
 
         let mut progress = AtomicBool::new(false);
-        let (resolved, unresolved): (Vec<_>, Vec<_>) = iter.partition(|layout| {
+        let iter = iter.map(|layout| {
             UPDATE.with(|vals| {
                 let mem = &mut *vals.borrow_mut();
                 let update = Update {
@@ -79,8 +82,22 @@ impl Iterator for TableJob<'_> {
                 tmp.resolved
             })
         });
-        self.layouts = unresolved;
-        self.resolved.extend(resolved);
+
+        #[cfg(feature = "parallell")]
+        self.is_resolved.par_extend(iter);
+        #[cfg(not(feature = "parallell"))]
+        self.is_resolved.extend(iter);
+
+        let mut i = 0;
+        self.layouts.retain(|layout| {
+            let res = self.is_resolved[i];
+            if res {
+                self.resolved.push(*layout)
+            }
+            i += 1;
+            !res
+        });
+        self.is_resolved.clear();
 
         if self.update.go_up {
             self.done = true;

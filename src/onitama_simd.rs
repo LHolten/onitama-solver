@@ -373,6 +373,7 @@ impl AllTables {
 struct TableJob<'a> {
     tb: &'a AllTables,
     layouts: Vec<TeamLayout>,
+    is_resolved: Vec<bool>,
     resolved: Vec<TeamLayout>,
     update: ImmutableUpdate<'a>,
     done: bool,
