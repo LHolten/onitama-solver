@@ -11,7 +11,7 @@ use std::{
 
 use crate::{index::Indexer, onitama_simd::LocalMem};
 
-use super::{AllTables, ImmutableUpdate, PawnCount, TableJob, Update};
+use super::{AllTables, Block, ImmutableUpdate, PawnCount, TableJob, Update};
 
 impl<'a> TableJob<'a> {
     pub fn new(tb: &'a AllTables, counts: PawnCount) -> Self {
@@ -66,6 +66,23 @@ impl<'a> TableJob<'a> {
                 let unresolved = update.get_unresolved::<true>();
                 self.total_unresolved
                     .fetch_add(unresolved, Ordering::Relaxed);
+            })
+        });
+    }
+
+    pub fn mark_ez_win(&self) {
+        let counts = self.update.current.counts;
+
+        #[cfg(feature = "parallell")]
+        let iter = self.layouts.par_iter();
+        #[cfg(not(feature = "parallell"))]
+        let iter = self.layouts.iter();
+
+        iter.for_each(|layout| {
+            self.tb.ez_win_for_each(counts, *layout, &mut |i, mask| {
+                // mask is the future cards
+                self.tb.index_count(counts).index(*layout)[i]
+                    .fetch_or(Block(mask).invert().expand().0, Ordering::Relaxed);
             })
         });
     }

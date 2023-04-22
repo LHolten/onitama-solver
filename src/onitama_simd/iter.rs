@@ -234,21 +234,6 @@ const COMB: [(u32, u32); 27 * 7 * 7 + 27] = seq!(i in 0..1350 {
     ,)*]
 });
 
-// const COMB2: [u32; 27 * 7 * 7 + 27] = seq!(i in 0..1350 {
-//     [#(
-//         #[allow(clippy::identity_op)]
-//         #[allow(clippy::erasing_op)]
-//         #[allow(clippy::eq_op)]
-//         {
-//             if i < 27 || i >= 1323 {
-//                 0
-//             } else {
-//                 comb_exact_inner2(i - 27) + comb_exact_inner2(i)
-//             }
-//         }
-//     ,)*]
-// });
-
 fn combinations(n: i32, k1: i32, k2: i32) -> usize {
     let i = 1 + n + 27 * (1 + k1 + 7 * (1 + k2));
     unsafe { COMB.get(i as usize).unwrap_unchecked().0 as usize }
@@ -268,35 +253,6 @@ fn iter(s_1: u32, s_2: u32, i: i32, ones: i32, twos: i32, f: &mut impl FnMut(u32
         }
     }
 }
-
-// fn step(mut r: i32, s_1: u32, s_2: u32, from: usize, to: usize) -> i32 {
-//     let (low, high) = if to > from {
-//         (from, to)
-//     } else {
-//         (to + 1, from + 1)
-//     };
-
-//     let mut ones = (s_1 & ((1 << low) - 1)).count_ones();
-//     let mut twos = (s_2 & ((1 << low) - 1)).count_ones();
-//     // for i in low..high {
-
-//     // }
-
-//     let mut twos = 0;
-//     let mut ones = 0;
-
-//     for i in BitIter::from(s_1 | s_2) {
-//         if s_1 & (1 << i) != 0 {
-//             ones += 1;
-//             r += combinations(i as i32, ones, twos);
-//         } else {
-//             twos += 1;
-//             r += combinations(i as i32, ones, twos);
-//             r += combinations(i as i32, ones - 1, twos);
-//         }
-//     }
-//     r as u32
-// }
 
 #[cfg(test)]
 mod tests {

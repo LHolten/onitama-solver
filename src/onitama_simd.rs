@@ -271,16 +271,6 @@ pub struct Spread<'a> {
 }
 
 impl AllTables {
-    pub fn mark_ez_win(&self, counts: PawnCount) {
-        for layout in counts {
-            self.ez_win_for_each(counts, layout, &mut |i, mask| {
-                // mask is the future cards
-                self.index_count(counts).index(layout)[i]
-                    .fetch_or(Block(mask).invert().expand().0, Ordering::Relaxed);
-            })
-        }
-    }
-
     pub fn ez_win_for_each(
         &self,
         counts: PawnCount,
@@ -346,12 +336,7 @@ impl AllTables {
             win_in1: 0,
         };
 
-        for counts in count_indexer(size) {
-            tb.mark_ez_win(counts);
-        }
-
-        tb.win_in1 = tb.count_ones();
-
+        let mut win_in1 = 0;
         let mut total_unresolved = 0;
         for counts in count_indexer(size) {
             let counts: PawnCount = counts;
@@ -361,6 +346,11 @@ impl AllTables {
             let mut jobs = vec![TableJob::new(&tb, counts)];
             if counts.count0 > counts.count1 {
                 jobs.push(TableJob::new(&tb, counts.invert()));
+            }
+
+            for job in &jobs {
+                job.mark_ez_win();
+                win_in1 += job.update.current.count_ones();
             }
 
             let mut any_progress = true;
@@ -382,6 +372,7 @@ impl AllTables {
         }
 
         tb.total_unresolved = total_unresolved;
+        tb.win_in1 = win_in1;
         tb
     }
 }
