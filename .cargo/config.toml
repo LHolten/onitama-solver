@@ -1,5 +1,10 @@
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-Ctarget-cpu=native"]
 
-[target.x86_64-pc-windows-gnu]
-rustflags = ["-Ctarget-cpu=znver2"]
+# [target.x86_64-unknown-linux-musl]
+# rustflags = ["-Ctarget-cpu=cascadelake",
+# "-Ctarget-feature=+crt-static"]
+
+# [target.x86_64-pc-windows-gnu]
+# rustflags = ["-Ctarget-cpu=znver2"]
+# rustflags = ["-Ctarget-cpu=raptorlake"]

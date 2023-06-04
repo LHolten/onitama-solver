@@ -113,12 +113,12 @@ pub struct AllTables {
     mask_lookup: [u32; 25],
     directions: u32,
     list: Box<[Table]>,
-    block_done: AtomicU64,
-    block_not_done: AtomicU64,
-    card_done: AtomicU64,
-    card_not_done: AtomicU64,
-    total_unresolved: u64,
-    win_in1: u64,
+    pub block_done: AtomicU64,
+    pub block_not_done: AtomicU64,
+    pub card_done: AtomicU64,
+    pub card_not_done: AtomicU64,
+    pub total_unresolved: u64,
+    pub win_in1: u64,
 }
 
 impl AllTables {
@@ -128,11 +128,11 @@ impl AllTables {
         unsafe { self.list.get(i).unwrap_unchecked() }
     }
 
-    fn count_ones(&self) -> u64 {
+    pub fn count_ones(&self) -> u64 {
         self.list.iter().map(|x| x.count_ones()).sum()
     }
 
-    fn len(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         let mut total = 0;
         for table in self.list.iter() {
             for layout in table.counts {
