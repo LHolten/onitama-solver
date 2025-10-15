@@ -1,5 +1,3 @@
-use std::intrinsics::assume;
-
 use std::iter::{self, once, Once};
 
 use bit_iter::BitIter;
@@ -199,6 +197,8 @@ pub struct ChooseExact {
     count: u32,
 }
 
+use std::hint::assert_unchecked;
+
 macro_rules! gen_impl {
     ($($t:ty)*) => {$(
         impl Gen<$t, $t> for ChooseExact {
@@ -224,7 +224,7 @@ macro_rules! gen_impl {
                     let new = curr_or_skip.wrapping_add(lowest);
                     let bits = (new & mask).count_ones();
 
-                    unsafe {assume(bits <= 4)}
+                    unsafe {assert_unchecked(bits <= 4)}
                     curr_or_skip = new | lookup[bits as usize];
 
                     curr = curr_or_skip & mask;

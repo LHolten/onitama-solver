@@ -5,9 +5,11 @@ mod job;
 mod update;
 
 use std::{
-    iter::{repeat_with, zip},
+    alloc::Layout,
+    iter::zip,
     ops::{BitAnd, Index, IndexMut},
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    time::Instant,
 };
 
 use bit_iter::BitIter;
@@ -303,6 +305,7 @@ impl AllTables {
             }
             directions |= card.bitmap::<false>();
         }
+
         let mut tb = Self {
             size,
             cards: Cards(cards),
@@ -313,9 +316,12 @@ impl AllTables {
                 .map(|counts: PawnCount| {
                     let chunk_size = (counts.count0 + 1) as usize * (counts.count1 + 1) as usize;
                     let num_chunks = counts.total();
-                    let list = repeat_with(|| AtomicU32::new(0))
-                        .take(chunk_size * num_chunks)
-                        .collect();
+                    let len = chunk_size * num_chunks;
+                    let list = unsafe {
+                        let ptr =
+                            std::alloc::alloc_zeroed(Layout::array::<AtomicU32>(len).unwrap());
+                        Vec::from_raw_parts(ptr as *mut AtomicU32, len, len).into_boxed_slice()
+                    };
                     Table {
                         counts,
                         chunk_size,
