@@ -17,3 +17,6 @@ rayon = "1.7.0"
 
 [features]
 parallell = []
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.189"

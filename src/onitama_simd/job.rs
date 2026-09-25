@@ -56,19 +56,21 @@ impl<'a> TableJob<'a> {
         #[cfg(not(feature = "parallell"))]
         let iter = self.layouts.iter();
 
-        iter.for_each(|layout| {
-            UPDATE.with(|vals| {
-                let mem = &mut *vals.borrow_mut();
-                let mut update = Update {
-                    layout: *layout,
-                    immutable: &self.update,
-                    mem,
-                };
-                let unresolved = update.get_unresolved::<true>();
-                self.total_unresolved
-                    .fetch_add(unresolved, Ordering::Relaxed);
+        // reduce per thread instead of hammering one shared cache line per layout
+        let total: u64 = iter
+            .map(|layout| {
+                UPDATE.with(|vals| {
+                    let mem = &mut *vals.borrow_mut();
+                    let mut update = Update {
+                        layout: *layout,
+                        immutable: &self.update,
+                        mem,
+                    };
+                    update.get_unresolved::<true>()
+                })
             })
-        });
+            .sum();
+        self.total_unresolved.fetch_add(total, Ordering::Relaxed);
     }
 
     pub fn mark_ez_win(&self) {
@@ -79,11 +81,13 @@ impl<'a> TableJob<'a> {
         #[cfg(not(feature = "parallell"))]
         let iter = self.layouts.iter();
 
+        let table = self.tb.index_count(counts);
         iter.for_each(|layout| {
+            // the slice only depends on the layout, so look it up once
+            let slice = table.index(*layout).slice;
             self.tb.ez_win_for_each(counts, *layout, &mut |i, mask| {
                 // mask is the future cards
-                let val = self.tb.index_count(counts).index(*layout).slice.get(i);
-                let val = unsafe { val.unwrap_unchecked() };
+                let val = unsafe { slice.get(i).unwrap_unchecked() };
                 val.fetch_or(Block(mask).invert().expand().0, Ordering::Relaxed);
             })
         });
@@ -116,7 +120,11 @@ impl Iterator for TableJob<'_> {
                     mem,
                 };
                 let tmp = update.update_layout();
-                progress.fetch_or(tmp.progress, Ordering::Relaxed);
+                // a `fetch_or` per layout ping-pongs this cache line between all
+                // threads; a relaxed load keeps the line shared once it is set
+                if tmp.progress && !progress.load(Ordering::Relaxed) {
+                    progress.store(true, Ordering::Relaxed);
+                }
                 tmp.unresolved == 0
             })
         });

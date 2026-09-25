@@ -1,4 +1,7 @@
-use std::{iter::repeat, sync::atomic::Ordering};
+use std::{
+    iter::{repeat, zip},
+    sync::atomic::Ordering,
+};
 
 use bit_iter::BitIter;
 
@@ -7,7 +10,10 @@ use crate::{
     index::{Indexer, InternalIter},
 };
 
-use super::{Accum, Block, ImmutableUpdate, Spread, SubTable, TeamLayout, Update, BLOCK_MASK};
+use super::{
+    prefetch, Accum, Block, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
+    TeamLayout, Update, BLOCK_MASK,
+};
 
 pub struct UpdateStatus {
     pub(crate) progress: bool,
@@ -40,6 +46,9 @@ impl Update<'_> {
         mem.status
             .extend(repeat(0).take(layout.indexer(current.counts).total()));
 
+        // first locate (and prefetch) the target chunk of every move, then do
+        // the actual work; see `PreparedMove`
+        mem.moves.clear();
         for offset in BitIter::from(directions) {
             let mask = mask_lookup[offset];
             let to_mask = offset_mask(offset, pieces0);
@@ -48,17 +57,52 @@ impl Update<'_> {
 
             for to in BitIter::from(to_mask) {
                 let from = to + 12 - offset;
-                let accum = Accum {
-                    layout,
-                    current,
-                    take_one,
-                    step: (from, to),
-                    slice: &mut mem.status,
-                    mask,
-                    king_lookup: &mem.king_lookup,
+
+                let new = TeamLayout {
+                    pieces0: pieces0 ^ (1 << to) ^ (1 << from),
+                    pieces1: layout.pieces1 & !(1 << to),
                 };
-                accum.accumulate();
+
+                // check if we are taking a piece
+                let table = if layout.pieces1 & 1 << to != 0 {
+                    let Some(table) = take_one else {
+                        // there is no way to take a piece when there is only a king to take
+                        continue
+                    };
+                    table
+                } else {
+                    current
+                };
+
+                let target = table.index(new).slice;
+                prefetch(target);
+                mem.moves.push(PreparedMove {
+                    step: (from, to),
+                    mask,
+                    new,
+                    counts: table.counts,
+                    target,
+                });
             }
+        }
+
+        let LocalMem {
+            status,
+            king_lookup,
+            moves,
+            ..
+        } = &mut *mem;
+        for mv in moves.iter() {
+            let accum = Accum {
+                new: mv.new,
+                counts: mv.counts,
+                step: mv.step,
+                mask: mv.mask,
+                target: mv.target(),
+                slice: status,
+                king_lookup,
+            };
+            accum.accumulate();
         }
 
         // we expand, marking all states that are not lost because it has the card
@@ -88,18 +132,14 @@ impl Update<'_> {
         let TeamLayout { pieces0, pieces1 } = layout;
 
         let unresolved = self.get_unresolved::<false>();
-        let mem = &mut *self.mem;
 
-        let mut progress = false;
-        // same thing, but cards are now inverted
-        // but it is also the other team, so not inverted
+        // same two phase split as in `get_unresolved`: locate and prefetch every
+        // target chunk before touching any of them.
+        // Cards are now inverted, but it is also the other team, so not inverted.
+        let moves = &mut self.mem.moves;
+        moves.clear();
         for offset in BitIter::from(directions) {
             let mask = mask_lookup[offset];
-
-            // we spread out the loses, these are wins for the previous state
-            mem.wins.clear();
-            mem.wins
-                .extend(mem.status.iter().map(|x| Block(x & mask).expand().0));
 
             // these are backwards moves, so `to` is the where the piece came from
             let to_mask = offset_mask(offset, pieces1);
@@ -108,17 +148,62 @@ impl Update<'_> {
 
             for to in BitIter::from(to_mask) {
                 let from = to + 12 - offset;
-                let spread = Spread {
-                    layout,
-                    current,
-                    leave_one,
-                    go_up,
-                    step: (from, to),
-                    slice: &mem.wins,
-                    king_lookup: &mem.king_lookup,
+
+                let mut new = TeamLayout {
+                    pieces0,
+                    pieces1: pieces1 ^ (1 << to) ^ (1 << from),
                 };
-                progress |= spread.spreadout();
+                let table = if go_up {
+                    new.pieces0 |= 1 << from;
+                    let Some(table) = leave_one else {
+                        // there is no larger table, so no progress
+                        continue
+                    };
+                    table
+                } else {
+                    current
+                };
+
+                let target = table.index(new).slice;
+                prefetch(target);
+                moves.push(PreparedMove {
+                    step: (from, to),
+                    mask,
+                    new,
+                    counts: table.counts,
+                    target,
+                });
             }
+        }
+
+        let LocalMem {
+            status,
+            wins,
+            king_lookup,
+            moves,
+            ..
+        } = &mut *self.mem;
+
+        let mut progress = false;
+        // `moves` is grouped by offset, so this rebuilds `wins` once per card mask
+        let mut built = None;
+        for mv in moves.iter() {
+            if built != Some(mv.mask) {
+                built = Some(mv.mask);
+                // we spread out the loses, these are wins for the previous state
+                wins.clear();
+                wins.extend(status.iter().map(|x| Block(x & mv.mask).expand().0));
+            }
+
+            let spread = Spread {
+                new: mv.new,
+                counts: mv.counts,
+                step: mv.step,
+                target: mv.target(),
+                slice: wins,
+                king_lookup,
+            };
+            progress |= spread.spreadout();
         }
 
         UpdateStatus {
@@ -136,10 +221,11 @@ impl Update<'_> {
         let mut total_unresolved = 0;
         // let mut num_done = 0;
         // let mut num_not_done = 0;
-        layout.indexer(current.counts).for_enumerate(|i, _kpos| {
-            let w = mem.wins[i];
-            let l = mem.status[i];
-            mem.status[i] &= !w;
+        // the indexer just enumerates 0..total here, so walk the slices directly
+        let total = layout.indexer(current.counts).total();
+        for (s, &w) in zip(&mut mem.status[..total], &mem.wins[..total]) {
+            let l = *s;
+            *s &= !w;
             if COUNT {
                 total_unresolved += 30 - ((w | l) & BLOCK_MASK).count_ones() as u64
             } else {
@@ -159,7 +245,7 @@ impl Update<'_> {
             //     //     }
             //     // }
             // }
-        });
+        }
         // if all_done != BLOCK_MASK {
         //     self.block_done.fetch_add(num_done, Ordering::Relaxed);
         //     self.block_not_done

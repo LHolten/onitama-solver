@@ -82,7 +82,11 @@ pub(crate) fn get_one_bitmap<const S: bool>(card: usize) -> u32 {
             #(reverse_bitmap(CARD_MAP_0[C]),)*
         ]
     });
-    [CARD_MAP_0, CARD_MAP_1][S as usize][card]
+    if S {
+        CARD_MAP_1[card]
+    } else {
+        CARD_MAP_0[card]
+    }
 }
 
 // card masks are ordered from top to bottom

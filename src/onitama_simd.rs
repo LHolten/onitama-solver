@@ -6,8 +6,10 @@ mod update;
 
 use std::{
     alloc::Layout,
+    fmt,
     iter::zip,
-    ops::{BitAnd, Index, IndexMut},
+    mem::size_of,
+    ops::{BitAnd, Deref, Index, IndexMut},
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
     time::Instant,
 };
@@ -145,11 +147,117 @@ impl AllTables {
     }
 }
 
+/// The size of a cache line.
+///
+/// A chunk (all king positions of one layout) is read and written as a unit, so
+/// aligning the table to this means a chunk that fits in a line only touches
+/// one, instead of straddling two.
+const LINE: usize = 64;
+
+/// The size of a huge page.
+const HUGE: usize = 2 << 20;
+
+/// A zeroed, cache line aligned `[AtomicU32]`.
+///
+/// Tables that are at least a huge page big get aligned to one instead, and ask
+/// to be backed by huge pages: they are read in essentially random order, so
+/// with 4K pages almost every lookup costs a page walk.
+pub struct AlignedTable {
+    ptr: *mut AtomicU32,
+    len: usize,
+}
+
+// the contents are atomics, so sharing them across threads is fine
+unsafe impl Send for AlignedTable {}
+unsafe impl Sync for AlignedTable {}
+
+impl AlignedTable {
+    fn size(len: usize) -> usize {
+        len * size_of::<AtomicU32>()
+    }
+
+    fn layout(len: usize) -> Layout {
+        Layout::from_size_align(Self::size(len), LINE).unwrap()
+    }
+
+    /// Map the table directly instead of going through the allocator.
+    ///
+    /// `alloc_zeroed` only reaches `calloc` for alignments up to `MIN_ALIGN`
+    /// (16); above that it allocates and then memsets, which both costs
+    /// gigabytes of writes up front and faults every page in as a 4K page
+    /// before `madvise` gets a chance to say otherwise. A fresh anonymous
+    /// mapping is already zeroed, page aligned and lazily faulted.
+    #[cfg(target_os = "linux")]
+    fn new_zeroed(len: usize) -> Self {
+        let size = Self::size(len);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(
+            ptr != libc::MAP_FAILED,
+            "could not map table of {len} entries"
+        );
+
+        // must happen before the pages are touched, otherwise they are already
+        // split into 4K pages and only khugepaged can undo that. This is a
+        // hint, so there is nothing useful to do if the kernel declines.
+        if size >= HUGE {
+            unsafe { libc::madvise(ptr, size, libc::MADV_HUGEPAGE) };
+        }
+
+        Self {
+            ptr: ptr as *mut AtomicU32,
+            len,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new_zeroed(len: usize) -> Self {
+        let ptr = unsafe { std::alloc::alloc_zeroed(Self::layout(len)) } as *mut AtomicU32;
+        assert!(!ptr.is_null(), "could not allocate table of {len} entries");
+        Self { ptr, len }
+    }
+}
+
+impl Drop for AlignedTable {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, Self::size(self.len));
+        }
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            std::alloc::dealloc(self.ptr as *mut u8, Self::layout(self.len))
+        }
+    }
+}
+
+impl Deref for AlignedTable {
+    type Target = [AtomicU32];
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl fmt::Debug for AlignedTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.deref().fmt(f)
+    }
+}
+
 #[derive(Debug)]
 pub struct Table {
     counts: PawnCount,
     chunk_size: usize,
-    list: Box<[AtomicU32]>,
+    list: AlignedTable,
 }
 
 impl Table {
@@ -218,6 +326,7 @@ pub struct LocalMem {
     wins: Vec<u32>,
     status: Vec<u32>,
     king_lookup: KingLookup,
+    moves: Vec<PreparedMove>,
 }
 
 impl LocalMem {
@@ -228,7 +337,41 @@ impl LocalMem {
             king_lookup: KingLookup {
                 list: [[0; 25]; 25],
             },
+            moves: vec![],
         }
+    }
+}
+
+/// A move whose target chunk has already been located.
+///
+/// Locating it means running the multiset [`iter::ranking`], so the address of
+/// the (usually DRAM resident) chunk is only known at the very end of a long
+/// dependency chain. Resolving every move of a layout up front lets all of
+/// those misses be prefetched and overlap with each other.
+pub struct PreparedMove {
+    step: (usize, usize),
+    mask: u32,
+    new: TeamLayout,
+    counts: PawnCount,
+    // borrows from the tables in `AllTables`, which outlive every update
+    target: *const [AtomicU32],
+}
+
+impl PreparedMove {
+    fn target(&self) -> &[AtomicU32] {
+        unsafe { &*self.target }
+    }
+}
+
+#[inline(always)]
+fn prefetch(slice: &[AtomicU32]) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let ptr = slice.as_ptr();
+        _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
+        // a chunk is at most 64 bytes, so it spans at most two lines
+        _mm_prefetch(ptr.wrapping_add(slice.len() - 1) as *const i8, _MM_HINT_T0);
     }
 }
 
@@ -250,21 +393,20 @@ pub struct Update<'a> {
 
 #[derive(Debug)]
 pub struct Accum<'a> {
-    layout: TeamLayout,
-    current: &'a Table,
-    take_one: Option<&'a Table>,
+    new: TeamLayout,
+    counts: PawnCount,
     mask: u32,
     step: (usize, usize),
+    target: &'a [AtomicU32],
     slice: &'a mut [u32],
     king_lookup: &'a KingLookup,
 }
 
 pub struct Spread<'a> {
-    layout: TeamLayout,
-    current: &'a Table,
-    leave_one: Option<&'a Table>,
-    go_up: bool,
+    new: TeamLayout,
+    counts: PawnCount,
     step: (usize, usize),
+    target: &'a [AtomicU32],
     slice: &'a [u32],
     king_lookup: &'a KingLookup,
 }
@@ -279,13 +421,14 @@ impl AllTables {
         let pieces1 = layout.pieces1;
 
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
+            let bitmap = card.bitmap::<false>();
             // from where can you attack the temple?
-            let from_mask = offset_mask(2, card.bitmap::<false>());
+            let from_mask = offset_mask(2, bitmap);
 
             layout.indexer(counts).for_enumerate(|i, kpos| {
                 if 1 << kpos.king1 & from_mask == 0 || 1 << 2 & pieces1 != 0 {
                     // no attack on temple
-                    let from_mask = offset_mask(kpos.king0 as usize, card.bitmap::<false>());
+                    let from_mask = offset_mask(kpos.king0 as usize, bitmap);
                     if from_mask & pieces1 == 0 {
                         // no attack on king
                         return;
@@ -317,11 +460,7 @@ impl AllTables {
                     let chunk_size = (counts.count0 + 1) as usize * (counts.count1 + 1) as usize;
                     let num_chunks = counts.total();
                     let len = chunk_size * num_chunks;
-                    let list = unsafe {
-                        let ptr =
-                            std::alloc::alloc_zeroed(Layout::array::<AtomicU32>(len).unwrap());
-                        Vec::from_raw_parts(ptr as *mut AtomicU32, len, len).into_boxed_slice()
-                    };
+                    let list = AlignedTable::new_zeroed(len);
                     Table {
                         counts,
                         chunk_size,
