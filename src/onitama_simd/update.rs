@@ -12,12 +12,15 @@ use crate::{
 
 use super::{
     prefetch, Accum, Block, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
-    TeamLayout, Update, BLOCK_MASK,
+    SpreadStatus, TeamLayout, Update, BLOCK_MASK,
 };
 
 pub struct UpdateStatus {
     pub(crate) progress: bool,
     pub(crate) unresolved: u64,
+    /// Whether the capture predecessors were already written, which means the
+    /// chunk does not need the extra pass at the end.
+    pub(crate) went_up: bool,
 }
 
 impl Update<'_> {
@@ -123,25 +126,52 @@ impl Update<'_> {
         self.check_unresolved::<COUNT>()
     }
 
-    // returns whether there was any progress
     pub fn update_layout(mut self, dead: &mut u32) -> UpdateStatus {
-        let layout = self.layout;
-        let ImmutableUpdate {
-            current,
-            leave_one,
-            go_up,
-            mask_lookup,
-            directions,
-            ..
-        } = *self.immutable;
-        let TeamLayout { pieces0, pieces1 } = layout;
+        let go_up = self.immutable.go_up;
 
         let unresolved = self.get_unresolved::<false>();
 
         // the `go_up` pass prepares a different set of moves, so the bits would
         // not line up. It only runs once, so there is nothing to remember.
         let mut scratch = 0;
-        let dead = if go_up { &mut scratch } else { dead };
+        let res = self.spread_phase(go_up, if go_up { &mut scratch } else { dead });
+
+        // `unresolved == 0` means every state of this chunk is settled, so
+        // these losses can never grow again and the capture predecessors can be
+        // written right now. Doing it here instead of in the extra pass at the
+        // end saves rebuilding the losses from scratch, which costs a full
+        // accumulate and a guaranteed miss on the mirrored chunk.
+        let went_up = !go_up && unresolved == 0;
+        if went_up {
+            // this runs once for the chunk, so there is no mask worth keeping
+            self.spread_phase(true, &mut 0);
+        }
+
+        UpdateStatus {
+            progress: res.progress,
+            // a chunk that can never spread anything new again is done, even if
+            // some of its own states are still unresolved: it is only kept in
+            // the work list to spread. The `go_up` pass has different targets
+            // and only runs once, so leave its bookkeeping alone.
+            unresolved: if go_up || res.could { unresolved } else { 0 },
+            went_up,
+        }
+    }
+
+    /// Locate, prefetch and then spread every backward move.
+    ///
+    /// `up` picks the capture predecessors, which live in the table with one
+    /// more piece, instead of the ones in this table.
+    fn spread_phase(&mut self, up: bool, dead: &mut u32) -> SpreadStatus {
+        let layout = self.layout;
+        let ImmutableUpdate {
+            current,
+            leave_one,
+            mask_lookup,
+            directions,
+            ..
+        } = *self.immutable;
+        let TeamLayout { pieces0, pieces1 } = layout;
 
         // same two phase split as in `get_unresolved`: locate and prefetch every
         // target chunk before touching any of them.
@@ -174,7 +204,7 @@ impl Update<'_> {
                     pieces0,
                     pieces1: pieces1 ^ (1 << to) ^ (1 << from),
                 };
-                let table = if go_up {
+                let table = if up {
                     new.pieces0 |= 1 << from;
                     let Some(table) = leave_one else {
                         // there is no larger table, so no progress
@@ -242,14 +272,7 @@ impl Update<'_> {
             }
         }
 
-        UpdateStatus {
-            progress,
-            // a chunk that can never spread anything new again is done, even if
-            // some of its own states are still unresolved: it is only kept in
-            // the work list to spread. The `go_up` pass has different targets
-            // and only runs once, so leave its bookkeeping alone.
-            unresolved: if go_up || could { unresolved } else { 0 },
-        }
+        SpreadStatus { progress, could }
     }
 
     pub fn check_unresolved<const COUNT: bool>(&mut self) -> u64 {

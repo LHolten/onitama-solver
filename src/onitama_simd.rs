@@ -562,7 +562,9 @@ struct Work {
 struct TableJob<'a> {
     tb: &'a AllTables,
     layouts: Vec<Work>,
-    is_resolved: Vec<bool>,
+    /// Per layout of the last pass: 0 keep, 1 retire but still needs the
+    /// `go_up` pass, 2 retire with the capture predecessors already written.
+    is_resolved: Vec<u8>,
     resolved: Vec<Work>,
     update: ImmutableUpdate<'a>,
     total_unresolved: AtomicU64,

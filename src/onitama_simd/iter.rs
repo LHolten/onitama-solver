@@ -267,6 +267,25 @@ mod tests {
     };
 
     #[test]
+    fn probe_runs() {
+        for (c0, c1) in [(1u32, 1u32), (2, 2), (3, 3), (3, 2)] {
+            let counts = PawnCount { count0: c0, count1: c1 };
+            let (mut n, mut runs0, mut runs1) = (0u64, 0u64, 0u64);
+            let (mut last0, mut last1) = (u32::MAX, u32::MAX);
+            for l in counts {
+                n += 1;
+                if l.pieces0 != last0 { runs0 += 1; last0 = l.pieces0 }
+                if l.pieces1 != last1 { runs1 += 1; last1 = l.pieces1 }
+            }
+            println!(
+                "counts ({c0},{c1}): {n} layouts | pieces0 runs {runs0} (avg {:.1}) | pieces1 runs {runs1} (avg {:.1})",
+                n as f64 / runs0 as f64,
+                n as f64 / runs1 as f64,
+            );
+        }
+    }
+
+    #[test]
     fn test_counts() {
         for n in -1..26 {
             for k1 in -1..3 {

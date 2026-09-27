@@ -133,7 +133,13 @@ impl Iterator for TableJob<'_> {
                 if tmp.progress && !progress.load(Ordering::Relaxed) {
                     progress.store(true, Ordering::Relaxed);
                 }
-                tmp.unresolved == 0
+                if tmp.unresolved != 0 {
+                    0
+                } else if tmp.went_up {
+                    2
+                } else {
+                    1
+                }
             })
         });
 
@@ -146,11 +152,13 @@ impl Iterator for TableJob<'_> {
         let resolved = &mut self.resolved;
         self.layouts.retain(|work| {
             let res = self.is_resolved[i];
-            if res {
+            // only the ones that have not spread upward yet are worth keeping
+            // around for the `go_up` pass
+            if res == 1 {
                 resolved.push(*work)
             }
             i += 1;
-            !res
+            res == 0
         });
         self.is_resolved.clear();
 
