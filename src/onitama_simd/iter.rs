@@ -9,6 +9,29 @@ use super::{PawnCount, TeamLayout};
 
 pub struct TeamLayoutIter(TeamLayout);
 
+impl TeamLayoutIter {
+    /// Restart the enumeration at `layout`, which has to be one it produces.
+    ///
+    /// The whole state is the layout it is about to yield, so a work block can
+    /// be walked from a recorded seed instead of from the beginning.
+    pub fn seeded(layout: TeamLayout) -> Self {
+        Self(layout)
+    }
+}
+
+impl PawnCount {
+    /// The layout the enumeration yields at position `i`.
+    ///
+    /// The enumeration is in ranking order, so this inverts the ranking instead
+    /// of walking up to `i`. That makes recording block seeds cost one unranking
+    /// per block rather than one step per layout, and lets the blocks be built in
+    /// any order.
+    pub fn nth_layout(self, i: usize) -> TeamLayout {
+        let (pieces0, pieces1) = unranking(i, 25, self.count0 as i32 + 1, self.count1 as i32 + 1);
+        TeamLayout { pieces0, pieces1 }
+    }
+}
+
 impl Iterator for TeamLayoutIter {
     type Item = TeamLayout;
 
@@ -282,6 +305,20 @@ mod tests {
                 n as f64 / runs0 as f64,
                 n as f64 / runs1 as f64,
             );
+        }
+    }
+
+    /// The enumeration has to be in ranking order for `nth_layout` to agree
+    /// with walking, which is what the work blocks rely on.
+    #[test]
+    fn test_nth_layout() {
+        for (count0, count1) in [(0, 0), (1, 1), (2, 1), (1, 2), (2, 2), (3, 2)] {
+            let counts = PawnCount { count0, count1 };
+            for (i, layout) in counts.into_iter().enumerate() {
+                assert_eq!(counts.index(&layout), i);
+                let seed = counts.nth_layout(i);
+                assert_eq!((seed.pieces0, seed.pieces1), (layout.pieces0, layout.pieces1));
+            }
         }
     }
 

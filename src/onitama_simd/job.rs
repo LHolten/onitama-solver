@@ -1,6 +1,4 @@
 #[cfg(feature = "parallell")]
-use rayon::prelude::ParallelExtend;
-#[cfg(feature = "parallell")]
 use rayon::prelude::*;
 
 use std::{
@@ -11,7 +9,13 @@ use std::{
 
 use crate::{index::Indexer, onitama_simd::LocalMem};
 
-use super::{AllTables, Block, ImmutableUpdate, PawnCount, TableJob, Update, Work};
+use super::{
+    iter::TeamLayoutIter, AllTables, Block, ImmutableUpdate, PawnCount, TableJob, TeamLayout,
+    Update, BLOCK,
+};
+
+/// Words of [`TableJob::live`] per block.
+const WORDS: usize = BLOCK / 64;
 
 impl<'a> TableJob<'a> {
     pub fn new(tb: &'a AllTables, counts: PawnCount) -> Self {
@@ -37,12 +41,33 @@ impl<'a> TableJob<'a> {
             directions: tb.directions,
         };
 
-        let mut layouts = Vec::with_capacity(counts.total());
-        layouts.extend(counts.into_iter().map(|layout| Work { layout, dead: 0 }));
+        let total = counts.total();
+        let blocks = total.div_ceil(BLOCK);
+        let padded = blocks * BLOCK;
+
+        // one unranking per block instead of one enumeration step per layout,
+        // which also lets the blocks be built out of order
+        let mut seeds = Vec::with_capacity(blocks);
+        #[cfg(feature = "parallell")]
+        seeds.par_extend((0..blocks).into_par_iter().map(|b| counts.nth_layout(b * BLOCK)));
+        #[cfg(not(feature = "parallell"))]
+        seeds.extend((0..blocks).map(|b| counts.nth_layout(b * BLOCK)));
+
+        // every move of every layout starts out worth running, but the
+        // padding at the end of the last block is not a layout at all. The
+        // zeroed allocation is untouched pages, so the only cost here is the
+        // parallel write that faults them in.
+        let mut live = vec![0u32; padded];
+        #[cfg(feature = "parallell")]
+        live[..total].par_iter_mut().for_each(|x| *x = u32::MAX);
+        #[cfg(not(feature = "parallell"))]
+        live[..total].fill(u32::MAX);
+
         Self {
-            layouts,
-            is_resolved: Vec::with_capacity(counts.total()),
-            resolved: Vec::with_capacity(counts.total()),
+            seeds,
+            live,
+            needs_up: vec![0; padded / 64],
+            total,
             update,
             done: false,
             total_unresolved: AtomicU64::new(0),
@@ -50,47 +75,70 @@ impl<'a> TableJob<'a> {
         }
     }
 
-    pub fn count_unresolved(&self) {
-        #[cfg(feature = "parallell")]
-        let iter = self.layouts.par_iter();
-        #[cfg(not(feature = "parallell"))]
-        let iter = self.layouts.iter();
+    /// Call `f` on every live layout and add up what it returns.
+    ///
+    /// The enumeration is only replayed inside a block, and a block that has
+    /// fully retired is skipped after reading its [`TableJob::live`] words.
+    fn map_live<F>(&self, f: F) -> u64
+    where
+        F: Fn(TeamLayout) -> u64 + Sync + Send,
+    {
+        let total = self.total;
 
-        // reduce per thread instead of hammering one shared cache line per layout
-        let total: u64 = iter
-            .map(|work| {
-                UPDATE.with(|vals| {
-                    let mem = &mut *vals.borrow_mut();
-                    let mut update = Update {
-                        layout: work.layout,
-                        immutable: &self.update,
-                        mem,
-                    };
-                    update.get_unresolved::<true>()
-                })
+        #[cfg(feature = "parallell")]
+        let iter = self.seeds.par_iter().zip(self.live.par_chunks(BLOCK));
+        #[cfg(not(feature = "parallell"))]
+        let iter = self.seeds.iter().zip(self.live.chunks(BLOCK));
+
+        iter.enumerate()
+            .map(|(b, (seed, live))| {
+                if live.iter().all(|&moves| moves == 0) {
+                    return 0;
+                }
+
+                let start = b * BLOCK;
+                let mut layouts = TeamLayoutIter::seeded(*seed);
+                let mut sum = 0;
+                for j in 0..BLOCK.min(total - start) {
+                    let layout = layouts.next().unwrap();
+                    if live[j] != 0 {
+                        sum += f(layout);
+                    }
+                }
+                sum
             })
-            .sum();
+            .sum()
+    }
+
+    pub fn count_unresolved(&self) {
+        // reduce per thread instead of hammering one shared cache line per layout
+        let total = self.map_live(|layout| {
+            UPDATE.with(|vals| {
+                let mem = &mut *vals.borrow_mut();
+                let mut update = Update {
+                    layout,
+                    immutable: &self.update,
+                    mem,
+                };
+                update.get_unresolved::<true>()
+            })
+        });
         self.total_unresolved.fetch_add(total, Ordering::Relaxed);
     }
 
     pub fn mark_ez_win(&self) {
         let counts = self.update.current.counts;
-
-        #[cfg(feature = "parallell")]
-        let iter = self.layouts.par_iter();
-        #[cfg(not(feature = "parallell"))]
-        let iter = self.layouts.iter();
-
         let table = self.tb.index_count(counts);
-        iter.for_each(|work| {
-            let layout = work.layout;
+
+        self.map_live(|layout| {
             // the slice only depends on the layout, so look it up once
             let slice = table.index(layout).slice;
             self.tb.ez_win_for_each(counts, layout, &mut |i, mask| {
                 // mask is the future cards
                 let val = unsafe { slice.get(i).unwrap_unchecked() };
                 val.fetch_or(Block(mask).invert().expand().0, Ordering::Relaxed);
-            })
+            });
+            0
         });
     }
 }
@@ -106,66 +154,81 @@ impl Iterator for TableJob<'_> {
         if self.done {
             return None;
         };
-        let Self {
-            layouts,
-            is_resolved,
-            update: immutable,
-            ..
-        } = self;
-
-        #[cfg(feature = "parallell")]
-        let iter = layouts.par_iter_mut();
-        #[cfg(not(feature = "parallell"))]
-        let iter = layouts.iter_mut();
 
         let progress = AtomicBool::new(false);
-        let iter = iter.map(|work| {
-            UPDATE.with(|vals| {
-                let mem = &mut *vals.borrow_mut();
-                let update = Update {
-                    layout: work.layout,
-                    immutable,
-                    mem,
-                };
-                let tmp = update.update_layout(&mut work.dead);
-                // a `fetch_or` per layout ping-pongs this cache line between all
-                // threads; a relaxed load keeps the line shared once it is set
-                if tmp.progress && !progress.load(Ordering::Relaxed) {
-                    progress.store(true, Ordering::Relaxed);
-                }
-                if tmp.unresolved != 0 {
-                    0
-                } else if tmp.went_up {
-                    2
-                } else {
-                    1
-                }
-            })
-        });
+        let total = self.total;
+        let immutable = &self.update;
 
         #[cfg(feature = "parallell")]
-        is_resolved.par_extend(iter);
+        let iter = self
+            .seeds
+            .par_iter()
+            .zip(self.live.par_chunks_mut(BLOCK))
+            .zip(self.needs_up.par_chunks_mut(WORDS));
         #[cfg(not(feature = "parallell"))]
-        is_resolved.extend(iter);
+        let iter = self
+            .seeds
+            .iter()
+            .zip(self.live.chunks_mut(BLOCK))
+            .zip(self.needs_up.chunks_mut(WORDS));
 
-        let mut i = 0;
-        let resolved = &mut self.resolved;
-        self.layouts.retain(|work| {
-            let res = self.is_resolved[i];
-            // only the ones that have not spread upward yet are worth keeping
-            // around for the `go_up` pass
-            if res == 1 {
-                resolved.push(*work)
-            }
-            i += 1;
-            res == 0
-        });
-        self.is_resolved.clear();
+        iter.enumerate()
+            .for_each(|(b, ((seed, live), needs_up))| {
+                // a block that has fully retired costs one scan of its masks,
+                // instead of replaying the enumeration all the way through it
+                if live.iter().all(|&moves| moves == 0) {
+                    return;
+                }
+
+                let start = b * BLOCK;
+                let mut layouts = TeamLayoutIter::seeded(*seed);
+                for j in 0..BLOCK.min(total - start) {
+                    let layout = layouts.next().unwrap();
+                    // no move left worth running means the layout is retired
+                    if live[j] == 0 {
+                        continue;
+                    }
+
+                    UPDATE.with(|vals| {
+                        let mem = &mut *vals.borrow_mut();
+                        let update = Update {
+                            layout,
+                            immutable,
+                            mem,
+                        };
+                        let tmp = update.update_layout(&mut live[j]);
+                        // a `fetch_or` per layout ping-pongs this cache line
+                        // between all threads; a relaxed load keeps the line
+                        // shared once it is set
+                        if tmp.progress && !progress.load(Ordering::Relaxed) {
+                            progress.store(true, Ordering::Relaxed);
+                        }
+
+                        if tmp.unresolved == 0 {
+                            // this is the whole compaction
+                            live[j] = 0;
+                            // only the ones that have not spread upward yet are
+                            // worth bringing back for the `go_up` pass
+                            if !tmp.went_up {
+                                needs_up[j / 64] |= 1 << (j % 64);
+                            }
+                        }
+                    })
+                }
+            });
 
         if self.update.go_up {
             self.done = true;
         } else if !progress.load(Ordering::Relaxed) {
-            self.layouts.extend(take(&mut self.resolved));
+            for (w, word) in self.needs_up.iter_mut().enumerate() {
+                let mut bits = take(word);
+                while bits != 0 {
+                    // the `go_up` pass has its own move set, so the bits do not
+                    // line up and every one of them starts out set
+                    self.live[w * 64 + bits.trailing_zeros() as usize] = u32::MAX;
+                    bits &= bits - 1;
+                }
+            }
             self.update.go_up = true;
         }
         Some(())

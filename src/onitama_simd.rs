@@ -354,7 +354,7 @@ impl LocalMem {
 /// dependency chain. Resolving every move of a layout up front lets all of
 /// those misses be prefetched and overlap with each other.
 pub struct PreparedMove {
-    /// Which bit of [`Work::dead`] this move owns. Kept on the move itself so
+    /// Which bit of `TableJob::live` this move owns. Kept on the move itself so
     /// that skipping one during preparation does not shift the rest.
     bit: u32,
     step: (usize, usize),
@@ -545,27 +545,30 @@ impl AllTables {
     }
 }
 
-/// A layout still in the work list, with what is already known about it.
+/// Layouts per work block.
 ///
-/// `dead` has a bit per backward move, in the order `update_layout` prepares
-/// them, which is fixed for a layout. A set bit means that move's target has
-/// already subsumed everything this chunk could ever spread there (see
-/// [`Spread::expanded`]), so it never has to run again. Moves past bit 31 are
-/// simply never skipped; there are at most 32 for the sizes that fit in memory
-/// anyway, since each of the 8 offsets contributes at most one per piece.
-#[derive(Debug, Clone, Copy)]
-struct Work {
-    layout: TeamLayout,
-    dead: u32,
-}
+/// Each block is one parallel task and one recorded seed, so this trades
+/// scheduling overhead against how much of the enumeration has to be replayed
+/// to reach the live layouts of a sparse late pass.
+const BLOCK: usize = 64;
 
 struct TableJob<'a> {
     tb: &'a AllTables,
-    layouts: Vec<Work>,
-    /// Per layout of the last pass: 0 keep, 1 retire but still needs the
-    /// `go_up` pass, 2 retire with the capture predecessors already written.
-    is_resolved: Vec<u8>,
-    resolved: Vec<Work>,
+    /// The layout starting each block, so a block can be walked without
+    /// replaying the enumeration from the beginning.
+    seeds: Vec<TeamLayout>,
+    /// Per layout, one bit per backward move: still worth running. A bit is
+    /// cleared once that move's target has subsumed everything this chunk
+    /// could ever spread there, and a layout is in the work list exactly while
+    /// any of its bits is set, so this is the work list and the per move state
+    /// in one. Moves past bit 31 are never skipped; there are at most 32 for
+    /// the sizes that fit in memory anyway, since each of the 8 offsets
+    /// contributes at most one per piece.
+    live: Vec<u32>,
+    /// One bit per layout: retired, but its capture predecessors still have to
+    /// be written by the `go_up` pass.
+    needs_up: Vec<u64>,
+    total: usize,
     update: ImmutableUpdate<'a>,
     total_unresolved: AtomicU64,
     done: bool,

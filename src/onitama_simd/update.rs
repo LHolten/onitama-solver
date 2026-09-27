@@ -126,15 +126,15 @@ impl Update<'_> {
         self.check_unresolved::<COUNT>()
     }
 
-    pub fn update_layout(mut self, dead: &mut u32) -> UpdateStatus {
+    pub fn update_layout(mut self, live: &mut u32) -> UpdateStatus {
         let go_up = self.immutable.go_up;
 
         let unresolved = self.get_unresolved::<false>();
 
         // the `go_up` pass prepares a different set of moves, so the bits would
         // not line up. It only runs once, so there is nothing to remember.
-        let mut scratch = 0;
-        let res = self.spread_phase(go_up, if go_up { &mut scratch } else { dead });
+        let mut scratch = u32::MAX;
+        let res = self.spread_phase(go_up, if go_up { &mut scratch } else { live });
 
         // `unresolved == 0` means every state of this chunk is settled, so
         // these losses can never grow again and the capture predecessors can be
@@ -144,7 +144,8 @@ impl Update<'_> {
         let went_up = !go_up && unresolved == 0;
         if went_up {
             // this runs once for the chunk, so there is no mask worth keeping
-            self.spread_phase(true, &mut 0);
+            let mut all = u32::MAX;
+            self.spread_phase(true, &mut all);
         }
 
         UpdateStatus {
@@ -162,7 +163,7 @@ impl Update<'_> {
     ///
     /// `up` picks the capture predecessors, which live in the table with one
     /// more piece, instead of the ones in this table.
-    fn spread_phase(&mut self, up: bool, dead: &mut u32) -> SpreadStatus {
+    fn spread_phase(&mut self, up: bool, live: &mut u32) -> SpreadStatus {
         let layout = self.layout;
         let ImmutableUpdate {
             current,
@@ -188,13 +189,13 @@ impl Update<'_> {
             let to_mask = to_mask & !pieces0 & !pieces1;
 
             for to in BitIter::from(to_mask) {
-                // moves past bit 31 just never get skipped
+                // a zero bit is a move past 31, which just never gets skipped
                 let bit = 1u32.checked_shl(seen).unwrap_or(0);
                 seen += 1;
-                // a dead move is not even worth locating: `Table::index` runs
-                // the multiset ranking, which is the whole reason for the
+                // a finished move is not even worth locating: `Table::index`
+                // runs the multiset ranking, which is the whole reason for the
                 // prefetch below
-                if *dead & bit != 0 {
+                if bit & !*live != 0 {
                     continue;
                 }
 
@@ -268,7 +269,7 @@ impl Update<'_> {
             progress |= res.progress;
             could |= res.could;
             if !res.could {
-                *dead |= mv.bit;
+                *live &= !mv.bit;
             }
         }
 
