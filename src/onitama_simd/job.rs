@@ -11,7 +11,7 @@ use std::{
 
 use crate::{index::Indexer, onitama_simd::LocalMem};
 
-use super::{AllTables, Block, ImmutableUpdate, PawnCount, TableJob, Update};
+use super::{AllTables, Block, ImmutableUpdate, PawnCount, TableJob, Update, Work};
 
 impl<'a> TableJob<'a> {
     pub fn new(tb: &'a AllTables, counts: PawnCount) -> Self {
@@ -38,7 +38,7 @@ impl<'a> TableJob<'a> {
         };
 
         let mut layouts = Vec::with_capacity(counts.total());
-        layouts.extend(counts);
+        layouts.extend(counts.into_iter().map(|layout| Work { layout, dead: 0 }));
         Self {
             layouts,
             is_resolved: Vec::with_capacity(counts.total()),
@@ -58,11 +58,11 @@ impl<'a> TableJob<'a> {
 
         // reduce per thread instead of hammering one shared cache line per layout
         let total: u64 = iter
-            .map(|layout| {
+            .map(|work| {
                 UPDATE.with(|vals| {
                     let mem = &mut *vals.borrow_mut();
                     let mut update = Update {
-                        layout: *layout,
+                        layout: work.layout,
                         immutable: &self.update,
                         mem,
                     };
@@ -82,10 +82,11 @@ impl<'a> TableJob<'a> {
         let iter = self.layouts.iter();
 
         let table = self.tb.index_count(counts);
-        iter.for_each(|layout| {
+        iter.for_each(|work| {
+            let layout = work.layout;
             // the slice only depends on the layout, so look it up once
-            let slice = table.index(*layout).slice;
-            self.tb.ez_win_for_each(counts, *layout, &mut |i, mask| {
+            let slice = table.index(layout).slice;
+            self.tb.ez_win_for_each(counts, layout, &mut |i, mask| {
                 // mask is the future cards
                 let val = unsafe { slice.get(i).unwrap_unchecked() };
                 val.fetch_or(Block(mask).invert().expand().0, Ordering::Relaxed);
@@ -105,21 +106,28 @@ impl Iterator for TableJob<'_> {
         if self.done {
             return None;
         };
+        let Self {
+            layouts,
+            is_resolved,
+            update: immutable,
+            ..
+        } = self;
+
         #[cfg(feature = "parallell")]
-        let iter = self.layouts.par_iter();
+        let iter = layouts.par_iter_mut();
         #[cfg(not(feature = "parallell"))]
-        let iter = self.layouts.iter();
+        let iter = layouts.iter_mut();
 
         let progress = AtomicBool::new(false);
-        let iter = iter.map(|layout| {
+        let iter = iter.map(|work| {
             UPDATE.with(|vals| {
                 let mem = &mut *vals.borrow_mut();
                 let update = Update {
-                    layout: *layout,
-                    immutable: &self.update,
+                    layout: work.layout,
+                    immutable,
                     mem,
                 };
-                let tmp = update.update_layout();
+                let tmp = update.update_layout(&mut work.dead);
                 // a `fetch_or` per layout ping-pongs this cache line between all
                 // threads; a relaxed load keeps the line shared once it is set
                 if tmp.progress && !progress.load(Ordering::Relaxed) {
@@ -130,15 +138,16 @@ impl Iterator for TableJob<'_> {
         });
 
         #[cfg(feature = "parallell")]
-        self.is_resolved.par_extend(iter);
+        is_resolved.par_extend(iter);
         #[cfg(not(feature = "parallell"))]
-        self.is_resolved.extend(iter);
+        is_resolved.extend(iter);
 
         let mut i = 0;
-        self.layouts.retain(|layout| {
+        let resolved = &mut self.resolved;
+        self.layouts.retain(|work| {
             let res = self.is_resolved[i];
             if res {
-                self.resolved.push(*layout)
+                resolved.push(*work)
             }
             i += 1;
             !res

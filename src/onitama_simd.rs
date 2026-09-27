@@ -354,6 +354,9 @@ impl LocalMem {
 /// dependency chain. Resolving every move of a layout up front lets all of
 /// those misses be prefetched and overlap with each other.
 pub struct PreparedMove {
+    /// Which bit of [`Work::dead`] this move owns. Kept on the move itself so
+    /// that skipping one during preparation does not shift the rest.
+    bit: u32,
     step: (usize, usize),
     mask: u32,
     new: TeamLayout,
@@ -542,11 +545,25 @@ impl AllTables {
     }
 }
 
+/// A layout still in the work list, with what is already known about it.
+///
+/// `dead` has a bit per backward move, in the order `update_layout` prepares
+/// them, which is fixed for a layout. A set bit means that move's target has
+/// already subsumed everything this chunk could ever spread there (see
+/// [`Spread::expanded`]), so it never has to run again. Moves past bit 31 are
+/// simply never skipped; there are at most 32 for the sizes that fit in memory
+/// anyway, since each of the 8 offsets contributes at most one per piece.
+#[derive(Debug, Clone, Copy)]
+struct Work {
+    layout: TeamLayout,
+    dead: u32,
+}
+
 struct TableJob<'a> {
     tb: &'a AllTables,
-    layouts: Vec<TeamLayout>,
+    layouts: Vec<Work>,
     is_resolved: Vec<bool>,
-    resolved: Vec<TeamLayout>,
+    resolved: Vec<Work>,
     update: ImmutableUpdate<'a>,
     total_unresolved: AtomicU64,
     done: bool,

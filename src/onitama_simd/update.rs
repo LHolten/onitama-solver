@@ -82,6 +82,7 @@ impl Update<'_> {
                 let target = table.index(new).slice;
                 prefetch(target);
                 mem.moves.push(PreparedMove {
+                    bit: 0,
                     step: (from, to),
                     mask,
                     new,
@@ -123,7 +124,7 @@ impl Update<'_> {
     }
 
     // returns whether there was any progress
-    pub fn update_layout(mut self) -> UpdateStatus {
+    pub fn update_layout(mut self, dead: &mut u32) -> UpdateStatus {
         let layout = self.layout;
         let ImmutableUpdate {
             current,
@@ -137,11 +138,17 @@ impl Update<'_> {
 
         let unresolved = self.get_unresolved::<false>();
 
+        // the `go_up` pass prepares a different set of moves, so the bits would
+        // not line up. It only runs once, so there is nothing to remember.
+        let mut scratch = 0;
+        let dead = if go_up { &mut scratch } else { dead };
+
         // same two phase split as in `get_unresolved`: locate and prefetch every
         // target chunk before touching any of them.
         // Cards are now inverted, but it is also the other team, so not inverted.
         let moves = &mut self.mem.moves;
         moves.clear();
+        let mut seen = 0u32;
         for offset in BitIter::from(directions) {
             let mask = mask_lookup[offset];
 
@@ -151,6 +158,16 @@ impl Update<'_> {
             let to_mask = to_mask & !pieces0 & !pieces1;
 
             for to in BitIter::from(to_mask) {
+                // moves past bit 31 just never get skipped
+                let bit = 1u32.checked_shl(seen).unwrap_or(0);
+                seen += 1;
+                // a dead move is not even worth locating: `Table::index` runs
+                // the multiset ranking, which is the whole reason for the
+                // prefetch below
+                if *dead & bit != 0 {
+                    continue;
+                }
+
                 let from = to + 12 - offset;
 
                 let mut new = TeamLayout {
@@ -171,6 +188,7 @@ impl Update<'_> {
                 let target = table.index(new).slice;
                 prefetch(target);
                 moves.push(PreparedMove {
+                    bit,
                     step: (from, to),
                     mask,
                     new,
@@ -219,6 +237,9 @@ impl Update<'_> {
             let res = spread.spreadout();
             progress |= res.progress;
             could |= res.could;
+            if !res.could {
+                *dead |= mv.bit;
+            }
         }
 
         UpdateStatus {
