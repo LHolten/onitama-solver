@@ -34,6 +34,11 @@ impl Update<'_> {
         } = *self.immutable;
         let pieces0 = layout.pieces0;
 
+        // the mirrored chunk is only read at the very end, but its address does
+        // not depend on any of the work in between, so start the miss now
+        let inv_slice = inv_current.index(layout.invert());
+        prefetch(inv_slice.slice);
+
         layout
             .indexer(current.counts)
             .for_enumerate(|i, oldk| mem.king_lookup[*oldk] = i as u8);
@@ -111,7 +116,6 @@ impl Update<'_> {
             .iter_mut()
             .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
 
-        let inv_slice = inv_current.index(layout.invert());
         mem.wins.resize(layout.indexer(current.counts).total(), 0);
         self.load_stuff(&inv_slice);
 
