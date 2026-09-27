@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 
 use crate::index::InternalIter;
 
-use super::{Accum, Spread};
+use super::{Accum, Spread, SpreadStatus};
 
 impl Accum<'_> {
     pub fn accumulate(self) {
@@ -28,11 +28,11 @@ impl Accum<'_> {
 }
 
 impl Spread<'_> {
-    // returns whether there was any progress
-    pub fn spreadout(self) -> bool {
+    pub fn spreadout(self) -> SpreadStatus {
         let (from, to) = self.step;
 
         let mut progress = false;
+        let mut could = false;
         self.new.indexer(self.counts).for_enumerate(|new_i, newk| {
             let mut oldk = *newk;
             if newk.king1 as usize == to {
@@ -49,10 +49,16 @@ impl Spread<'_> {
 
             let old_i = self.king_lookup[oldk] as usize;
 
-            let tmp = self.slice[old_i];
+            let (tmp, may) = self.expanded[old_i];
 
             let new_val = unsafe { self.target.get(new_i).unwrap_unchecked() };
             let fetch = new_val.load(Ordering::Relaxed);
+            // `tmp` is a subset of `may`, so this also covers the case where
+            // there is nothing to do right now
+            if fetch | may == fetch {
+                return;
+            }
+            could = true;
             if fetch | tmp == fetch {
                 return;
             }
@@ -62,6 +68,6 @@ impl Spread<'_> {
             progress = true;
         });
 
-        progress
+        SpreadStatus { progress, could }
     }
 }

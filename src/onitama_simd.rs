@@ -325,6 +325,10 @@ impl IndexMut<KingPos> for KingLookup {
 pub struct LocalMem {
     wins: Vec<u32>,
     status: Vec<u32>,
+    /// Per king position, `status` and the not won states expanded for the
+    /// card mask of the current move group. Interleaved because [`Spread`]
+    /// wants both at the same index. See [`Spread::expanded`].
+    expanded: Vec<(u32, u32)>,
     king_lookup: KingLookup,
     moves: Vec<PreparedMove>,
 }
@@ -334,6 +338,7 @@ impl LocalMem {
         Self {
             wins: vec![],
             status: vec![],
+            expanded: vec![],
             king_lookup: KingLookup {
                 list: [[0; 25]; 25],
             },
@@ -407,8 +412,22 @@ pub struct Spread<'a> {
     counts: PawnCount,
     step: (usize, usize),
     target: &'a [AtomicU32],
-    slice: &'a [u32],
+    /// Per king position, what to spread and the most that could ever be
+    /// spread here.
+    ///
+    /// The second is not just what it spreads now: a state only ever goes from
+    /// unresolved to won or to lost, so the losses it can still gain are
+    /// bounded by the states that are not won. That bound shrinks over time
+    /// while the target only gains bits, so once the target subsumes it the
+    /// chunk is done contributing, for good.
+    expanded: &'a [(u32, u32)],
     king_lookup: &'a KingLookup,
+}
+
+/// What a [`Spread`] did, and whether it could ever do anything again.
+pub struct SpreadStatus {
+    pub(crate) progress: bool,
+    pub(crate) could: bool,
 }
 
 impl AllTables {

@@ -180,23 +180,32 @@ impl Update<'_> {
             }
         }
 
+        let total = layout.indexer(current.counts).total();
         let LocalMem {
             status,
             wins,
+            expanded,
             king_lookup,
             moves,
             ..
         } = &mut *self.mem;
+        expanded.resize(total, (0, 0));
 
         let mut progress = false;
-        // `moves` is grouped by offset, so this rebuilds `wins` once per card mask
+        let mut could = false;
+        // `moves` is grouped by offset, so this rebuilds the expansions once per
+        // card mask. Both come off the same walk over the chunk: `wins` is kept
+        // intact by `get_unresolved` precisely so the bound can be read here.
         let mut built = None;
         for mv in moves.iter() {
             if built != Some(mv.mask) {
                 built = Some(mv.mask);
-                // we spread out the loses, these are wins for the previous state
-                wins.clear();
-                wins.extend(status.iter().map(|x| Block(x & mv.mask).expand().0));
+                let mask = mv.mask;
+                let src = zip(&status[..total], &wins[..total]);
+                for (e, (&s, &w)) in zip(&mut expanded[..total], src) {
+                    // we spread out the loses, these are wins for the previous state
+                    *e = (Block(s & mask).expand().0, Block(!w & mask).expand().0);
+                }
             }
 
             let spread = Spread {
@@ -204,15 +213,21 @@ impl Update<'_> {
                 counts: mv.counts,
                 step: mv.step,
                 target: mv.target(),
-                slice: wins,
+                expanded,
                 king_lookup,
             };
-            progress |= spread.spreadout();
+            let res = spread.spreadout();
+            progress |= res.progress;
+            could |= res.could;
         }
 
         UpdateStatus {
             progress,
-            unresolved,
+            // a chunk that can never spread anything new again is done, even if
+            // some of its own states are still unresolved: it is only kept in
+            // the work list to spread. The `go_up` pass has different targets
+            // and only runs once, so leave its bookkeeping alone.
+            unresolved: if go_up || could { unresolved } else { 0 },
         }
     }
 
