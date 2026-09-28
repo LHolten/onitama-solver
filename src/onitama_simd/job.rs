@@ -4,14 +4,14 @@ use rayon::prelude::*;
 use std::{
     cell::RefCell,
     mem::take,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{index::Indexer, onitama_simd::LocalMem};
 
 use super::{
-    iter::LayoutCursor, AllTables, Block, ImmutableUpdate, PawnCount, TableJob, TeamLayout, Update,
-    BLOCK,
+    count_indexer, iter::LayoutCursor, AllTables, Block, ImmutableUpdate, PawnCount, TableJob,
+    TeamLayout, Update, BLOCK,
 };
 
 /// Layouts covered by one word of [`TableJob::needs_up`], and the granularity
@@ -21,11 +21,11 @@ const GROUP: usize = 64;
 /// Words of [`TableJob::needs_up`] per block.
 const WORDS: usize = BLOCK / GROUP;
 
-impl<'a> TableJob<'a> {
-    pub fn new(tb: &'a AllTables, counts: PawnCount) -> Self {
+impl<'a> ImmutableUpdate<'a> {
+    /// Everything about one table that does not change while it is solved.
+    fn new(tb: &'a AllTables, counts: PawnCount) -> Self {
         let PawnCount { count0, count1 } = counts;
-
-        let update = ImmutableUpdate {
+        ImmutableUpdate {
             current: tb.index_count(counts),
             inv_current: tb.index_count(counts.invert()),
             take_one: (count1 != 0).then(|| {
@@ -43,7 +43,13 @@ impl<'a> TableJob<'a> {
             go_up: false,
             mask_lookup: &tb.mask_lookup,
             directions: tb.directions,
-        };
+        }
+    }
+}
+
+impl<'a> TableJob<'a> {
+    pub fn new(tb: &'a AllTables, counts: PawnCount) -> Self {
+        let update = ImmutableUpdate::new(tb, counts);
 
         let total = counts.total();
         let blocks = total.div_ceil(BLOCK);
@@ -66,7 +72,6 @@ impl<'a> TableJob<'a> {
             total,
             update,
             done: false,
-            total_unresolved: AtomicU64::new(0),
             tb,
         }
     }
@@ -108,22 +113,6 @@ impl<'a> TableJob<'a> {
                 sum
             })
             .sum()
-    }
-
-    pub fn count_unresolved(&self) {
-        // reduce per thread instead of hammering one shared cache line per layout
-        let total = self.map_live(|layout| {
-            UPDATE.with(|vals| {
-                let mem = &mut *vals.borrow_mut();
-                let mut update = Update {
-                    layout,
-                    immutable: &self.update,
-                    mem,
-                };
-                update.get_unresolved::<true>()
-            })
-        });
-        self.total_unresolved.fetch_add(total, Ordering::Relaxed);
     }
 
     pub fn mark_ez_win(&self) {
@@ -173,7 +162,8 @@ impl Iterator for TableJob<'_> {
         iter.enumerate().for_each(|(b, (live, needs_up))| {
             let start = b * BLOCK;
             let mut cursor = LayoutCursor::new(counts);
-            for (g, (group, needs_up)) in live.chunks_mut(GROUP).zip(needs_up).enumerate() {
+            let groups = live.chunks_mut(GROUP).zip(needs_up);
+            for (g, (group, needs_up)) in groups.enumerate() {
                 // a retired run is rejected by one scan that stops at the first
                 // live layout, instead of a branch per layout
                 if group.iter().all(|&moves| moves == 0) {
@@ -233,5 +223,50 @@ impl Iterator for TableJob<'_> {
             self.update.go_up = true;
         }
         Some(())
+    }
+}
+
+impl AllTables {
+    /// Add up the states that ended up neither won nor lost.
+    ///
+    /// This rebuilds every chunk from scratch, which is why it is a separate
+    /// pass and not something the solve keeps track of: a chunk leaves the work
+    /// list for what it can still spread, not for being settled, so the solve
+    /// never finds out what the ones it dropped early settled on.
+    pub fn count_unresolved(&self) -> u64 {
+        count_indexer(self.size)
+            .into_iter()
+            .map(|counts: PawnCount| {
+                let immutable = ImmutableUpdate::new(self, counts);
+                let total = counts.total();
+
+                #[cfg(feature = "parallell")]
+                let blocks = (0..total.div_ceil(BLOCK)).into_par_iter();
+                #[cfg(not(feature = "parallell"))]
+                let blocks = 0..total.div_ceil(BLOCK);
+
+                blocks
+                    .map(|b| {
+                        let start = b * BLOCK;
+                        // every layout is visited, so the cursor only ever steps
+                        let mut cursor = LayoutCursor::new(counts);
+                        let mut sum = 0;
+                        for i in start..(start + BLOCK).min(total) {
+                            let layout = cursor.at(i);
+                            sum += UPDATE.with(|vals| {
+                                let mem = &mut *vals.borrow_mut();
+                                let mut update = Update {
+                                    layout,
+                                    immutable: &immutable,
+                                    mem,
+                                };
+                                update.get_unresolved::<true>()
+                            });
+                        }
+                        sum
+                    })
+                    .sum::<u64>()
+            })
+            .sum()
     }
 }

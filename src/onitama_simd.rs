@@ -121,7 +121,6 @@ pub struct AllTables {
     pub block_not_done: AtomicU64,
     pub card_done: AtomicU64,
     pub card_not_done: AtomicU64,
-    pub total_unresolved: u64,
     pub win_in1: u64,
 }
 
@@ -494,7 +493,6 @@ impl AllTables {
             block_not_done: Default::default(),
             card_done: Default::default(),
             card_not_done: Default::default(),
-            total_unresolved: 0,
             win_in1: 0,
         };
 
@@ -516,7 +514,6 @@ impl AllTables {
             schedule.push(jobs)
         }
 
-        let mut total_unresolved = 0;
         for mut jobs in schedule {
             let mut any_progress = true;
             let mut iters = 0;
@@ -528,10 +525,6 @@ impl AllTables {
                 iters += 1;
             }
 
-            for job in &jobs {
-                job.count_unresolved();
-                total_unresolved += job.total_unresolved.load(Ordering::Relaxed);
-            }
 
             println!(
                 "finished {:?} in {iters} iterations",
@@ -539,7 +532,6 @@ impl AllTables {
             );
         }
 
-        tb.total_unresolved = total_unresolved;
         tb.win_in1 = win_in1;
         tb
     }
@@ -570,7 +562,6 @@ struct TableJob<'a> {
     needs_up: Vec<u64>,
     total: usize,
     update: ImmutableUpdate<'a>,
-    total_unresolved: AtomicU64,
     done: bool,
 }
 
@@ -666,10 +657,11 @@ mod tests {
         println!("{wins} total wins");
         println!("{} wins in 1", tb.win_in1);
         println!("{} not win in 1", total - tb.win_in1);
-        println!("{} unresolved states", tb.total_unresolved);
+        let unresolved = tb.count_unresolved();
+        println!("{unresolved} unresolved states");
         println!(
             "{} resolved, not win in 1",
-            total - tb.win_in1 - tb.total_unresolved
+            total - tb.win_in1 - unresolved
         );
         println!(
             "{} blocks done, {} blocks not done",

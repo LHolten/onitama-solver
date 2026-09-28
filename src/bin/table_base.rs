@@ -13,6 +13,10 @@ pub fn main() {
         _ => panic!("that size is not supported"),
     };
 
+    // off by default: it is a statistic, and it costs a full rebuild of every
+    // chunk, which is more than the solve it reports on
+    let count = args().any(|a| a == "--unresolved");
+
     let before = Instant::now();
     let tb = AllTables::build(size, 0b11111);
     let time = before.elapsed();
@@ -22,11 +26,13 @@ pub fn main() {
     println!("{wins} total wins");
     println!("{} wins in 1", tb.win_in1);
     println!("{} not win in 1", total - tb.win_in1);
-    println!("{} unresolved states", tb.total_unresolved);
-    println!(
-        "{} resolved, not win in 1",
-        total - tb.win_in1 - tb.total_unresolved
-    );
+    match count.then(|| tb.count_unresolved()) {
+        Some(unresolved) => {
+            println!("{unresolved} unresolved states");
+            println!("{} resolved, not win in 1", total - tb.win_in1 - unresolved);
+        }
+        None => println!("unresolved states not counted, pass --unresolved"),
+    }
     println!(
         "{} blocks done, {} blocks not done",
         tb.block_done.load(Ordering::Relaxed),

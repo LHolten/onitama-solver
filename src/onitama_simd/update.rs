@@ -136,17 +136,26 @@ impl Update<'_> {
         let mut scratch = u32::MAX;
         let res = self.spread_phase(go_up, if go_up { &mut scratch } else { live });
 
-        // `unresolved == 0` means every state of this chunk is settled, so
-        // these losses can never grow again and the capture predecessors can be
-        // written right now. Doing it here instead of in the extra pass at the
-        // end saves rebuilding the losses from scratch, which costs a full
+        // Either way out of the work list is worth spreading up on the spot,
+        // because `status` and `wins` are still built here: doing it in the
+        // extra pass at the end means rebuilding them, which costs a full
         // accumulate and a guaranteed miss on the mirrored chunk.
-        let went_up = !go_up && unresolved == 0;
-        if went_up {
+        let done = !go_up && (unresolved == 0 || !res.could);
+        let went_up = done && {
             // this runs once for the chunk, so there is no mask worth keeping
             let mut all = u32::MAX;
-            self.spread_phase(true, &mut all);
-        }
+            let up = self.spread_phase(true, &mut all);
+
+            // `unresolved == 0` means every state is settled, so these losses
+            // can never grow again and that was the last word.
+            //
+            // Otherwise they can still grow, since the chunk is retired for
+            // what it spreads, not for what gets spread into it. It is still
+            // finished upward if the capture predecessors have subsumed
+            // everything it could ever send them, which is the same bound that
+            // retired it here, read against the other table.
+            unresolved == 0 || !up.could
+        };
 
         UpdateStatus {
             progress: res.progress,
