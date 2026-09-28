@@ -9,13 +9,42 @@ use super::{PawnCount, TeamLayout};
 
 pub struct TeamLayoutIter(TeamLayout);
 
-impl TeamLayoutIter {
-    /// Restart the enumeration at `layout`, which has to be one it produces.
-    ///
-    /// The whole state is the layout it is about to yield, so a work block can
-    /// be walked from a recorded seed instead of from the beginning.
-    pub fn seeded(layout: TeamLayout) -> Self {
-        Self(layout)
+/// Walks the enumeration, skipping forward to any position asked for.
+///
+/// One step is much cheaper than one unranking, but a skip over a long run of
+/// retired layouts is not worth walking, so that restarts from an unranking
+/// instead. Early passes are dense and pay only steps; late ones are sparse and
+/// pay about one unranking per live layout.
+pub struct LayoutCursor {
+    counts: PawnCount,
+    /// The position `iter` is about to yield.
+    at: usize,
+    iter: TeamLayoutIter,
+}
+
+impl LayoutCursor {
+    /// The longest skip still worth walking, in steps per unranking.
+    const GAP: usize = 4;
+
+    pub fn new(counts: PawnCount) -> Self {
+        Self {
+            counts,
+            // no position, so the first `at` always unranks
+            at: usize::MAX,
+            iter: TeamLayoutIter(TeamLayout::default()),
+        }
+    }
+
+    pub fn at(&mut self, i: usize) -> TeamLayout {
+        if i < self.at || i - self.at > Self::GAP {
+            self.iter = TeamLayoutIter(self.counts.nth_layout(i));
+        } else {
+            for _ in self.at..i {
+                self.iter.next();
+            }
+        }
+        self.at = i + 1;
+        self.iter.next().unwrap()
     }
 }
 

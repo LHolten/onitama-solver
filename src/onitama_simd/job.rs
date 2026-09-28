@@ -10,12 +10,16 @@ use std::{
 use crate::{index::Indexer, onitama_simd::LocalMem};
 
 use super::{
-    iter::TeamLayoutIter, AllTables, Block, ImmutableUpdate, PawnCount, TableJob, TeamLayout,
-    Update, BLOCK,
+    iter::LayoutCursor, AllTables, Block, ImmutableUpdate, PawnCount, TableJob, TeamLayout, Update,
+    BLOCK,
 };
 
-/// Words of [`TableJob::live`] per block.
-const WORDS: usize = BLOCK / 64;
+/// Layouts covered by one word of [`TableJob::needs_up`], and the granularity
+/// at which a retired run is skipped without being looked at layout by layout.
+const GROUP: usize = 64;
+
+/// Words of [`TableJob::needs_up`] per block.
+const WORDS: usize = BLOCK / GROUP;
 
 impl<'a> TableJob<'a> {
     pub fn new(tb: &'a AllTables, counts: PawnCount) -> Self {
@@ -45,14 +49,6 @@ impl<'a> TableJob<'a> {
         let blocks = total.div_ceil(BLOCK);
         let padded = blocks * BLOCK;
 
-        // one unranking per block instead of one enumeration step per layout,
-        // which also lets the blocks be built out of order
-        let mut seeds = Vec::with_capacity(blocks);
-        #[cfg(feature = "parallell")]
-        seeds.par_extend((0..blocks).into_par_iter().map(|b| counts.nth_layout(b * BLOCK)));
-        #[cfg(not(feature = "parallell"))]
-        seeds.extend((0..blocks).map(|b| counts.nth_layout(b * BLOCK)));
-
         // every move of every layout starts out worth running, but the
         // padding at the end of the last block is not a layout at all. The
         // zeroed allocation is untouched pages, so the only cost here is the
@@ -64,7 +60,7 @@ impl<'a> TableJob<'a> {
         live[..total].fill(u32::MAX);
 
         Self {
-            seeds,
+            counts,
             live,
             needs_up: vec![0; padded / 64],
             total,
@@ -77,32 +73,36 @@ impl<'a> TableJob<'a> {
 
     /// Call `f` on every live layout and add up what it returns.
     ///
-    /// The enumeration is only replayed inside a block, and a block that has
-    /// fully retired is skipped after reading its [`TableJob::live`] words.
+    /// A retired layout costs one word of [`TableJob::live`] and nothing else:
+    /// its position in the enumeration is only turned back into a layout once a
+    /// live word is found, so a sparse late pass never pays for the gaps.
     fn map_live<F>(&self, f: F) -> u64
     where
         F: Fn(TeamLayout) -> u64 + Sync + Send,
     {
-        let total = self.total;
+        let counts = self.counts;
 
         #[cfg(feature = "parallell")]
-        let iter = self.seeds.par_iter().zip(self.live.par_chunks(BLOCK));
+        let iter = self.live.par_chunks(BLOCK);
         #[cfg(not(feature = "parallell"))]
-        let iter = self.seeds.iter().zip(self.live.chunks(BLOCK));
+        let iter = self.live.chunks(BLOCK);
 
         iter.enumerate()
-            .map(|(b, (seed, live))| {
-                if live.iter().all(|&moves| moves == 0) {
-                    return 0;
-                }
-
+            .map(|(b, live)| {
                 let start = b * BLOCK;
-                let mut layouts = TeamLayoutIter::seeded(*seed);
+                let mut cursor = LayoutCursor::new(counts);
                 let mut sum = 0;
-                for j in 0..BLOCK.min(total - start) {
-                    let layout = layouts.next().unwrap();
-                    if live[j] != 0 {
-                        sum += f(layout);
+                for (g, group) in live.chunks(GROUP).enumerate() {
+                    // a retired run is rejected by one scan that stops at the
+                    // first live layout, instead of a branch per layout
+                    if group.iter().all(|&moves| moves == 0) {
+                        continue;
+                    }
+                    let start = start + g * GROUP;
+                    for (j, &moves) in group.iter().enumerate() {
+                        if moves != 0 {
+                            sum += f(cursor.at(start + j));
+                        }
                     }
                 }
                 sum
@@ -156,38 +156,38 @@ impl Iterator for TableJob<'_> {
         };
 
         let progress = AtomicBool::new(false);
-        let total = self.total;
+        let counts = self.counts;
         let immutable = &self.update;
 
         #[cfg(feature = "parallell")]
         let iter = self
-            .seeds
-            .par_iter()
-            .zip(self.live.par_chunks_mut(BLOCK))
+            .live
+            .par_chunks_mut(BLOCK)
             .zip(self.needs_up.par_chunks_mut(WORDS));
         #[cfg(not(feature = "parallell"))]
         let iter = self
-            .seeds
-            .iter()
-            .zip(self.live.chunks_mut(BLOCK))
+            .live
+            .chunks_mut(BLOCK)
             .zip(self.needs_up.chunks_mut(WORDS));
 
-        iter.enumerate()
-            .for_each(|(b, ((seed, live), needs_up))| {
-                // a block that has fully retired costs one scan of its masks,
-                // instead of replaying the enumeration all the way through it
-                if live.iter().all(|&moves| moves == 0) {
-                    return;
+        iter.enumerate().for_each(|(b, (live, needs_up))| {
+            let start = b * BLOCK;
+            let mut cursor = LayoutCursor::new(counts);
+            for (g, (group, needs_up)) in live.chunks_mut(GROUP).zip(needs_up).enumerate() {
+                // a retired run is rejected by one scan that stops at the first
+                // live layout, instead of a branch per layout
+                if group.iter().all(|&moves| moves == 0) {
+                    continue;
                 }
+                let start = start + g * GROUP;
 
-                let start = b * BLOCK;
-                let mut layouts = TeamLayoutIter::seeded(*seed);
-                for j in 0..BLOCK.min(total - start) {
-                    let layout = layouts.next().unwrap();
-                    // no move left worth running means the layout is retired
-                    if live[j] == 0 {
+                for j in 0..group.len() {
+                    // no move left worth running means the layout is retired,
+                    // and a retired layout is never unranked into a layout
+                    if group[j] == 0 {
                         continue;
                     }
+                    let layout = cursor.at(start + j);
 
                     UPDATE.with(|vals| {
                         let mem = &mut *vals.borrow_mut();
@@ -196,7 +196,7 @@ impl Iterator for TableJob<'_> {
                             immutable,
                             mem,
                         };
-                        let tmp = update.update_layout(&mut live[j]);
+                        let tmp = update.update_layout(&mut group[j]);
                         // a `fetch_or` per layout ping-pongs this cache line
                         // between all threads; a relaxed load keeps the line
                         // shared once it is set
@@ -206,16 +206,17 @@ impl Iterator for TableJob<'_> {
 
                         if tmp.unresolved == 0 {
                             // this is the whole compaction
-                            live[j] = 0;
+                            group[j] = 0;
                             // only the ones that have not spread upward yet are
                             // worth bringing back for the `go_up` pass
                             if !tmp.went_up {
-                                needs_up[j / 64] |= 1 << (j % 64);
+                                *needs_up |= 1 << j;
                             }
                         }
                     })
                 }
-            });
+            }
+        });
 
         if self.update.go_up {
             self.done = true;

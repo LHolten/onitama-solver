@@ -550,13 +550,13 @@ impl AllTables {
 /// Each block is one parallel task and one recorded seed, so this trades
 /// scheduling overhead against how much of the enumeration has to be replayed
 /// to reach the live layouts of a sparse late pass.
-const BLOCK: usize = 64;
+const BLOCK: usize = 1024;
 
 struct TableJob<'a> {
     tb: &'a AllTables,
-    /// The layout starting each block, so a block can be walked without
-    /// replaying the enumeration from the beginning.
-    seeds: Vec<TeamLayout>,
+    /// What the positions in `live` are indices into, so a live one can be
+    /// unranked back into a layout.
+    counts: PawnCount,
     /// Per layout, one bit per backward move: still worth running. A bit is
     /// cleared once that move's target has subsumed everything this chunk
     /// could ever spread there, and a layout is in the work list exactly while
