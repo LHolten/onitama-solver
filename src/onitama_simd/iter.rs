@@ -49,6 +49,25 @@ impl LayoutCursor {
 }
 
 impl PawnCount {
+    /// How many states the table for these counts holds.
+    ///
+    /// A chunk only has a slot per king position that can exist, and neither
+    /// king can stand on its own temple, so a layout with a piece there has one
+    /// fewer choice for that king. The layouts that do have one are just a
+    /// multinomial with that square spoken for, which makes the whole sum
+    /// closed form instead of a walk over every layout.
+    pub fn states(self) -> u64 {
+        let (k0, k1) = (self.count0 as i32 + 1, self.count1 as i32 + 1);
+        let comb = |n, a, b| combinations(n, a, b) as u64;
+        let (a, b) = (k0 as u64, k1 as u64);
+
+        // every layout, minus the ones that lose a king position on either
+        // temple, plus back the ones that lose both
+        a * b * comb(25, k0, k1) + comb(23, k0 - 1, k1 - 1)
+            - b * comb(24, k0 - 1, k1)
+            - a * comb(24, k0, k1 - 1)
+    }
+
     /// The layout the enumeration yields at position `i`.
     ///
     /// The enumeration is in ranking order, so this inverts the ranking instead
@@ -334,6 +353,20 @@ mod tests {
                 n as f64 / runs0 as f64,
                 n as f64 / runs1 as f64,
             );
+        }
+    }
+
+    /// `states` has to agree with adding up what every layout actually holds,
+    /// which is the walk it replaces.
+    #[test]
+    fn test_states() {
+        for (count0, count1) in [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (0, 2), (2, 1), (1, 2)] {
+            let counts = PawnCount { count0, count1 };
+            let walked: u64 = counts
+                .into_iter()
+                .map(|layout| layout.indexer(counts).total() as u64)
+                .sum();
+            assert_eq!(counts.states(), walked, "{counts:?}");
         }
     }
 

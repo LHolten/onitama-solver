@@ -136,13 +136,7 @@ impl AllTables {
     }
 
     pub fn len(&self) -> u64 {
-        let mut total = 0;
-        for table in self.list.iter() {
-            for layout in table.counts {
-                total += layout.indexer(table.counts).total() as u64;
-            }
-        }
-        total
+        self.list.iter().map(|table| table.counts.states()).sum()
     }
 }
 
