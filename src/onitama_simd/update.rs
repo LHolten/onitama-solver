@@ -7,7 +7,7 @@ use bit_iter::BitIter;
 
 use crate::{
     card::offset_mask_fixed as offset_mask,
-    index::{Indexer, InternalIter},
+    index::Indexer,
 };
 
 use super::{
@@ -41,10 +41,6 @@ impl Update<'_> {
         // not depend on any of the work in between, so start the miss now
         let inv_slice = inv_current.index(layout.invert());
         prefetch(inv_slice.slice);
-
-        layout
-            .indexer(current.counts)
-            .for_enumerate(|i, oldk| mem.king_lookup[*oldk] = i as u8);
 
         // every 0 bit means that it could be anything, win loss or draw
         // every 1 bit means that it must be a draw or win
@@ -95,21 +91,16 @@ impl Update<'_> {
             }
         }
 
-        let LocalMem {
-            status,
-            king_lookup,
-            moves,
-            ..
-        } = &mut *mem;
+        let LocalMem { status, moves, .. } = &mut *mem;
         for mv in moves.iter() {
             let accum = Accum {
+                old: layout,
                 new: mv.new,
                 counts: mv.counts,
                 step: mv.step,
                 mask: mv.mask,
                 target: mv.target(),
                 slice: status,
-                king_lookup,
             };
             accum.accumulate();
         }
@@ -243,7 +234,6 @@ impl Update<'_> {
             status,
             wins,
             expanded,
-            king_lookup,
             moves,
             ..
         } = &mut *self.mem;
@@ -267,14 +257,18 @@ impl Update<'_> {
             }
 
             let spread = Spread {
+                old: layout,
                 new: mv.new,
                 counts: mv.counts,
                 step: mv.step,
                 target: mv.target(),
                 expanded,
-                king_lookup,
             };
-            let res = spread.spreadout();
+            let res = if up {
+                spread.spreadout::<true>()
+            } else {
+                spread.spreadout::<false>()
+            };
             progress |= res.progress;
             could |= res.could;
             if !res.could {
@@ -331,16 +325,32 @@ impl Update<'_> {
         }
     }
 
+    /// Read this chunk's wins out of the mirrored chunk.
+    ///
+    /// The mirror's piece masks are this one's reversed, and inverting a king
+    /// position swaps the two kings, so its rows are our columns read backwards
+    /// and the other way about. That makes the position it wants a transpose
+    /// and two reversals, which is arithmetic on the two counters rather than a
+    /// lookup per position.
     fn load_stuff(&mut self, inv_slice: &SubTable) {
-        let mem = &mut *self.mem;
+        let layout = self.layout;
+        let rows = (layout.pieces0 & !(1 << 22)).count_ones() as usize;
+        let cols = (layout.pieces1 & !(1 << 2)).count_ones() as usize;
 
-        let inv_indexer = inv_slice.layout.indexer(inv_slice.counts);
-        inv_indexer.for_enumerate(|inv_i, kpos| {
-            let i = mem.king_lookup[kpos.invert()] as usize;
-            let s = unsafe { mem.wins.get_mut(i).unwrap_unchecked() };
-            let x = unsafe { inv_slice.slice.get(inv_i).unwrap_unchecked() };
-            let tmp = x.load(Ordering::Relaxed);
-            *s = Block(tmp).invert().0;
-        });
+        let wins = &mut self.mem.wins[..];
+        let inv = inv_slice.slice;
+
+        let mut inv_i = 0;
+        for r in 0..cols {
+            let ours = cols - 1 - r;
+            for c in 0..rows {
+                let i = (rows - 1 - c) * cols + ours;
+                let s = unsafe { wins.get_unchecked_mut(i) };
+                let x = unsafe { inv.get_unchecked(inv_i) };
+                let tmp = x.load(Ordering::Relaxed);
+                *s = Block(tmp).invert().0;
+                inv_i += 1;
+            }
+        }
     }
 }

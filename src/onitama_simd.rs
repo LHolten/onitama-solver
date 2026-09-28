@@ -294,26 +294,6 @@ impl Index<KingPos> for SubTable<'_> {
     }
 }
 
-#[derive(Debug)]
-struct KingLookup {
-    list: [[u8; 25]; 25],
-}
-
-impl Index<KingPos> for KingLookup {
-    type Output = u8;
-
-    fn index(&self, index: KingPos) -> &Self::Output {
-        let t = unsafe { self.list.get(index.king0 as usize).unwrap_unchecked() };
-        unsafe { t.get(index.king1 as usize).unwrap_unchecked() }
-    }
-}
-
-impl IndexMut<KingPos> for KingLookup {
-    fn index_mut(&mut self, index: KingPos) -> &mut Self::Output {
-        let t = unsafe { self.list.get_mut(index.king0 as usize).unwrap_unchecked() };
-        unsafe { t.get_mut(index.king1 as usize).unwrap_unchecked() }
-    }
-}
 
 pub struct LocalMem {
     wins: Vec<u32>,
@@ -322,7 +302,6 @@ pub struct LocalMem {
     /// card mask of the current move group. Interleaved because [`Spread`]
     /// wants both at the same index. See [`Spread::expanded`].
     expanded: Vec<(u32, u32)>,
-    king_lookup: KingLookup,
     moves: Vec<PreparedMove>,
 }
 
@@ -332,9 +311,6 @@ impl LocalMem {
             wins: vec![],
             status: vec![],
             expanded: vec![],
-            king_lookup: KingLookup {
-                list: [[0; 25]; 25],
-            },
             moves: vec![],
         }
     }
@@ -394,16 +370,19 @@ pub struct Update<'a> {
 
 #[derive(Debug)]
 pub struct Accum<'a> {
+    /// The chunk being accumulated into, which is what `slice` is indexed by.
+    old: TeamLayout,
     new: TeamLayout,
     counts: PawnCount,
     mask: u32,
     step: (usize, usize),
     target: &'a [AtomicU32],
     slice: &'a mut [u32],
-    king_lookup: &'a KingLookup,
 }
 
 pub struct Spread<'a> {
+    /// The chunk being spread out of, which is what `expanded` is indexed by.
+    old: TeamLayout,
     new: TeamLayout,
     counts: PawnCount,
     step: (usize, usize),
@@ -417,7 +396,6 @@ pub struct Spread<'a> {
     /// while the target only gains bits, so once the target subsumes it the
     /// chunk is done contributing, for good.
     expanded: &'a [(u32, u32)],
-    king_lookup: &'a KingLookup,
 }
 
 /// What a [`Spread`] did, and whether it could ever do anything again.
