@@ -150,6 +150,39 @@ const LINE: usize = 64;
 /// The size of a huge page.
 const HUGE: usize = 2 << 20;
 
+/// Where the kernel reports whether transparent huge pages are allowed.
+#[cfg(target_os = "linux")]
+const THP_SETTING: &str = "/sys/kernel/mm/transparent_hugepage/enabled";
+
+/// Whether the kernel will hand out transparent huge pages at all.
+///
+/// The file names every mode and brackets the active one, so `madvise` and
+/// `always` both leave this build with huge pages and only `never` does not.
+#[cfg(target_os = "linux")]
+fn thp_allowed(setting: &str) -> bool {
+    !setting.contains("[never]")
+}
+
+/// Refuse to run without transparent huge pages.
+///
+/// `madvise` will not say so: under `never` it still sets the flag and simply
+/// never collapses anything, and the tables then run several times slower on
+/// page walks alone. That is a slowdown rather than a failure, which is exactly
+/// the kind of thing that gets measured without being noticed, so check the
+/// setting that `madvise` is quiet about and stop instead.
+#[cfg(target_os = "linux")]
+fn require_hugepages() {
+    let setting = std::fs::read_to_string(THP_SETTING).unwrap_or_else(|err| {
+        panic!("this needs transparent huge pages, and {THP_SETTING} is unreadable: {err}")
+    });
+    assert!(
+        thp_allowed(&setting),
+        "this needs transparent huge pages, and {THP_SETTING} is `{}`; \
+         set it to `madvise` or `always`",
+        setting.trim()
+    );
+}
+
 /// A zeroed, cache line aligned `[AtomicU32]`.
 ///
 /// Tables that are at least a huge page big get aligned to one instead, and ask
@@ -199,10 +232,16 @@ impl AlignedTable {
         );
 
         // must happen before the pages are touched, otherwise they are already
-        // split into 4K pages and only khugepaged can undo that. This is a
-        // hint, so there is nothing useful to do if the kernel declines.
+        // split into 4K pages and only khugepaged can undo that
         if size >= HUGE {
-            unsafe { libc::madvise(ptr, size, libc::MADV_HUGEPAGE) };
+            require_hugepages();
+            let err = unsafe { libc::madvise(ptr, size, libc::MADV_HUGEPAGE) };
+            assert_eq!(
+                err,
+                0,
+                "could not ask for huge pages: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         Self {
@@ -669,6 +708,20 @@ mod tests {
         let tb = AllTables::build(3, 0b1_0011_1001);
         assert_eq!(tb.count_ones(), 850996693);
         assert_eq!(tb.count_unresolved(), 300597);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thp_settings() {
+        use super::{thp_allowed, require_hugepages, THP_SETTING};
+
+        assert!(thp_allowed("[always] madvise never\n"));
+        assert!(thp_allowed("always [madvise] never\n"));
+        assert!(!thp_allowed("always madvise [never]\n"));
+        // the machine this is built for has to be one of the first two, so the
+        // check the tables run has to pass here
+        println!("{THP_SETTING} is {:?}", std::fs::read_to_string(THP_SETTING));
+        require_hugepages();
     }
 
     /// The same set at 8 men, where a chunk reaches 41 moves. Ignored by
