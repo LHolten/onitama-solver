@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 
 use bit_iter::BitIter;
 
-use super::{Accum, Chunk, Spread, SpreadStatus};
+use super::{Accum, Chunk, Spread, SpreadStatus, PAD};
 
 impl Accum<'_> {
     /// Add what this move says about the source chunk.
@@ -19,6 +19,7 @@ impl Accum<'_> {
             rows: rows_old,
             cols: cols_old,
             width: width_old,
+            ..
         } = self.old;
         let rows_new = self.new.pieces0 & !(1 << 22);
         let cols_new = self.new.pieces1 & !(1 << 2);
@@ -47,7 +48,7 @@ impl Accum<'_> {
             } else {
                 king0
             };
-            let base = (rows_old & (1 << old0) - 1).count_ones() as usize * width_old;
+            let base = (rows_old & (1 << old0) - 1).count_ones() as usize * PAD;
 
             // without a capture the whole row is one run and the two indices
             // just walk together; with one, the source is a step ahead after
@@ -83,6 +84,7 @@ impl Spread<'_> {
             rows: rows_old,
             cols: cols_old,
             width: width_old,
+            ..
         } = self.old;
         let rows_new = self.new.pieces0 & !(1 << 22);
         let cols_new = self.new.pieces1 & !(1 << 2);
@@ -114,9 +116,9 @@ impl Spread<'_> {
             }
             // only the `go_up` form moves the rows around
             let base = if UP {
-                (rows_old & (1 << king0) - 1).count_ones() as usize * width_old
+                (rows_old & (1 << king0) - 1).count_ones() as usize * PAD
             } else {
-                row * width_old
+                row * PAD
             };
             row += 1;
 

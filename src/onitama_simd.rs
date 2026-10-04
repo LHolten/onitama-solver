@@ -150,6 +150,37 @@ const LINE: usize = 64;
 /// The size of a huge page.
 const HUGE: usize = 2 << 20;
 
+/// Slots a row of a chunk is padded to in the local buffers.
+///
+/// A row is then exactly one vector, and always starts on one, so a whole row
+/// is read and written in one aligned access instead of a short loop over a
+/// width only known at runtime.
+const PAD: usize = 8;
+
+/// The most rows a chunk can have, which is one per piece.
+const MAX_ROWS: usize = 8;
+
+/// A row padded buffer, aligned so every row is.
+///
+/// One row of slack on the end: a capture shifts the write of a row up by one
+/// slot, and letting that run off the last row costs nothing because what it
+/// writes there is zero.
+#[repr(align(64))]
+struct Padded<T>([T; MAX_ROWS * PAD + PAD]);
+
+impl<T> std::ops::Deref for Padded<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for Padded<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.0
+    }
+}
+
 /// Where the kernel reports whether transparent huge pages are allowed.
 #[cfg(target_os = "linux")]
 const THP_SETTING: &str = "/sys/kernel/mm/transparent_hugepage/enabled";
@@ -202,8 +233,14 @@ impl AlignedTable {
         len * size_of::<AtomicU32>()
     }
 
+    /// What is actually mapped: a vector of slack, so a read that runs off the
+    /// end of the last chunk still lands inside the mapping.
+    fn map_size(len: usize) -> usize {
+        Self::size(len + PAD)
+    }
+
     fn layout(len: usize) -> Layout {
-        Layout::from_size_align(Self::size(len), LINE).unwrap()
+        Layout::from_size_align(Self::map_size(len), LINE).unwrap()
     }
 
     /// Map the table directly instead of going through the allocator.
@@ -215,7 +252,7 @@ impl AlignedTable {
     /// mapping is already zeroed, page aligned and lazily faulted.
     #[cfg(target_os = "linux")]
     fn new_zeroed(len: usize) -> Self {
-        let size = Self::size(len);
+        let size = Self::map_size(len);
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -262,7 +299,7 @@ impl Drop for AlignedTable {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
         unsafe {
-            libc::munmap(self.ptr as *mut libc::c_void, Self::size(self.len));
+            libc::munmap(self.ptr as *mut libc::c_void, Self::map_size(self.len));
         }
         #[cfg(not(target_os = "linux"))]
         unsafe {
@@ -335,21 +372,21 @@ impl Index<KingPos> for SubTable<'_> {
 
 
 pub struct LocalMem {
-    wins: Vec<u32>,
-    status: Vec<u32>,
+    wins: Padded<u32>,
+    status: Padded<u32>,
     /// Per king position, `status` and the not won states expanded for the
     /// card mask of the current move group. Interleaved because [`Spread`]
     /// wants both at the same index. See [`Spread::expanded`].
-    expanded: Vec<(u32, u32)>,
+    expanded: Padded<(u32, u32)>,
     moves: Vec<PreparedMove>,
 }
 
 impl LocalMem {
     const fn new() -> Self {
         Self {
-            wins: vec![],
-            status: vec![],
-            expanded: vec![],
+            wins: Padded([0; MAX_ROWS * PAD + PAD]),
+            status: Padded([0; MAX_ROWS * PAD + PAD]),
+            expanded: Padded([(0, 0); MAX_ROWS * PAD + PAD]),
             moves: vec![],
         }
     }
@@ -416,27 +453,29 @@ pub struct Chunk {
     /// Where this side's king can stand, which is its pieces without its
     /// temple: a king on its own temple has already won.
     rows: u32,
-    /// The same for the other side, and the stride of a row.
+    /// The same for the other side, and how long a row really is.
     cols: u32,
+    height: usize,
     width: usize,
 }
 
 impl Chunk {
     fn new(layout: TeamLayout) -> Self {
+        let rows = layout.pieces0 & !(1 << 22);
         let cols = layout.pieces1 & !(1 << 2);
-        Self {
-            rows: layout.pieces0 & !(1 << 22),
+        let this = Self {
+            rows,
             cols,
+            height: rows.count_ones() as usize,
             width: cols.count_ones() as usize,
-        }
+        };
+        debug_assert!(this.height <= MAX_ROWS && this.width <= PAD);
+        this
     }
 
-    /// How many king positions the chunk holds.
-    ///
-    /// This is what the indexer counts, one multiplication in instead of a
-    /// walk, and the two factors are needed here anyway.
-    fn total(self) -> usize {
-        self.rows.count_ones() as usize * self.width
+    /// How many slots the chunk takes in the padded buffers.
+    fn padded(self) -> usize {
+        self.height * PAD
     }
 }
 

@@ -1,5 +1,5 @@
 use std::{
-    iter::{repeat, zip},
+    iter::zip,
     sync::atomic::Ordering,
 };
 
@@ -9,7 +9,7 @@ use crate::card::offset_mask_fixed as offset_mask;
 
 use super::{
     prefetch, Accum, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
-    SpreadStatus, TeamLayout, Update, BLOCK_MASK,
+    SpreadStatus, TeamLayout, Update, BLOCK_MASK, PAD,
 };
 
 pub struct UpdateStatus {
@@ -34,7 +34,7 @@ impl Update<'_> {
         } = *self.immutable;
         let pieces0 = layout.pieces0;
         let chunk = Chunk::new(layout);
-        let total = chunk.total();
+        let padded = chunk.padded();
 
         // the mirrored chunk is only read at the very end, but its address does
         // not depend on any of the work in between, so start the miss now
@@ -45,8 +45,7 @@ impl Update<'_> {
         // every 1 bit means that it must be a draw or win
         // we will gradually flip these to 1s, leaving only losses on 0
         // it is initialized to the wins, because those are not lost even when they don't have moves
-        mem.status.clear();
-        mem.status.extend(repeat(0).take(total));
+        mem.status[..padded].fill(0);
 
         // first locate (and prefetch) the target chunk of every move, then do
         // the actual work; see `PreparedMove`
@@ -96,21 +95,24 @@ impl Update<'_> {
                 step: mv.step,
                 mask: mv.mask,
                 target: mv.target(),
-                slice: status,
+                slice: &mut status[..padded + PAD],
             };
             accum.accumulate();
         }
 
         // we expand, marking all states that are not lost because it has the card
         // then we negate to get only the lost states
-        mem.status
+        mem.status[..padded]
             .iter_mut()
             .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
 
-        mem.wins.resize(total, 0);
+        // the slots no king position uses are set to won, which makes them
+        // resolved and contributes nothing, so the walks below need no bounds
+        // of their own
+        mem.wins[..padded].fill(BLOCK_MASK);
         self.load_stuff(&inv_slice, chunk);
 
-        self.check_unresolved::<COUNT>(total)
+        self.check_unresolved::<COUNT>(padded)
     }
 
     pub fn update_layout(mut self, live: &mut u32) -> UpdateStatus {
@@ -228,7 +230,7 @@ impl Update<'_> {
             }
         }
 
-        let total = chunk.total();
+        let padded = chunk.padded();
         let LocalMem {
             status,
             wins,
@@ -236,7 +238,7 @@ impl Update<'_> {
             moves,
             ..
         } = &mut *self.mem;
-        expanded.resize(total, (0, 0));
+
 
         let mut progress = false;
         // a bit can be shared, so it is not cleared the moment one of its moves
@@ -253,8 +255,8 @@ impl Update<'_> {
             if built != Some(mv.mask) {
                 built = Some(mv.mask);
                 let mask = mv.mask;
-                let src = zip(&status[..total], &wins[..total]);
-                for (e, (&s, &w)) in zip(&mut expanded[..total], src) {
+                let src = zip(&status[..padded], &wins[..padded]);
+                for (e, (&s, &w)) in zip(&mut expanded[..padded], src) {
                     // we spread out the loses, these are wins for the previous state
                     *e = (Block(s & mask).expand().0, Block(!w & mask).expand().0);
                 }
@@ -285,14 +287,14 @@ impl Update<'_> {
         }
     }
 
-    pub fn check_unresolved<const COUNT: bool>(&mut self, total: usize) -> u64 {
+    pub fn check_unresolved<const COUNT: bool>(&mut self, padded: usize) -> u64 {
         let mem = &mut *self.mem;
 
         let mut all_done = BLOCK_MASK;
         let mut total_unresolved = 0;
         // let mut num_done = 0;
         // let mut num_not_done = 0;
-        for (s, &w) in zip(&mut mem.status[..total], &mem.wins[..total]) {
+        for (s, &w) in zip(&mut mem.status[..padded], &mem.wins[..padded]) {
             let l = *s;
             *s &= !w;
             if COUNT {
@@ -335,7 +337,7 @@ impl Update<'_> {
     /// and two reversals, which is arithmetic on the two counters rather than a
     /// lookup per position.
     fn load_stuff(&mut self, inv_slice: &SubTable, chunk: Chunk) {
-        let rows = chunk.rows.count_ones() as usize;
+        let rows = chunk.height;
         let cols = chunk.width;
 
         let wins = &mut self.mem.wins[..];
@@ -345,7 +347,7 @@ impl Update<'_> {
         for r in 0..cols {
             let ours = cols - 1 - r;
             for c in 0..rows {
-                let i = (rows - 1 - c) * cols + ours;
+                let i = (rows - 1 - c) * PAD + ours;
                 let s = unsafe { wins.get_unchecked_mut(i) };
                 let x = unsafe { inv.get_unchecked(inv_i) };
                 let tmp = x.load(Ordering::Relaxed);
