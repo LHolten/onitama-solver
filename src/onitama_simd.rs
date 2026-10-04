@@ -323,8 +323,9 @@ impl LocalMem {
 /// dependency chain. Resolving every move of a layout up front lets all of
 /// those misses be prefetched and overlap with each other.
 pub struct PreparedMove {
-    /// Which bit of `TableJob::live` this move owns. Kept on the move itself so
-    /// that skipping one during preparation does not shift the rest.
+    /// Which bit of `TableJob::live` this move owns, possibly shared with
+    /// another move. Kept on the move itself so that skipping one during
+    /// preparation does not shift the rest.
     bit: u32,
     step: (usize, usize),
     mask: u32,
@@ -522,12 +523,17 @@ struct TableJob<'a> {
     /// unranked back into a layout.
     counts: PawnCount,
     /// Per layout, one bit per backward move: still worth running. A bit is
-    /// cleared once that move's target has subsumed everything this chunk
-    /// could ever spread there, and a layout is in the work list exactly while
-    /// any of its bits is set, so this is the work list and the per move state
-    /// in one. Moves past bit 31 are never skipped; there are at most 32 for
-    /// the sizes that fit in memory anyway, since each of the 8 offsets
-    /// contributes at most one per piece.
+    /// cleared once every move on it has had its target subsume everything this
+    /// chunk could ever spread there, and a layout is in the work list exactly
+    /// while any of its bits is set, so this is the work list and the per move
+    /// state in one.
+    ///
+    /// Usually that is one move per bit, but the count depends on the cards and
+    /// the piece count, and 32 is not a bound on it: the default five reach 27
+    /// moves at 8 men and 32 at 10, and other sets reach 41 already at 8. So
+    /// the move index wraps, and the moves that collide share a bit and retire
+    /// together. That loses skips rather than correctness, and only on the
+    /// chunks that actually overflow.
     live: Vec<u32>,
     /// One bit per layout: retired, but its capture predecessors still have to
     /// be written by the `go_up` pass.
@@ -648,6 +654,31 @@ mod tests {
         // assert_eq!(wins, 6752579);
         assert_eq!(wins, 831344251);
         // assert_eq!(wins, 27126107221);
+    }
+
+    /// A card set with more backward moves per chunk than `TableJob::live` has
+    /// bits, so some of them share one and can only retire together.
+    ///
+    /// Cards 0, 3, 4, 5 and 8 span 13 offsets instead of the 8 the default five
+    /// span, which takes a chunk to 33 moves at 6 men and 41 at 8, well past
+    /// the 27 the default set ever reaches. The counts are the ones `799e9f0`
+    /// produces, from before any of the skipping existed, so this pins sharing
+    /// a bit to cost a skip and never an answer.
+    #[test]
+    fn overflowing_card_set() {
+        let tb = AllTables::build(3, 0b1_0011_1001);
+        assert_eq!(tb.count_ones(), 850996693);
+        assert_eq!(tb.count_unresolved(), 300597);
+    }
+
+    /// The same set at 8 men, where a chunk reaches 41 moves. Ignored by
+    /// default because the extra offsets make it a minute of work; 6 men
+    /// already goes past the 32 bits.
+    #[test]
+    #[ignore]
+    fn overflowing_card_set_8() {
+        let tb = AllTables::build(4, 0b1_0011_1001);
+        assert_eq!(tb.count_ones(), 38181597408);
     }
 
     #[test]

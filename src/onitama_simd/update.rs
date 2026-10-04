@@ -189,8 +189,11 @@ impl Update<'_> {
             let to_mask = to_mask & !pieces0 & !pieces1;
 
             for to in BitIter::from(to_mask) {
-                // a zero bit is a move past 31, which just never gets skipped
-                let bit = 1u32.checked_shl(seen).unwrap_or(0);
+                // the bits wrap, so a chunk with more moves than bits has some
+                // of them share one. A shared bit only goes out once every move
+                // on it is done, which costs skips but is never wrong, and it
+                // spreads the sharing instead of piling it on the last bit
+                let bit = 1u32 << (seen & 31);
                 seen += 1;
                 // a finished move is not even worth locating: `Table::index`
                 // runs the multiset ranking, which is the whole reason for the
@@ -240,7 +243,12 @@ impl Update<'_> {
         expanded.resize(total, (0, 0));
 
         let mut progress = false;
-        let mut could = false;
+        // a bit can be shared, so it is not cleared the moment one of its moves
+        // is finished: collect the ones that can still contribute instead, and
+        // let everything else go at the end. Every bit that was still set got a
+        // move, so what is not kept is finished, down to the bits past the move
+        // count that never had one to begin with.
+        let mut keep = 0u32;
         // `moves` is grouped by offset, so this rebuilds the expansions once per
         // card mask. Both come off the same walk over the chunk: `wins` is kept
         // intact by `get_unresolved` precisely so the bound can be read here.
@@ -270,13 +278,16 @@ impl Update<'_> {
                 spread.spreadout::<false>()
             };
             progress |= res.progress;
-            could |= res.could;
-            if !res.could {
-                *live &= !mv.bit;
+            if res.could {
+                keep |= mv.bit;
             }
         }
+        *live = keep;
 
-        SpreadStatus { progress, could }
+        SpreadStatus {
+            progress,
+            could: keep != 0,
+        }
     }
 
     pub fn check_unresolved<const COUNT: bool>(&mut self) -> u64 {
