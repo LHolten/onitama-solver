@@ -8,7 +8,7 @@ use bit_iter::BitIter;
 use crate::card::offset_mask_fixed as offset_mask;
 
 use super::{
-    prefetch, Accum, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
+    accum_spread::accumulate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
     SpreadStatus, TeamLayout, Update, BLOCK_MASK, PAD,
 };
 
@@ -45,7 +45,6 @@ impl Update<'_> {
         // every 1 bit means that it must be a draw or win
         // we will gradually flip these to 1s, leaving only losses on 0
         // it is initialized to the wins, because those are not lost even when they don't have moves
-        mem.status[..padded].fill(0);
 
         // first locate (and prefetch) the target chunk of every move, then do
         // the actual work; see `PreparedMove`
@@ -77,28 +76,30 @@ impl Update<'_> {
 
                 let target = table.index(new).slice;
                 prefetch(target);
+                let width_new = (new.pieces1 & !(1 << 2)).count_ones();
+                // the column a capture takes out of the source, which is where
+                // the row breaks; without one it never does
+                let split = if width_new == chunk.width as u32 {
+                    width_new
+                } else {
+                    (chunk.cols & (1 << to) - 1).count_ones()
+                };
                 mem.moves.push(PreparedMove {
                     bit: 0,
                     step: (from, to),
                     mask,
                     new,
+                    rows_new: new.pieces0 & !(1 << 22),
+                    width_new: width_new as u8,
+                    split: split as u8,
                     target,
                 });
             }
         }
 
         let LocalMem { status, moves, .. } = &mut *mem;
-        for mv in moves.iter() {
-            let accum = Accum {
-                old: chunk,
-                new: mv.new,
-                step: mv.step,
-                mask: mv.mask,
-                target: mv.target(),
-                slice: &mut status[..padded + PAD],
-            };
-            accum.accumulate();
-        }
+        status[..padded].fill(0);
+        accumulate(chunk, moves, status);
 
         // we expand, marking all states that are not lost because it has the card
         // then we negate to get only the lost states
@@ -225,6 +226,9 @@ impl Update<'_> {
                     step: (from, to),
                     mask,
                     new,
+                    rows_new: 0,
+                    width_new: 0,
+                    split: 0,
                     target,
                 });
             }

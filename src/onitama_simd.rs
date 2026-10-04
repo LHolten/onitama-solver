@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-mod accum_spread;
+pub mod accum_spread;
 mod iter;
 mod job;
 mod update;
@@ -406,6 +406,11 @@ pub struct PreparedMove {
     step: (usize, usize),
     mask: u32,
     new: TeamLayout,
+    /// The target's rows, how long one of them is, and the column a capture
+    /// takes out of the source. Only the accumulate reads these.
+    rows_new: u32,
+    width_new: u8,
+    split: u8,
     // borrows from the tables in `AllTables`, which outlive every update
     target: *const [AtomicU32],
 }
@@ -413,6 +418,16 @@ pub struct PreparedMove {
 impl PreparedMove {
     fn target(&self) -> &[AtomicU32] {
         unsafe { &*self.target }
+    }
+
+    /// The target chunk as plain words.
+    ///
+    /// The accumulate takes a whole padded row at a time, which no atomic load
+    /// can do. The values only ever gain bits and the walk already reads them
+    /// relaxed, so a lane is either what a concurrent `fetch_or` left or what
+    /// it found, which is what a relaxed load would have given anyway.
+    fn src(&self) -> *const u32 {
+        self.target().as_ptr() as *const u32
     }
 }
 
@@ -477,17 +492,6 @@ impl Chunk {
     fn padded(self) -> usize {
         self.height * PAD
     }
-}
-
-#[derive(Debug)]
-pub struct Accum<'a> {
-    /// The chunk being accumulated into, which is what `slice` is indexed by.
-    old: Chunk,
-    new: TeamLayout,
-    mask: u32,
-    step: (usize, usize),
-    target: &'a [AtomicU32],
-    slice: &'a mut [u32],
 }
 
 pub struct Spread<'a> {

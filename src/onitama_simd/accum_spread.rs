@@ -1,70 +1,79 @@
-use std::sync::atomic::Ordering;
+use std::{
+    simd::{cmp::SimdPartialOrd, simd_swizzle, Select, Simd},
+    slice::from_raw_parts,
+    sync::atomic::Ordering,
+};
 
 use bit_iter::BitIter;
 
-use super::{Accum, Chunk, Spread, SpreadStatus, PAD};
+use super::{Chunk, PreparedMove, Spread, SpreadStatus, PAD};
 
-impl Accum<'_> {
-    /// Add what this move says about the source chunk.
-    ///
-    /// A forward move leaves `pieces1` alone unless it captures, so the king
-    /// positions of the source and the target run in the same order: within a
-    /// row the two indices differ by a constant, and a capture only splits that
-    /// into two such runs. Walking those runs means the source index is a
-    /// counter rather than a lookup, so the inner loop never builds a
-    /// [`KingPos`] or a lookup table at all.
-    pub fn accumulate(self) {
-        let (from, to) = self.step;
-        let Chunk {
-            rows: rows_old,
-            cols: cols_old,
-            width: width_old,
-            ..
-        } = self.old;
-        let rows_new = self.new.pieces0 & !(1 << 22);
-        let cols_new = self.new.pieces1 & !(1 << 2);
-        let width_new = cols_new.count_ones() as usize;
-        // a capture takes one column out of the middle, which is where the two
-        // runs meet; without one the whole row is a single run
-        let split = if width_new == width_old {
-            width_new
-        } else {
-            (cols_old & (1 << to) - 1).count_ones() as usize
-        };
+/// Add what every move says about the source chunk.
+///
+/// The moves come off the card offsets, so every move of one offset carries the
+/// same card mask, and what each contributes to a slot is `!target & mask`.
+/// Those or together, and `(!a & m) | (!b & m)` is `!(a & b) & m`, so a whole
+/// offset is one and per move and a single not and mask at the end of it. And
+/// is associative, so that accumulator stays in a register instead of being an
+/// or back into `status` per move, and the ors across offsets stay in one too,
+/// which leaves one store per row for the whole chunk.
+///
+/// Both dimensions keep their order apart from the squares the move touches.
+/// The row the king moved off is the only one that does not map to itself, and
+/// the columns are the target's with the captured one taken out, which is a
+/// rotate and a select rather than a second walk. The slot that select leaves
+/// holding its neighbour is the one with the king on the captured square: this
+/// move takes that king for every card it has, so the slot is won and anything
+/// claiming it is not lost is true there.
+pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
+    /// Rows this long or shorter are read without touching the line after them.
+    const HALF: usize = PAD / 2;
 
-        // hoisted so the inner runs do not re-derive them from the `Vec`
-        let target = self.target;
-        let slice = &mut self.slice[..];
+    let lane = Simd::<u32, PAD>::from_array(std::array::from_fn(|k| k as u32));
 
-        let mut new_i = 0;
-        for king0 in BitIter::from(rows_new) {
-            let old0 = if king0 == to {
-                if from == 22 {
-                    // there is no way we came from the temple
-                    new_i += width_new;
+    // `moves` is built offset by offset, so an offset is a run of it. Taking
+    // those on the outside keeps the handful of chunks one offset reads hot
+    // across the rows, instead of walking every chunk again for each row
+    for group in moves.chunk_by(|a, b| a.mask == b.mask) {
+        let card = Simd::splat(group[0].mask);
+
+        for (r, king0) in BitIter::from(chunk.rows).enumerate() {
+            let mut all = Simd::splat(u32::MAX);
+
+            for mv in group {
+                let (from, to) = mv.step;
+                // the king moved exactly when it was the piece on `from`
+                let new0 = if king0 == from { to } else { king0 };
+                if new0 == 22 {
+                    // onto its own temple, so it has already won and there is
+                    // no state over there to read. Leaving `all` alone drops
+                    // this move out of the offset, which is what that means
                     continue;
                 }
-                from
-            } else {
-                king0
-            };
-            let base = (rows_old & (1 << old0) - 1).count_ones() as usize * PAD;
 
-            // without a capture the whole row is one run and the two indices
-            // just walk together; with one, the source is a step ahead after
-            // the column that was taken
-            for k in 0..split {
-                let new_val = unsafe { target.get_unchecked(new_i + k) };
-                let s = unsafe { slice.get_unchecked_mut(base + k) };
-                // if new state is not won, then old state is not lost
-                *s |= !new_val.load(Ordering::Relaxed) & self.mask;
+                let width_new = mv.width_new as usize;
+                let tbase = (mv.rows_new & (1 << new0) - 1).count_ones() as usize * width_new;
+                let ptr = unsafe { mv.src().add(tbase) };
+                let src: Simd<u32, PAD> = if width_new <= HALF {
+                    // a whole vector is wider than the row and would straddle
+                    // into the next chunk's line, which nothing prefetched: a
+                    // chunk is at most two lines and they are what was. What
+                    // the row does not reach reads as all ones, which is what
+                    // an and wants there anyway
+                    let half: Simd<u32, HALF> =
+                        Simd::from_slice(unsafe { from_raw_parts(ptr, HALF) });
+                    simd_swizzle!(half, Simd::splat(u32::MAX), [0, 1, 2, 3, 4, 5, 6, 7])
+                } else {
+                    Simd::from_slice(unsafe { from_raw_parts(ptr, PAD) })
+                };
+
+                let shifted = src.rotate_elements_right::<1>();
+                all &= lane.simd_lt(Simd::splat(mv.split as u32)).select(src, shifted);
             }
-            for k in split..width_new {
-                let new_val = unsafe { target.get_unchecked(new_i + k) };
-                let s = unsafe { slice.get_unchecked_mut(base + k + 1) };
-                *s |= !new_val.load(Ordering::Relaxed) & self.mask;
-            }
-            new_i += width_new;
+
+            // if no move of this offset is won, then the state is not lost
+            let row = unsafe { status.get_unchecked_mut(r * PAD..r * PAD + PAD) };
+            (Simd::from_slice(row) | (!all & card)).copy_to_slice(row);
         }
     }
 }
