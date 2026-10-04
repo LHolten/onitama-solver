@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 
 use bit_iter::BitIter;
 
-use super::{Accum, Spread, SpreadStatus};
+use super::{Accum, Chunk, Spread, SpreadStatus};
 
 impl Accum<'_> {
     /// Add what this move says about the source chunk.
@@ -15,13 +15,14 @@ impl Accum<'_> {
     /// [`KingPos`] or a lookup table at all.
     pub fn accumulate(self) {
         let (from, to) = self.step;
+        let Chunk {
+            rows: rows_old,
+            cols: cols_old,
+            width: width_old,
+        } = self.old;
         let rows_new = self.new.pieces0 & !(1 << 22);
-        let rows_old = self.old.pieces0 & !(1 << 22);
         let cols_new = self.new.pieces1 & !(1 << 2);
-        let cols_old = self.old.pieces1 & !(1 << 2);
-
         let width_new = cols_new.count_ones() as usize;
-        let width_old = cols_old.count_ones() as usize;
         // a capture takes one column out of the middle, which is where the two
         // runs meet; without one the whole row is a single run
         let split = if width_new == width_old {
@@ -78,12 +79,14 @@ impl Spread<'_> {
     /// came from is settled once for the move.
     pub fn spreadout<const UP: bool>(self) -> SpreadStatus {
         let (from, to) = self.step;
+        let Chunk {
+            rows: rows_old,
+            cols: cols_old,
+            width: width_old,
+        } = self.old;
         let rows_new = self.new.pieces0 & !(1 << 22);
-        let rows_old = self.old.pieces0 & !(1 << 22);
         let cols_new = self.new.pieces1 & !(1 << 2);
-        let cols_old = self.old.pieces1 & !(1 << 2);
         let width_new = cols_new.count_ones() as usize;
-        let width_old = cols_old.count_ones() as usize;
 
         // where each target column came from. `NONE` is the moved piece having
         // come off the temple, which the source has no column for.

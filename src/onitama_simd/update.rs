@@ -5,13 +5,10 @@ use std::{
 
 use bit_iter::BitIter;
 
-use crate::{
-    card::offset_mask_fixed as offset_mask,
-    index::Indexer,
-};
+use crate::card::offset_mask_fixed as offset_mask;
 
 use super::{
-    prefetch, Accum, Block, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
+    prefetch, Accum, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
     SpreadStatus, TeamLayout, Update, BLOCK_MASK,
 };
 
@@ -36,6 +33,8 @@ impl Update<'_> {
             ..
         } = *self.immutable;
         let pieces0 = layout.pieces0;
+        let chunk = Chunk::new(layout);
+        let total = chunk.total();
 
         // the mirrored chunk is only read at the very end, but its address does
         // not depend on any of the work in between, so start the miss now
@@ -47,8 +46,7 @@ impl Update<'_> {
         // we will gradually flip these to 1s, leaving only losses on 0
         // it is initialized to the wins, because those are not lost even when they don't have moves
         mem.status.clear();
-        mem.status
-            .extend(repeat(0).take(layout.indexer(current.counts).total()));
+        mem.status.extend(repeat(0).take(total));
 
         // first locate (and prefetch) the target chunk of every move, then do
         // the actual work; see `PreparedMove`
@@ -85,7 +83,6 @@ impl Update<'_> {
                     step: (from, to),
                     mask,
                     new,
-                    counts: table.counts,
                     target,
                 });
             }
@@ -94,9 +91,8 @@ impl Update<'_> {
         let LocalMem { status, moves, .. } = &mut *mem;
         for mv in moves.iter() {
             let accum = Accum {
-                old: layout,
+                old: chunk,
                 new: mv.new,
-                counts: mv.counts,
                 step: mv.step,
                 mask: mv.mask,
                 target: mv.target(),
@@ -111,10 +107,10 @@ impl Update<'_> {
             .iter_mut()
             .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
 
-        mem.wins.resize(layout.indexer(current.counts).total(), 0);
-        self.load_stuff(&inv_slice);
+        mem.wins.resize(total, 0);
+        self.load_stuff(&inv_slice, chunk);
 
-        self.check_unresolved::<COUNT>()
+        self.check_unresolved::<COUNT>(total)
     }
 
     pub fn update_layout(mut self, live: &mut u32) -> UpdateStatus {
@@ -173,6 +169,7 @@ impl Update<'_> {
             ..
         } = *self.immutable;
         let TeamLayout { pieces0, pieces1 } = layout;
+        let chunk = Chunk::new(layout);
 
         // same two phase split as in `get_unresolved`: locate and prefetch every
         // target chunk before touching any of them.
@@ -226,13 +223,12 @@ impl Update<'_> {
                     step: (from, to),
                     mask,
                     new,
-                    counts: table.counts,
                     target,
                 });
             }
         }
 
-        let total = layout.indexer(current.counts).total();
+        let total = chunk.total();
         let LocalMem {
             status,
             wins,
@@ -265,9 +261,8 @@ impl Update<'_> {
             }
 
             let spread = Spread {
-                old: layout,
+                old: chunk,
                 new: mv.new,
-                counts: mv.counts,
                 step: mv.step,
                 target: mv.target(),
                 expanded,
@@ -290,17 +285,13 @@ impl Update<'_> {
         }
     }
 
-    pub fn check_unresolved<const COUNT: bool>(&mut self) -> u64 {
-        let layout = self.layout;
+    pub fn check_unresolved<const COUNT: bool>(&mut self, total: usize) -> u64 {
         let mem = &mut *self.mem;
-        let current = self.immutable.current;
 
         let mut all_done = BLOCK_MASK;
         let mut total_unresolved = 0;
         // let mut num_done = 0;
         // let mut num_not_done = 0;
-        // the indexer just enumerates 0..total here, so walk the slices directly
-        let total = layout.indexer(current.counts).total();
         for (s, &w) in zip(&mut mem.status[..total], &mem.wins[..total]) {
             let l = *s;
             *s &= !w;
@@ -343,10 +334,9 @@ impl Update<'_> {
     /// and the other way about. That makes the position it wants a transpose
     /// and two reversals, which is arithmetic on the two counters rather than a
     /// lookup per position.
-    fn load_stuff(&mut self, inv_slice: &SubTable) {
-        let layout = self.layout;
-        let rows = (layout.pieces0 & !(1 << 22)).count_ones() as usize;
-        let cols = (layout.pieces1 & !(1 << 2)).count_ones() as usize;
+    fn load_stuff(&mut self, inv_slice: &SubTable, chunk: Chunk) {
+        let rows = chunk.rows.count_ones() as usize;
+        let cols = chunk.width;
 
         let wins = &mut self.mem.wins[..];
         let inv = inv_slice.slice;

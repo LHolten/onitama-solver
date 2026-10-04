@@ -369,7 +369,6 @@ pub struct PreparedMove {
     step: (usize, usize),
     mask: u32,
     new: TeamLayout,
-    counts: PawnCount,
     // borrows from the tables in `AllTables`, which outlive every update
     target: *const [AtomicU32],
 }
@@ -408,12 +407,44 @@ pub struct Update<'a> {
     mem: &'a mut LocalMem,
 }
 
+/// The shape of the chunk being written, which every move of it shares.
+///
+/// A move only ever changes where the walk reads from, so these come off the
+/// layout once instead of out of every [`Accum`] and [`Spread`] it builds.
+#[derive(Debug, Clone, Copy)]
+pub struct Chunk {
+    /// Where this side's king can stand, which is its pieces without its
+    /// temple: a king on its own temple has already won.
+    rows: u32,
+    /// The same for the other side, and the stride of a row.
+    cols: u32,
+    width: usize,
+}
+
+impl Chunk {
+    fn new(layout: TeamLayout) -> Self {
+        let cols = layout.pieces1 & !(1 << 2);
+        Self {
+            rows: layout.pieces0 & !(1 << 22),
+            cols,
+            width: cols.count_ones() as usize,
+        }
+    }
+
+    /// How many king positions the chunk holds.
+    ///
+    /// This is what the indexer counts, one multiplication in instead of a
+    /// walk, and the two factors are needed here anyway.
+    fn total(self) -> usize {
+        self.rows.count_ones() as usize * self.width
+    }
+}
+
 #[derive(Debug)]
 pub struct Accum<'a> {
     /// The chunk being accumulated into, which is what `slice` is indexed by.
-    old: TeamLayout,
+    old: Chunk,
     new: TeamLayout,
-    counts: PawnCount,
     mask: u32,
     step: (usize, usize),
     target: &'a [AtomicU32],
@@ -422,9 +453,8 @@ pub struct Accum<'a> {
 
 pub struct Spread<'a> {
     /// The chunk being spread out of, which is what `expanded` is indexed by.
-    old: TeamLayout,
+    old: Chunk,
     new: TeamLayout,
-    counts: PawnCount,
     step: (usize, usize),
     target: &'a [AtomicU32],
     /// Per king position, what to spread and the most that could ever be
