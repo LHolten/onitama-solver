@@ -1,5 +1,5 @@
 use std::{
-    simd::{cmp::SimdPartialOrd, simd_swizzle, Select, Simd},
+    simd::{cmp::SimdPartialOrd, Select, Simd},
     slice::from_raw_parts,
     sync::atomic::Ordering,
 };
@@ -26,9 +26,6 @@ use super::{Chunk, PreparedMove, Spread, SpreadStatus, PAD};
 /// move takes that king for every card it has, so the slot is won and anything
 /// claiming it is not lost is true there.
 pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
-    /// Rows this long or shorter are read without touching the line after them.
-    const HALF: usize = PAD / 2;
-
     let lane = Simd::<u32, PAD>::from_array(std::array::from_fn(|k| k as u32));
 
     // `moves` is built offset by offset, so an offset is a run of it. Taking
@@ -53,19 +50,8 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
 
                 let width_new = mv.width_new as usize;
                 let tbase = (mv.rows_new & (1 << new0) - 1).count_ones() as usize * width_new;
-                let ptr = unsafe { mv.src().add(tbase) };
-                let src: Simd<u32, PAD> = if width_new <= HALF {
-                    // a whole vector is wider than the row and would straddle
-                    // into the next chunk's line, which nothing prefetched: a
-                    // chunk is at most two lines and they are what was. What
-                    // the row does not reach reads as all ones, which is what
-                    // an and wants there anyway
-                    let half: Simd<u32, HALF> =
-                        Simd::from_slice(unsafe { from_raw_parts(ptr, HALF) });
-                    simd_swizzle!(half, Simd::splat(u32::MAX), [0, 1, 2, 3, 4, 5, 6, 7])
-                } else {
-                    Simd::from_slice(unsafe { from_raw_parts(ptr, PAD) })
-                };
+                let src: Simd<u32, PAD> =
+                    Simd::from_slice(unsafe { from_raw_parts(mv.src().add(tbase), PAD) });
 
                 let shifted = src.rotate_elements_right::<1>();
                 all &= lane.simd_lt(Simd::splat(mv.split as u32)).select(src, shifted);

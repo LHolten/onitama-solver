@@ -155,18 +155,35 @@ const HUGE: usize = 2 << 20;
 /// A row is then exactly one vector, and always starts on one, so a whole row
 /// is read and written in one aligned access instead of a short loop over a
 /// width only known at runtime.
-const PAD: usize = 8;
+///
+/// Four fits the sizes up to eight men, where a side has at most four pieces
+/// and so a row at most four king positions. Nine and ten men need eight, and
+/// a path of their own: see [`Chunk::padded`] for what else has to change, and
+/// [`AllTables::build`] refuses the sizes this does not cover.
+const PAD: usize = 4;
+
+/// Slots the vectorised walks over the padded buffers take at a time.
+const GROUP: usize = 8;
+
+/// Rows per [`GROUP`], which is what [`Chunk::padded`] rounds to.
+const ROWS_PER_GROUP: usize = GROUP / PAD;
 
 /// The most rows a chunk can have, which is one per piece.
 const MAX_ROWS: usize = 8;
 
 /// A row padded buffer, aligned so every row is.
 ///
-/// One row of slack on the end: a capture shifts the write of a row up by one
-/// slot, and letting that run off the last row costs nothing because what it
-/// writes there is zero.
+/// Far longer than the rows can need, which is not slack for them but for the
+/// vectoriser: the length bounds how long it can tell the walks over this might
+/// run, and under [`MAX_ROWS`] groups it decides a whole vector at a time is
+/// not worth it and packs a single pair instead.
+///
+/// That bound is the whole reason for the length, so it is the shortest one
+/// that clears it rather than anything tuned. It is worth re-checking that the
+/// wide loop is still there after a toolchain bump; being wrong about it is a
+/// slowdown and nothing else.
 #[repr(align(64))]
-struct Padded<T>([T; MAX_ROWS * PAD + PAD]);
+struct Padded<T>([T; MAX_ROWS * GROUP]);
 
 impl<T> std::ops::Deref for Padded<T> {
     type Target = [T];
@@ -370,7 +387,7 @@ impl Index<KingPos> for SubTable<'_> {
     }
 }
 
-
+/// The scratch every chunk is built in, held per thread.
 pub struct LocalMem {
     wins: Padded<u32>,
     status: Padded<u32>,
@@ -384,9 +401,9 @@ pub struct LocalMem {
 impl LocalMem {
     const fn new() -> Self {
         Self {
-            wins: Padded([0; MAX_ROWS * PAD + PAD]),
-            status: Padded([0; MAX_ROWS * PAD + PAD]),
-            expanded: Padded([(0, 0); MAX_ROWS * PAD + PAD]),
+            wins: Padded([0; MAX_ROWS * GROUP]),
+            status: Padded([0; MAX_ROWS * GROUP]),
+            expanded: Padded([(0, 0); MAX_ROWS * GROUP]),
             moves: vec![],
         }
     }
@@ -489,8 +506,23 @@ impl Chunk {
     }
 
     /// How many slots the chunk takes in the padded buffers.
+    ///
+    /// Rounded up to a whole [`GROUP`], which the rows need not be: the slots
+    /// that buys are past every row and nobody reads them, and `wins` is filled
+    /// with a resolved value so the walks that do reach them get nothing.
+    ///
+    /// The rounding is on the rows and not on the slots, which matters. The
+    /// biggest of those walks builds [`Spread::expanded`], and its interleaved
+    /// pairs only vectorise a whole vector at a time if the vectoriser can
+    /// *prove* the count is a multiple of [`GROUP`]. It proves that from the
+    /// multiplication, which an even row count keeps. Rounding the slots
+    /// instead computes the very same number but folds to a bitmask
+    /// (`(n + 7) & !7`, or a `div_ceil` and a multiply, which become one), and
+    /// through that it can only see a multiple of `PAD`: it then gives up and
+    /// packs a single pair at a time, which the whole solve pays for in
+    /// instructions.
     fn padded(self) -> usize {
-        self.height * PAD
+        self.height.next_multiple_of(ROWS_PER_GROUP) * PAD
     }
 }
 
@@ -546,6 +578,13 @@ impl AllTables {
     }
 
     pub fn build(size: u32, cards: u16) -> Self {
+        // a side has `size` pieces, so a chunk has at most that many king
+        // positions each way, and a row has to fit in one vector
+        assert!(
+            size as usize <= PAD,
+            "this is built for up to {PAD} pieces a side; {size} needs a wider PAD"
+        );
+
         let mut mask_lookup = [0; 25];
         let mut directions = 0;
         for (mask, card) in zip(mask_iter(), Cards(cards).iter()) {
