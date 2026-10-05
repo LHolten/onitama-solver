@@ -14,6 +14,9 @@ use std::{
     time::Instant,
 };
 
+#[cfg(feature = "parallell")]
+use rayon::prelude::*;
+
 use bit_iter::BitIter;
 
 use crate::{
@@ -646,39 +649,71 @@ impl AllTables {
         };
 
         let mut win_in1 = 0;
-        let mut schedule = vec![];
+        // Everything a table reads is a piece smaller: a take lands in
+        // `take_one`, which is one off `count1`. So a whole piece count only
+        // ever reads counts below it and none of its own, and the lot can run
+        // together; the mirror a table reads its wins out of is in there with
+        // it, which is why those two always had to be.
+        //
+        // What that buys is the tail. A count on its own runs until its last
+        // few layouts stop moving, and those are far too few to keep the
+        // machine busy; run the whole piece count at once and the ones still
+        // going fill in for the ones that are nearly done.
+        let mut schedule: Vec<Vec<TableJob>> = vec![];
         for counts in count_indexer(size) {
             let counts: PawnCount = counts;
             if counts.count0 < counts.count1 {
                 continue;
             }
-            let mut jobs = vec![TableJob::new(&tb, counts)];
+            let total = (counts.count0 + counts.count1) as usize;
+            if schedule.len() <= total {
+                schedule.resize_with(total + 1, Vec::new);
+            }
+            let jobs = &mut schedule[total];
+            jobs.push(TableJob::new(&tb, counts));
             if counts.count0 > counts.count1 {
                 jobs.push(TableJob::new(&tb, counts.invert()));
             }
-            for job in &jobs {
+        }
+        for jobs in &schedule {
+            for job in jobs {
                 job.mark_ez_win();
                 win_in1 += job.update.current.count_ones();
             }
-            schedule.push(jobs)
         }
 
-        for mut jobs in schedule {
+        for (total, mut jobs) in schedule.into_iter().enumerate() {
+            if jobs.is_empty() {
+                continue;
+            }
+            let tables = jobs.len();
             let mut any_progress = true;
             let mut iters = 0;
             while any_progress {
-                any_progress = false;
-                for job in &mut jobs {
-                    any_progress |= job.next().is_some();
+                // the tables of a count do not read each other, so they are a
+                // pass each rather than a pass apiece. Reading a mirror that is
+                // still being written only ever leaves a bound wider than it
+                // will end up, which costs a pass and never a result
+                #[cfg(feature = "parallell")]
+                {
+                    any_progress = jobs
+                        .par_iter_mut()
+                        .map(|job| job.next().is_some())
+                        .reduce(|| false, |a, b| a | b);
+                }
+                #[cfg(not(feature = "parallell"))]
+                {
+                    any_progress = false;
+                    for job in &mut jobs {
+                        any_progress |= job.next().is_some();
+                    }
                 }
                 iters += 1;
             }
 
-
-            println!(
-                "finished {:?} in {iters} iterations",
-                jobs[0].update.current.counts
-            );
+            // the counts are pawns, and both kings are always on the board
+            let pieces = total + 2;
+            println!("finished {pieces} pieces, {tables} tables, in {iters} iterations");
         }
 
         tb.win_in1 = win_in1;
