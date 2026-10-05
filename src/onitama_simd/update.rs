@@ -8,7 +8,7 @@ use bit_iter::BitIter;
 use crate::card::offset_mask_fixed as offset_mask;
 
 use super::{
-    accum_spread::accumulate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
+    accum_spread::accumulate, prefetch, Block, Chunk, Expanded, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
     SpreadStatus, TeamLayout, Update, BLOCK_MASK, PAD,
 };
 
@@ -262,7 +262,10 @@ impl Update<'_> {
                 let src = zip(&status[..padded], &wins[..padded]);
                 for (e, (&s, &w)) in zip(&mut expanded[..padded], src) {
                     // we spread out the loses, these are wins for the previous state
-                    *e = (Block(s & mask).expand().0, Block(!w & mask).expand().0);
+                    *e = Expanded {
+                        tmp: Block(s & mask).expand().0,
+                        may: Block(!w & mask).expand().0,
+                    };
                 }
             }
 

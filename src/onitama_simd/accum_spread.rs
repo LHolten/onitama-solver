@@ -1,5 +1,9 @@
 use std::{
-    simd::{cmp::SimdPartialOrd, Select, Simd},
+    simd::{
+        cmp::{SimdPartialEq, SimdPartialOrd},
+        num::SimdUint,
+        Mask, Select, Simd,
+    },
     slice::from_raw_parts,
     sync::atomic::Ordering,
 };
@@ -78,26 +82,52 @@ impl Spread<'_> {
         let Chunk {
             rows: rows_old,
             cols: cols_old,
-            width: width_old,
             ..
         } = self.old;
         let rows_new = self.new.pieces0 & !(1 << 22);
         let cols_new = self.new.pieces1 & !(1 << 2);
         let width_new = cols_new.count_ones() as usize;
 
-        // where each target column came from. `NONE` is the moved piece having
-        // come off the temple, which the source has no column for.
-        const NONE: u8 = u8::MAX;
-        let mut came_from = [NONE; 8];
-        for (slot, square) in came_from.iter_mut().zip(BitIter::from(cols_new)) {
-            let square = if square == to { from } else { square };
-            if cols_old & 1 << square != 0 {
-                *slot = (cols_old & (1 << square) - 1).count_ones() as u8;
-            }
-        }
+        // Which slot each target column reads is a rotate of a run of them. The
+        // move takes the piece out of one column and puts it back in another,
+        // so the columns between the two shift along by one and every column
+        // outside stays where it was. `p` is the column it arrives in, which is
+        // the one that reads the slot `f` it left.
+        //
+        // A piece on the temple has no column, so `from` there means `p` reads
+        // nothing and `to` there means the piece leaves the chunk and there is
+        // no arrival column at all. Both only ever drop lanes, so they are a
+        // bound on the run and a bit out of `live` rather than a case.
+        let gone = from == 2;
+        let f = if gone {
+            width_new.saturating_sub(1)
+        } else {
+            (cols_old & (1 << from) - 1).count_ones() as usize
+        };
+        let p = if to == 2 {
+            width_new
+        } else {
+            (cols_new & (1 << to) - 1).count_ones() as usize
+        };
 
-        let expanded = self.expanded;
-        let target = self.target;
+        let lane = Simd::<u64, PAD>::from_array(std::array::from_fn(|k| k as u64));
+        let at_p = lane.simd_eq(Simd::splat(p as u64));
+        // the run is the columns strictly between the two, which is the half
+        // open interval on whichever side the piece moved
+        let run = if p > f {
+            lane.simd_ge(Simd::splat(f as u64)) & lane.simd_lt(Simd::splat(p as u64))
+        } else {
+            lane.simd_gt(Simd::splat(p as u64)) & lane.simd_le(Simd::splat(f as u64))
+        };
+        let live = lane.simd_lt(Simd::splat(width_new as u64)) & !(at_p & Mask::splat(gone));
+
+        let target = self.target.as_ptr();
+        // the pair is one word, so a row of them is one vector
+        let row_at = |i: usize| unsafe { self.expanded.as_ptr().add(i).cast::<u64>() };
+        // the target word in both halves, so one and against the pair asks of
+        // the bound and of the losses at the same time
+        const LOW: u64 = u32::MAX as u64;
+        let zero = Simd::<u64, PAD>::splat(0);
 
         let mut progress = false;
         let mut could = false;
@@ -117,29 +147,46 @@ impl Spread<'_> {
             };
             row += 1;
 
-            for &col in &came_from[..width_new] {
-                if col == NONE {
-                    new_i += 1;
-                    continue;
-                }
+            let src = Simd::<u64, PAD>::from_slice(unsafe { from_raw_parts(row_at(base), PAD) });
+            let shifted = if p > f {
+                src.rotate_elements_left::<1>()
+            } else {
+                src.rotate_elements_right::<1>()
+            };
+            let moved = Simd::splat(unsafe { *row_at(base + f) });
+            let pair = at_p.select(moved, run.select(shifted, src));
 
-                let (tmp, may) = unsafe { *expanded.get_unchecked(base + col as usize) };
-                let new_val = unsafe { target.get_unchecked(new_i) };
-                new_i += 1;
-                let fetch = new_val.load(Ordering::Relaxed);
-                // `tmp` is a subset of `may`, so this also covers the case where
-                // there is nothing to do right now
-                if fetch | may == fetch {
-                    continue;
-                }
-                could = true;
-                if fetch | tmp == fetch {
-                    continue;
-                }
+            // the row of the target is contiguous, and the table carries `PAD`
+            // of slack precisely so the last one can be read whole
+            let fetch: Simd<u32, PAD> =
+                Simd::from_slice(unsafe { from_raw_parts(target.cast::<u32>().add(new_i), PAD) });
+            let fetch = fetch.cast::<u64>();
+            let both = fetch | fetch << Simd::splat(32);
+            new_i += width_new;
 
-                // if accum state is lost, then new state is won
-                new_val.fetch_or(tmp, Ordering::Relaxed);
-                progress = true;
+            // what the pair says that the target does not have yet, in both
+            // halves at once. The losses are a subset of the bound, so the high
+            // half empty means the low one is too and the row is finished
+            let news = pair & !both;
+            let can = (news & Simd::splat(LOW << 32)).simd_ne(zero) & live;
+            if !can.any() {
+                continue;
+            }
+            could = true;
+
+            let todo = (news & Simd::splat(LOW)).simd_ne(zero) & live;
+            if !todo.any() {
+                continue;
+            }
+            progress = true;
+            // the write is an atomic read modify write per column, which no
+            // vector does. By here it is the rare case though: a row with
+            // nothing to say leaves above, all of it at once
+            for col in 0..PAD {
+                if todo.test(col) {
+                    let slot = unsafe { &*target.add(new_i - width_new + col) };
+                    slot.fetch_or(pair[col] as u32, Ordering::Relaxed);
+                }
             }
         }
 

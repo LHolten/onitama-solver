@@ -185,6 +185,19 @@ const MAX_ROWS: usize = 8;
 #[repr(align(64))]
 struct Padded<T>([T; MAX_ROWS * GROUP]);
 
+/// What one slot of [`LocalMem::expanded`] holds.
+///
+/// `repr(C)` so the pair really is `tmp` in the low half of a word and `may` in
+/// the high half, which is how [`Spread::spreadout`] reads it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Expanded {
+    /// The losses this slot spreads.
+    tmp: u32,
+    /// The most it could ever spread.
+    may: u32,
+}
+
 impl<T> std::ops::Deref for Padded<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
@@ -392,9 +405,13 @@ pub struct LocalMem {
     wins: Padded<u32>,
     status: Padded<u32>,
     /// Per king position, `status` and the not won states expanded for the
-    /// card mask of the current move group. Interleaved because [`Spread`]
-    /// wants both at the same index. See [`Spread::expanded`].
-    expanded: Padded<(u32, u32)>,
+    /// card mask of the current move group.
+    ///
+    /// Side by side, and in that order, because both ends want it: the build
+    /// writes the two as one contiguous stream of the width the expansion
+    /// already works in, and [`Spread`] reads the pair as the single word it
+    /// tests the target against. See [`Spread::expanded`].
+    expanded: Padded<Expanded>,
     moves: Vec<PreparedMove>,
 }
 
@@ -403,7 +420,7 @@ impl LocalMem {
         Self {
             wins: Padded([0; MAX_ROWS * GROUP]),
             status: Padded([0; MAX_ROWS * GROUP]),
-            expanded: Padded([(0, 0); MAX_ROWS * GROUP]),
+            expanded: Padded([Expanded { tmp: 0, may: 0 }; MAX_ROWS * GROUP]),
             moves: vec![],
         }
     }
@@ -540,7 +557,10 @@ pub struct Spread<'a> {
     /// bounded by the states that are not won. That bound shrinks over time
     /// while the target only gains bits, so once the target subsumes it the
     /// chunk is done contributing, for good.
-    expanded: &'a [(u32, u32)],
+    ///
+    /// Read as one word per slot: the target broadcast into both halves turns
+    /// the two tests into one and against the pair. See [`Spread::spreadout`].
+    expanded: &'a [Expanded],
 }
 
 /// What a [`Spread`] did, and whether it could ever do anything again.
