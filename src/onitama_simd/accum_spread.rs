@@ -2,7 +2,7 @@ use std::{
     simd::{
         cmp::{SimdPartialEq, SimdPartialOrd},
         num::SimdUint,
-        Mask, Select, Simd,
+        simd_swizzle, Mask, Select, Simd,
     },
     slice::from_raw_parts,
     sync::atomic::Ordering,
@@ -10,7 +10,7 @@ use std::{
 
 use bit_iter::BitIter;
 
-use super::{Chunk, PreparedMove, Spread, SpreadStatus, PAD};
+use super::{Chunk, PreparedMove, Spread, SpreadStatus, MAX_ROWS, PAD};
 
 /// Add what every move says about the source chunk.
 ///
@@ -20,7 +20,7 @@ use super::{Chunk, PreparedMove, Spread, SpreadStatus, PAD};
 /// offset is one and per move and a single not and mask at the end of it. And
 /// is associative, so that accumulator stays in a register instead of being an
 /// or back into `status` per move, and the ors across offsets stay in one too,
-/// which leaves one store per row for the whole chunk.
+/// which leaves one store per vector of rows for the whole chunk.
 ///
 /// Both dimensions keep their order apart from the squares the move touches.
 /// The row the king moved off is the only one that does not map to itself, and
@@ -30,39 +30,79 @@ use super::{Chunk, PreparedMove, Spread, SpreadStatus, PAD};
 /// move takes that king for every card it has, so the slot is won and anything
 /// claiming it is not lost is true there.
 pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
-    let lane = Simd::<u32, PAD>::from_array(std::array::from_fn(|k| k as u32));
+    /// Rows taken at a time, so one vector holds this many of them side by
+    /// side. Every row of a chunk fits in one at the sizes this is built for.
+    const ROWS: usize = 4;
+    /// Slots in that vector.
+    const WIDE: usize = PAD * ROWS;
+
+    // the square of each row, so the walks below index it instead of stepping a
+    // bit iterator they cannot start in the middle of
+    let mut kings = [0usize; MAX_ROWS];
+    for (slot, king0) in kings.iter_mut().zip(BitIter::from(chunk.rows)) {
+        *slot = king0;
+    }
+    let height = chunk.height;
 
     // `moves` is built offset by offset, so an offset is a run of it. Taking
     // those on the outside keeps the handful of chunks one offset reads hot
     // across the rows, instead of walking every chunk again for each row
     for group in moves.chunk_by(|a, b| a.mask == b.mask) {
-        let card = Simd::splat(group[0].mask);
+        let card = Simd::<u32, WIDE>::splat(group[0].mask);
 
-        for (r, king0) in BitIter::from(chunk.rows).enumerate() {
-            let mut all = Simd::splat(u32::MAX);
+        for gs in (0..height).step_by(ROWS) {
+            let mut all = Simd::<u32, WIDE>::splat(u32::MAX);
 
             for mv in group {
                 let (from, to) = mv.step;
-                // the king moved exactly when it was the piece on `from`
-                let new0 = if king0 == from { to } else { king0 };
-                if new0 == 22 {
-                    // onto its own temple, so it has already won and there is
-                    // no state over there to read. Leaving `all` alone drops
-                    // this move out of the offset, which is what that means
-                    continue;
+                let width_new = mv.width_new as usize;
+
+                // Only the rows differ between these, and only in where they
+                // read: the columns permute the same way for all of them, so
+                // the rotate and the select below are one go for the lot.
+                //
+                // A row that is not there, and one whose king moved onto its
+                // own temple, read nothing and stay all ones. That is the
+                // identity of the and, which is what dropping them means.
+                let mut part = [Simd::<u32, PAD>::splat(u32::MAX); ROWS];
+                for (i, slot) in part.iter_mut().enumerate() {
+                    let r = gs + i;
+                    if r >= height {
+                        break;
+                    }
+                    let king0 = kings[r];
+                    // the king moved exactly when it was the piece on `from`
+                    let new0 = if king0 == from { to } else { king0 };
+                    if new0 == 22 {
+                        continue;
+                    }
+                    let tbase = (mv.rows_new & (1 << new0) - 1).count_ones() as usize * width_new;
+                    // a row is read whole however short it is, which the `PAD`
+                    // of slack on the table is there to let the last one do
+                    *slot = Simd::from_slice(unsafe { from_raw_parts(mv.src().add(tbase), PAD) });
                 }
 
-                let width_new = mv.width_new as usize;
-                let tbase = (mv.rows_new & (1 << new0) - 1).count_ones() as usize * width_new;
-                let src: Simd<u32, PAD> =
-                    Simd::from_slice(unsafe { from_raw_parts(mv.src().add(tbase), PAD) });
-
-                let shifted = src.rotate_elements_right::<1>();
-                all &= lane.simd_lt(Simd::splat(mv.split as u32)).select(src, shifted);
+                let low = simd_swizzle!(part[0], part[1], [0, 1, 2, 3, 4, 5, 6, 7]);
+                let high = simd_swizzle!(part[2], part[3], [0, 1, 2, 3, 4, 5, 6, 7]);
+                let src: Simd<u32, WIDE> = simd_swizzle!(
+                    low,
+                    high,
+                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+                );
+                // the rotate is per row, so it stays inside each row's slots
+                let shifted = simd_swizzle!(
+                    src,
+                    [3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14]
+                );
+                // the same columns in every row, which is the move's mask once
+                // per row. It is `PAD` wide and never carries, so spreading it
+                // over the rows is a multiply
+                let keep = Mask::<i32, WIDE>::from_bitmask(mv.keep as u64 * 0x1111);
+                all &= keep.select(src, shifted);
             }
 
             // if no move of this offset is won, then the state is not lost
-            let row = unsafe { status.get_unchecked_mut(r * PAD..r * PAD + PAD) };
+            let row = unsafe { status.get_unchecked_mut(gs * PAD..gs * PAD + WIDE) };
             (Simd::from_slice(row) | (!all & card)).copy_to_slice(row);
         }
     }

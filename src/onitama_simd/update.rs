@@ -84,6 +84,9 @@ impl Update<'_> {
                 } else {
                     (chunk.cols & (1 << to) - 1).count_ones()
                 };
+                // the lanes below the break, which is every lane when there is
+                // no capture to break the row
+                let keep = ((1u32 << split) - 1) as u8;
                 mem.moves.push(PreparedMove {
                     bit: 0,
                     step: (from, to),
@@ -91,7 +94,7 @@ impl Update<'_> {
                     new,
                     rows_new: new.pieces0 & !(1 << 22),
                     width_new: width_new as u8,
-                    split: split as u8,
+                    keep,
                     target,
                 });
             }
@@ -228,7 +231,7 @@ impl Update<'_> {
                     new,
                     rows_new: 0,
                     width_new: 0,
-                    split: 0,
+                    keep: 0,
                     target,
                 });
             }

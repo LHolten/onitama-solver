@@ -440,11 +440,16 @@ pub struct PreparedMove {
     step: (usize, usize),
     mask: u32,
     new: TeamLayout,
-    /// The target's rows, how long one of them is, and the column a capture
-    /// takes out of the source. Only the accumulate reads these.
+    /// The target's rows, how long one of them is, and which of its columns
+    /// read the source column of the same number rather than the one after.
+    ///
+    /// That last one is a property of the move, not of the row, so it is the
+    /// lane mask itself and not the column to compare against: the walk reads
+    /// it straight into a mask register instead of rebuilding it per row.
+    /// Only the accumulate reads these.
     rows_new: u32,
     width_new: u8,
-    split: u8,
+    keep: u8,
     // borrows from the tables in `AllTables`, which outlive every update
     target: *const [AtomicU32],
 }
