@@ -84,9 +84,9 @@ impl Update<'_> {
                 } else {
                     (chunk.cols & (1 << to) - 1).count_ones()
                 };
-                // the lanes below the break, which is every lane when there is
-                // no capture to break the row
-                let keep = ((1u32 << split) - 1) as u8;
+                // the lanes below the break, which is every lane when there
+                // is no capture to break the row, in every row of a vector
+                let keep = (((1u32 << split) - 1) * 0x1111) as u16;
                 mem.moves.push(PreparedMove {
                     bit: 0,
                     step: (from, to),
@@ -101,7 +101,8 @@ impl Update<'_> {
         }
 
         let LocalMem { status, moves, .. } = &mut *mem;
-        status[..padded].fill(0);
+        // no clearing first: `accumulate` writes every slot it covers, and it
+        // covers the whole of `padded`
         accumulate(chunk, moves, status);
 
         // we expand, marking all states that are not lost because it has the card

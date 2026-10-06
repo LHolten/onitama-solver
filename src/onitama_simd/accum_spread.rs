@@ -12,6 +12,30 @@ use bit_iter::BitIter;
 
 use super::{Chunk, PreparedMove, Spread, SpreadStatus, MAX_ROWS, PAD};
 
+/// `src` read through `idx`, with every lane `keep` leaves out zeroed.
+///
+/// One instruction where the permutation it stands for is a rotate, a broadcast
+/// and two selects, and the zeroing is the same instruction's mask rather than
+/// an and per test that reads the result.
+#[inline(always)]
+fn pick(src: Simd<u64, PAD>, idx: Simd<u64, PAD>, keep: Mask<i64, PAD>) -> Simd<u64, PAD> {
+    #[cfg(target_feature = "avx512vl")]
+    unsafe {
+        use std::arch::x86_64::_mm256_maskz_permutexvar_epi64;
+        _mm256_maskz_permutexvar_epi64(keep.to_bitmask() as u8, idx.into(), src.into()).into()
+    }
+    #[cfg(not(target_feature = "avx512vl"))]
+    {
+        let mut out = [0; PAD];
+        for (k, slot) in out.iter_mut().enumerate() {
+            if keep.test(k) {
+                *slot = src[idx[k] as usize];
+            }
+        }
+        Simd::from_array(out)
+    }
+}
+
 /// Add what every move says about the source chunk.
 ///
 /// The moves come off the card offsets, so every move of one offset carries the
@@ -44,13 +68,16 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
     }
     let height = chunk.height;
 
-    // `moves` is built offset by offset, so an offset is a run of it. Taking
-    // those on the outside keeps the handful of chunks one offset reads hot
-    // across the rows, instead of walking every chunk again for each row
-    for group in moves.chunk_by(|a, b| a.mask == b.mask) {
-        let card = Simd::<u32, WIDE>::splat(group[0].mask);
+    // The rows on the outside and the offsets within, so what every offset
+    // contributes to these rows adds up in a register and `status` is written
+    // once. It is also the only write, which is what lets the caller hand this
+    // whatever it last held rather than zeroing it first.
+    for gs in (0..height).step_by(ROWS) {
+        let mut acc = Simd::<u32, WIDE>::splat(0);
 
-        for gs in (0..height).step_by(ROWS) {
+        // `moves` is built offset by offset, so an offset is a run of it
+        for group in moves.chunk_by(|a, b| a.mask == b.mask) {
+            let card = Simd::<u32, WIDE>::splat(group[0].mask);
             let mut all = Simd::<u32, WIDE>::splat(u32::MAX);
 
             for mv in group {
@@ -70,7 +97,9 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
                     if r >= height {
                         break;
                     }
-                    let king0 = kings[r];
+                    // `r` is bounded by `height`, which is `MAX_ROWS` at
+                    // most, but that is not something the walk makes obvious
+                    let king0 = unsafe { *kings.get_unchecked(r) };
                     // the king moved exactly when it was the piece on `from`
                     let new0 = if king0 == from { to } else { king0 };
                     if new0 == 22 {
@@ -94,17 +123,16 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
                     src,
                     [3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14]
                 );
-                // the same columns in every row, which is the move's mask once
-                // per row. It is `PAD` wide and never carries, so spreading it
-                // over the rows is a multiply
-                let keep = Mask::<i32, WIDE>::from_bitmask(mv.keep as u64 * 0x1111);
+                let keep = Mask::<i32, WIDE>::from_bitmask(mv.keep as u64);
                 all &= keep.select(src, shifted);
             }
 
             // if no move of this offset is won, then the state is not lost
-            let row = unsafe { status.get_unchecked_mut(gs * PAD..gs * PAD + WIDE) };
-            (Simd::from_slice(row) | (!all & card)).copy_to_slice(row);
+            acc |= !all & card;
         }
+
+        let row = unsafe { status.get_unchecked_mut(gs * PAD..gs * PAD + WIDE) };
+        acc.copy_to_slice(row);
     }
 }
 
@@ -153,13 +181,19 @@ impl Spread<'_> {
         let lane = Simd::<u64, PAD>::from_array(std::array::from_fn(|k| k as u64));
         let at_p = lane.simd_eq(Simd::splat(p as u64));
         // the run is the columns strictly between the two, which is the half
-        // open interval on whichever side the piece moved
-        let run = if p > f {
-            lane.simd_ge(Simd::splat(f as u64)) & lane.simd_lt(Simd::splat(p as u64))
+        // open interval on whichever side the piece moved, and it steps towards
+        // the slot the piece left
+        let (run, step) = if p > f {
+            let run = lane.simd_ge(Simd::splat(f as u64)) & lane.simd_lt(Simd::splat(p as u64));
+            (run, lane + Simd::splat(1))
         } else {
-            lane.simd_gt(Simd::splat(p as u64)) & lane.simd_le(Simd::splat(f as u64))
+            let run = lane.simd_gt(Simd::splat(p as u64)) & lane.simd_le(Simd::splat(f as u64));
+            (run, lane - Simd::splat(1))
         };
         let live = lane.simd_lt(Simd::splat(width_new as u64)) & !(at_p & Mask::splat(gone));
+        // which slot every column reads, which is the whole mapping and the
+        // same for every row, so it is settled once for the move
+        let idx = at_p.select(Simd::splat(f as u64), run.select(step, lane));
 
         let target = self.target.as_ptr();
         // the pair is one word, so a row of them is one vector
@@ -169,8 +203,10 @@ impl Spread<'_> {
         const LOW: u64 = u32::MAX as u64;
         let zero = Simd::<u64, PAD>::splat(0);
 
-        let mut progress = false;
-        let mut could = false;
+        // every row's news folded together, so what the move still owes and
+        // whether anything went out at all are two tests after the walk rather
+        // than a compare, a mask test and a fold per row
+        let mut seen = Simd::<u64, PAD>::splat(0);
         let mut new_i = 0;
         let mut row = 0;
         for king0 in BitIter::from(rows_new) {
@@ -188,13 +224,9 @@ impl Spread<'_> {
             row += 1;
 
             let src = Simd::<u64, PAD>::from_slice(unsafe { from_raw_parts(row_at(base), PAD) });
-            let shifted = if p > f {
-                src.rotate_elements_left::<1>()
-            } else {
-                src.rotate_elements_right::<1>()
-            };
-            let moved = Simd::splat(unsafe { *row_at(base + f) });
-            let pair = at_p.select(moved, run.select(shifted, src));
+            // the dead columns come back zeroed, which is what every test below
+            // would otherwise have to mask off one by one
+            let pair = pick(src, idx, live);
 
             // the row of the target is contiguous, and the table carries `PAD`
             // of slack precisely so the last one can be read whole
@@ -209,20 +241,15 @@ impl Spread<'_> {
             // is going out taken off it already, so nothing in either means
             // the row has nothing to say and each half then wants its own test
             let news = pair & !both;
-            let any = news.simd_ne(zero) & live;
-            if !any.any() {
+            if !news.simd_ne(zero).any() {
                 continue;
             }
+            seen |= news;
 
-            // the high half is what this move would still owe the target once
-            // this row's write has landed, which is what keeps it alive
-            could |= ((news & Simd::splat(LOW << 32)).simd_ne(zero) & live).any();
-
-            let todo = (news & Simd::splat(LOW)).simd_ne(zero) & live;
+            let todo = (news & Simd::splat(LOW)).simd_ne(zero);
             if !todo.any() {
                 continue;
             }
-            progress = true;
             // The write is an atomic read modify write per column, which no
             // vector does. By here it is the rare case though: a row with
             // nothing to say leaves above, all of it at once.
@@ -232,14 +259,26 @@ impl Spread<'_> {
             // built on a stale read drops the other's bits; the move that lost
             // them can have retired on a read taken before the store landed,
             // and then nobody writes them ever again.
+            // Off the bitmask rather than off the mask itself, which tests a
+            // lane by pulling it into a register and comparing it.
+            //
+            // The column still has to be the constant the unrolling makes it,
+            // and not a bit walked out of the mask: a lane picked by a runtime
+            // index is one the whole vector has to be on the stack for, and
+            // that spill lands on every row rather than on the few that write
+            let bits = todo.to_bitmask();
             for col in 0..PAD {
-                if todo.test(col) {
+                if bits >> col & 1 != 0 {
                     let slot = unsafe { &*target.add(new_i - width_new + col) };
                     slot.fetch_or(pair[col] as u32, Ordering::Relaxed);
                 }
             }
         }
 
-        SpreadStatus { progress, could }
+        SpreadStatus {
+            // the losses that went out, and the bound still owed beyond them
+            progress: (seen & Simd::splat(LOW)).simd_ne(zero).any(),
+            could: (seen & Simd::splat(LOW << 32)).simd_ne(zero).any(),
+        }
     }
 }

@@ -448,11 +448,13 @@ pub struct PreparedMove {
     ///
     /// That last one is a property of the move, not of the row, so it is the
     /// lane mask itself and not the column to compare against: the walk reads
-    /// it straight into a mask register instead of rebuilding it per row.
-    /// Only the accumulate reads these.
+    /// it straight into a mask register instead of rebuilding it per row. It
+    /// is already spread over the rows of a vector too, since that is the same
+    /// mask in each of them and it never carries. Only the accumulate reads
+    /// these.
     rows_new: u32,
     width_new: u8,
-    keep: u8,
+    keep: u16,
     // borrows from the tables in `AllTables`, which outlive every update
     target: *const [AtomicU32],
 }
