@@ -115,31 +115,57 @@ impl<'a> TableJob<'a> {
             .sum()
     }
 
-    /// Write the wins in one, which are the seed of the whole solve.
+    /// Blocks of layouts this job covers, which is what seeding is split into.
+    pub fn blocks(&self) -> usize {
+        self.live.len() / BLOCK
+    }
+
+    /// Write the wins in one of one block, which is the seed of the solve.
     ///
-    /// A chunk's cards are gathered before the write, so this is one
-    /// `fetch_or` per king position rather than one per card.
-    pub fn mark_ez_win(&self) {
+    /// A block rather than a whole table, so that seeding every table is one
+    /// flat walk: the small tables have nowhere near enough layouts to fill the
+    /// machine on their own, and a table at a time is a barrier at the end of
+    /// each.
+    ///
+    /// A chunk's cards are gathered before the write, so this is one write per
+    /// king position rather than one per card, and a plain store rather than an
+    /// or into what is there: this runs before any table is solved, so the
+    /// tables still hold the zeros they were allocated with, and a layout is
+    /// the only one that writes its own chunk.
+    pub fn seed_block(&self, b: usize) {
         let counts = self.update.current.counts;
         let table = self.tb.index_count(counts);
 
-        self.map_live(|layout| {
-            // the slice only depends on the layout, so look it up once
-            let slice = table.index(layout).slice;
+        let start = b * BLOCK;
+        let mut cursor = LayoutCursor::new(counts);
+        for (g, group) in self.live[start..][..BLOCK].chunks(GROUP).enumerate() {
+            // a retired run is rejected by one scan that stops at the first
+            // live layout, instead of a branch per layout
+            if group.iter().all(|&moves| moves == 0) {
+                continue;
+            }
+            let start = start + g * GROUP;
+            for (j, &moves) in group.iter().enumerate() {
+                if moves == 0 {
+                    continue;
+                }
+                let layout = cursor.at(start + j);
+                // the slice only depends on the layout, so look it up once
+                let slice = table.index(layout).slice;
 
-            let mut acc = [0u32; PAD * PAD];
-            // mask is the future cards
-            self.tb.ez_win_for_each(counts, layout, &mut |i, mask| {
-                acc[i] |= Block(mask).invert().expand().0;
-            });
+                let mut acc = [0u32; PAD * PAD];
+                // mask is the future cards
+                self.tb.ez_win_for_each(counts, layout, &mut |i, mask| {
+                    acc[i] |= Block(mask).invert().expand().0;
+                });
 
-            for (val, &new) in slice.iter().zip(&acc) {
-                if new != 0 {
-                    val.fetch_or(new, Ordering::Relaxed);
+                for (val, &new) in slice.iter().zip(&acc) {
+                    if new != 0 {
+                        val.store(new, Ordering::Relaxed);
+                    }
                 }
             }
-            0
-        });
+        }
     }
 }
 

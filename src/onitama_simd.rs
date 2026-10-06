@@ -672,11 +672,18 @@ impl AllTables {
                 jobs.push(TableJob::new(&tb, counts.invert()));
             }
         }
-        for jobs in &schedule {
-            for job in jobs {
-                job.mark_ez_win();
-            }
-        }
+        // All of them at once rather than a table at a time: the small ones
+        // have nowhere near enough layouts to fill the machine on their own,
+        // and taken one by one each is a barrier at the end of it.
+        let all: Vec<(&TableJob, usize)> = schedule
+            .iter()
+            .flatten()
+            .flat_map(|job| (0..job.blocks()).map(move |b| (job, b)))
+            .collect();
+        #[cfg(feature = "parallell")]
+        all.par_iter().for_each(|&(job, b)| job.seed_block(b));
+        #[cfg(not(feature = "parallell"))]
+        all.iter().for_each(|&(job, b)| job.seed_block(b));
 
         for (total, mut jobs) in schedule.into_iter().enumerate() {
             if jobs.is_empty() {
