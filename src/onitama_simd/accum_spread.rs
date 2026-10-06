@@ -205,23 +205,33 @@ impl Spread<'_> {
             new_i += width_new;
 
             // what the pair says that the target does not have yet, in both
-            // halves at once. The losses are a subset of the bound, so the high
-            // half empty means the low one is too and the row is finished
+            // halves at once. The two are disjoint, since the bound has what
+            // is going out taken off it already, so nothing in either means
+            // the row has nothing to say and each half then wants its own test
             let news = pair & !both;
-            let can = (news & Simd::splat(LOW << 32)).simd_ne(zero) & live;
-            if !can.any() {
+            let any = news.simd_ne(zero) & live;
+            if !any.any() {
                 continue;
             }
-            could = true;
+
+            // the high half is what this move would still owe the target once
+            // this row's write has landed, which is what keeps it alive
+            could |= ((news & Simd::splat(LOW << 32)).simd_ne(zero) & live).any();
 
             let todo = (news & Simd::splat(LOW)).simd_ne(zero) & live;
             if !todo.any() {
                 continue;
             }
             progress = true;
-            // the write is an atomic read modify write per column, which no
+            // The write is an atomic read modify write per column, which no
             // vector does. By here it is the rare case though: a row with
-            // nothing to say leaves above, all of it at once
+            // nothing to say leaves above, all of it at once.
+            //
+            // It has to be the exchange and not a store of the read or'd with
+            // the losses. Two chunks spread into the same one, and a store
+            // built on a stale read drops the other's bits; the move that lost
+            // them can have retired on a read taken before the store landed,
+            // and then nobody writes them ever again.
             for col in 0..PAD {
                 if todo.test(col) {
                     let slot = unsafe { &*target.add(new_i - width_new + col) };

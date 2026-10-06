@@ -265,9 +265,14 @@ impl Update<'_> {
                 let src = zip(&status[..padded], &wins[..padded]);
                 for (e, (&s, &w)) in zip(&mut expanded[..padded], src) {
                     // we spread out the loses, these are wins for the previous state
+                    let tmp = Block(s & mask).expand().0;
                     *e = Expanded {
-                        tmp: Block(s & mask).expand().0,
-                        may: Block(!w & mask).expand().0,
+                        tmp,
+                        // what is going out now is taken off the bound here
+                        // rather than in the spread: it does not depend on the
+                        // target, so it is the same for every move that reads
+                        // this slot and for every row it reads it into
+                        may: Block(!w & mask).expand().0 & !tmp,
                     };
                 }
             }

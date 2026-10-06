@@ -196,7 +196,8 @@ struct Padded<T>([T; MAX_ROWS * GROUP]);
 pub struct Expanded {
     /// The losses this slot spreads.
     tmp: u32,
-    /// The most it could ever spread.
+    /// The most it could ever spread beyond those, which is what decides
+    /// whether a move is finished. The two are disjoint.
     may: u32,
 }
 
