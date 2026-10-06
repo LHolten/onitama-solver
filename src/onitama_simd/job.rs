@@ -11,7 +11,7 @@ use crate::{index::Indexer, onitama_simd::LocalMem};
 
 use super::{
     count_indexer, iter::LayoutCursor, AllTables, Block, ImmutableUpdate, PawnCount, TableJob,
-    TeamLayout, Update, BLOCK,
+    TeamLayout, Update, BLOCK, PAD,
 };
 
 /// Layouts covered by one word of [`TableJob::needs_up`], and the granularity
@@ -115,6 +115,10 @@ impl<'a> TableJob<'a> {
             .sum()
     }
 
+    /// Write the wins in one, which are the seed of the whole solve.
+    ///
+    /// A chunk's cards are gathered before the write, so this is one
+    /// `fetch_or` per king position rather than one per card.
     pub fn mark_ez_win(&self) {
         let counts = self.update.current.counts;
         let table = self.tb.index_count(counts);
@@ -122,11 +126,18 @@ impl<'a> TableJob<'a> {
         self.map_live(|layout| {
             // the slice only depends on the layout, so look it up once
             let slice = table.index(layout).slice;
+
+            let mut acc = [0u32; PAD * PAD];
+            // mask is the future cards
             self.tb.ez_win_for_each(counts, layout, &mut |i, mask| {
-                // mask is the future cards
-                let val = unsafe { slice.get(i).unwrap_unchecked() };
-                val.fetch_or(Block(mask).invert().expand().0, Ordering::Relaxed);
+                acc[i] |= Block(mask).invert().expand().0;
             });
+
+            for (val, &new) in slice.iter().zip(&acc) {
+                if new != 0 {
+                    val.fetch_or(new, Ordering::Relaxed);
+                }
+            }
             0
         });
     }

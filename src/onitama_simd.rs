@@ -124,7 +124,6 @@ pub struct AllTables {
     pub block_not_done: AtomicU64,
     pub card_done: AtomicU64,
     pub card_not_done: AtomicU64,
-    pub win_in1: u64,
 }
 
 impl AllTables {
@@ -622,7 +621,7 @@ impl AllTables {
             directions |= card.bitmap::<false>();
         }
 
-        let mut tb = Self {
+        let tb = Self {
             size,
             cards: Cards(cards),
             mask_lookup,
@@ -645,10 +644,8 @@ impl AllTables {
             block_not_done: Default::default(),
             card_done: Default::default(),
             card_not_done: Default::default(),
-            win_in1: 0,
         };
 
-        let mut win_in1 = 0;
         // Everything a table reads is a piece smaller: a take lands in
         // `take_one`, which is one off `count1`. So a whole piece count only
         // ever reads counts below it and none of its own, and the lot can run
@@ -678,7 +675,6 @@ impl AllTables {
         for jobs in &schedule {
             for job in jobs {
                 job.mark_ez_win();
-                win_in1 += job.update.current.count_ones();
             }
         }
 
@@ -716,7 +712,6 @@ impl AllTables {
             println!("finished {pieces} pieces, {tables} tables, in {iters} iterations");
         }
 
-        tb.win_in1 = win_in1;
         tb
     }
 }
@@ -844,14 +839,9 @@ mod tests {
         let wins = tb.count_ones();
         let total = tb.len() * 30;
         println!("{wins} total wins");
-        println!("{} wins in 1", tb.win_in1);
-        println!("{} not win in 1", total - tb.win_in1);
         let unresolved = tb.count_unresolved();
         println!("{unresolved} unresolved states");
-        println!(
-            "{} resolved, not win in 1",
-            total - tb.win_in1 - unresolved
-        );
+        println!("{} resolved states", total - unresolved);
         println!(
             "{} blocks done, {} blocks not done",
             tb.block_done.load(Ordering::Relaxed),

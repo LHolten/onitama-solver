@@ -24,12 +24,10 @@ pub fn main() {
     let wins = tb.count_ones();
     let total = tb.len() * 30;
     println!("{wins} total wins");
-    println!("{} wins in 1", tb.win_in1);
-    println!("{} not win in 1", total - tb.win_in1);
     match count.then(|| tb.count_unresolved()) {
         Some(unresolved) => {
             println!("{unresolved} unresolved states");
-            println!("{} resolved, not win in 1", total - tb.win_in1 - unresolved);
+            println!("{} resolved states", total - unresolved);
         }
         None => println!("unresolved states not counted, pass --unresolved"),
     }
