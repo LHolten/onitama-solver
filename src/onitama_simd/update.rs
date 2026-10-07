@@ -123,12 +123,21 @@ impl Update<'_> {
     pub fn update_layout(mut self, live: &mut u32) -> UpdateStatus {
         let go_up = self.immutable.go_up;
 
-        let unresolved = self.get_unresolved::<false>();
-
+        // The backward moves are located first and read last. Locating one is a
+        // multiset ranking, so its target address is only known at the end of a
+        // long scalar chain and the line it names is a near certain miss;
+        // hoisting the lot up here puts the whole of `get_unresolved` between
+        // every one of those prefetches and the read that wants it, instead of
+        // only the rest of this same walk.
+        let mut scratch = u32::MAX;
         // the `go_up` pass prepares a different set of moves, so the bits would
         // not line up. It only runs once, so there is nothing to remember.
-        let mut scratch = u32::MAX;
-        let res = self.spread_phase(go_up, if go_up { &mut scratch } else { live });
+        let live = if go_up { &mut scratch } else { live };
+        self.prepare_spread(go_up, *live);
+
+        let unresolved = self.get_unresolved::<false>();
+
+        let res = self.run_spread(go_up, live);
 
         // Either way out of the work list is worth spreading up on the spot,
         // because `status` and `wins` are still built here: doing it in the
@@ -138,7 +147,8 @@ impl Update<'_> {
         let went_up = done && {
             // this runs once for the chunk, so there is no mask worth keeping
             let mut all = u32::MAX;
-            let up = self.spread_phase(true, &mut all);
+            self.prepare_spread(true, all);
+            let up = self.run_spread(true, &mut all);
 
             // `unresolved == 0` means every state is settled, so these losses
             // can never grow again and that was the last word.
@@ -162,11 +172,13 @@ impl Update<'_> {
         }
     }
 
-    /// Locate, prefetch and then spread every backward move.
+    /// Locate and prefetch every backward move.
     ///
     /// `up` picks the capture predecessors, which live in the table with one
-    /// more piece, instead of the ones in this table.
-    fn spread_phase(&mut self, up: bool, live: &mut u32) -> SpreadStatus {
+    /// more piece, instead of the ones in this table. `live` is the move mask
+    /// as it stands, which never changes between here and [`Self::run_spread`]:
+    /// only this layout's own update writes it.
+    fn prepare_spread(&mut self, up: bool, live: u32) {
         let layout = self.layout;
         let ImmutableUpdate {
             current,
@@ -176,12 +188,11 @@ impl Update<'_> {
             ..
         } = *self.immutable;
         let TeamLayout { pieces0, pieces1 } = layout;
-        let chunk = Chunk::new(layout);
 
         // same two phase split as in `get_unresolved`: locate and prefetch every
         // target chunk before touching any of them.
         // Cards are now inverted, but it is also the other team, so not inverted.
-        let moves = &mut self.mem.moves;
+        let moves = &mut self.mem.spread;
         moves.clear();
         let mut seen = 0u32;
         for offset in BitIter::from(directions) {
@@ -202,7 +213,7 @@ impl Update<'_> {
                 // a finished move is not even worth locating: `Table::index`
                 // runs the multiset ranking, which is the whole reason for the
                 // prefetch below
-                if bit & !*live != 0 {
+                if bit & !live != 0 {
                     continue;
                 }
 
@@ -237,13 +248,17 @@ impl Update<'_> {
                 });
             }
         }
+    }
 
+    /// Spread every backward move [`Self::prepare_spread`] located.
+    fn run_spread(&mut self, up: bool, live: &mut u32) -> SpreadStatus {
+        let chunk = Chunk::new(self.layout);
         let padded = chunk.padded();
         let LocalMem {
             status,
             wins,
             expanded,
-            moves,
+            spread: moves,
             ..
         } = &mut *self.mem;
 

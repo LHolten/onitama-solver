@@ -416,6 +416,10 @@ pub struct LocalMem {
     /// tests the target against. See [`Spread::expanded`].
     expanded: Padded<Expanded>,
     moves: Vec<PreparedMove>,
+    /// The backward moves, kept apart from `moves` so that locating them can
+    /// run before the accumulate rather than after it. See
+    /// [`Update::prepare_spread`].
+    spread: Vec<PreparedMove>,
 }
 
 impl LocalMem {
@@ -425,6 +429,7 @@ impl LocalMem {
             status: Padded([0; MAX_ROWS * GROUP]),
             expanded: Padded([Expanded { tmp: 0, may: 0 }; MAX_ROWS * GROUP]),
             moves: vec![],
+            spread: vec![],
         }
     }
 }
