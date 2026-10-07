@@ -848,6 +848,38 @@ mod tests {
 
     use super::{mask_iter, AllTables, PawnCount};
 
+    /// How an 8 man table's chunks sit against the cache lines.
+    ///
+    /// A chunk starts at `chunk_size * i` off a page aligned base, so it is
+    /// inside one line exactly when its size divides one. Four of the sixteen
+    /// tables fail that, which is what the second prefetch is there for.
+    #[test]
+    fn chunks_against_lines() {
+        use super::{count_indexer, Indexer, LINE};
+        let (mut bytes, mut straddling, mut padded) = (0u64, 0u64, 0u64);
+        for counts in count_indexer(4) {
+            let chunk = (counts.count0 + 1) as usize * (counts.count1 + 1) as usize * 4;
+            let n = counts.total() as u64;
+            let straddles = chunk > LINE || LINE % chunk != 0;
+            println!(
+                "{counts:?}: chunk {chunk:>3} B x {n:>9} = {:>5.2} GB{}",
+                (chunk as u64 * n) as f64 / 1e9,
+                if straddles { "  STRADDLES" } else { "" },
+            );
+            bytes += chunk as u64 * n;
+            straddling += if straddles { chunk as u64 * n } else { 0 };
+            padded += chunk.next_power_of_two() as u64 * n;
+        }
+        println!(
+            "total {:.2} GB, {:.2} GB of it straddling; padding every chunk to a \
+             power of two would take {:.2} GB (+{:.1}%)",
+            bytes as f64 / 1e9,
+            straddling as f64 / 1e9,
+            padded as f64 / 1e9,
+            (padded as f64 / bytes as f64 - 1.0) * 100.0,
+        );
+    }
+
     #[test]
     fn build_tb() {
         let tb = AllTables::build(3, 0b11111);
