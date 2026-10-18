@@ -16,6 +16,7 @@ bit-iter = "1.1.1"
 rayon = "1.7.0"
 
 [features]
+default = ["parallell"]
 parallell = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
