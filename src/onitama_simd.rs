@@ -377,6 +377,11 @@ impl Table {
         }
     }
 
+    /// The first chunk, which [`locate`] moves along by the rank.
+    fn first(&self) -> *const [AtomicU32] {
+        std::ptr::slice_from_raw_parts(self.list.ptr, self.chunk_size)
+    }
+
     fn count_ones(&self) -> u64 {
         self.list
             .iter()
@@ -469,6 +474,16 @@ impl PreparedMove {
         unsafe { &*self.target }
     }
 
+    /// Move `target` from the first chunk of its table to chunk `rank`, and
+    /// start the miss on it.
+    #[inline(always)]
+    fn offset(&mut self, rank: usize) {
+        let len = self.target.len();
+        let ptr = (self.target as *const AtomicU32).wrapping_add(len * rank);
+        self.target = std::ptr::slice_from_raw_parts(ptr, len);
+        prefetch(self.target());
+    }
+
     /// The target chunk as plain words.
     ///
     /// The accumulate takes a whole padded row at a time, which no atomic load
@@ -477,6 +492,31 @@ impl PreparedMove {
     /// it found, which is what a relaxed load would have given anyway.
     fn src(&self) -> *const u32 {
         self.target().as_ptr() as *const u32
+    }
+}
+
+/// Point every move at its target chunk, and prefetch it.
+///
+/// Each `target` comes in as [`Table::first`] of its table, and leaves as the
+/// chunk of `new` in it. The ranks are taken sixteen at a time, which is what
+/// pulling them out of the walk that builds the moves buys: see
+/// [`iter::ranking16`].
+fn locate(moves: &mut [PreparedMove]) {
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
+    for batch in moves.chunks_mut(16) {
+        use std::simd::Simd;
+        let (mut s_1, mut s_2) = ([0; 16], [0; 16]);
+        for (k, mv) in batch.iter().enumerate() {
+            (s_1[k], s_2[k]) = (mv.new.pieces0, mv.new.pieces1);
+        }
+        let ranks = iter::ranking16(Simd::from_array(s_1), Simd::from_array(s_2));
+        for (mv, &rank) in zip(batch, ranks.as_array()) {
+            mv.offset(rank as usize);
+        }
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512cd")))]
+    for mv in moves {
+        mv.offset(iter::ranking(mv.new.pieces0, mv.new.pieces1));
     }
 }
 

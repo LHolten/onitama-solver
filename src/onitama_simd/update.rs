@@ -8,7 +8,7 @@ use bit_iter::BitIter;
 use crate::card::offset_mask_fixed as offset_mask;
 
 use super::{
-    accum_spread::accumulate, prefetch, Block, Chunk, Expanded, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
+    accum_spread::accumulate, locate, prefetch, Block, Chunk, Expanded, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
     SpreadStatus, TeamLayout, Update, BLOCK_MASK, PAD,
 };
 
@@ -74,8 +74,6 @@ impl Update<'_> {
                     current
                 };
 
-                let target = table.index(new).slice;
-                prefetch(target);
                 let width_new = (new.pieces1 & !(1 << 2)).count_ones();
                 // the column a capture takes out of the source, which is where
                 // the row breaks; without one it never does
@@ -95,10 +93,12 @@ impl Update<'_> {
                     rows_new: new.pieces0 & !(1 << 22),
                     width_new: width_new as u8,
                     keep,
-                    target,
+                    // `locate` takes it from here to the chunk of `new`
+                    target: table.first(),
                 });
             }
         }
+        locate(&mut mem.moves);
 
         let LocalMem { status, moves, .. } = &mut *mem;
         // no clearing first: `accumulate` writes every slot it covers, and it
@@ -234,8 +234,6 @@ impl Update<'_> {
                     current
                 };
 
-                let target = table.index(new).slice;
-                prefetch(target);
                 moves.push(PreparedMove {
                     bit,
                     step: (from, to),
@@ -244,10 +242,12 @@ impl Update<'_> {
                     rows_new: 0,
                     width_new: 0,
                     keep: 0,
-                    target,
+                    // `locate` takes it from here to the chunk of `new`
+                    target: table.first(),
                 });
             }
         }
+        locate(moves);
     }
 
     /// Spread every backward move [`Self::prepare_spread`] located.
