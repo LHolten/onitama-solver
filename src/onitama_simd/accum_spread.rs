@@ -2,7 +2,7 @@ use std::{
     simd::{
         cmp::{SimdPartialEq, SimdPartialOrd},
         num::SimdUint,
-        simd_swizzle, Mask, Select, Simd,
+        Mask, Select, Simd,
     },
     slice::from_raw_parts,
     sync::atomic::Ordering,
@@ -74,6 +74,11 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
     // whatever it last held rather than zeroing it first.
     for gs in (0..height).step_by(ROWS) {
         let mut acc = Simd::<u32, WIDE>::splat(0);
+        // the square of the row every slot is in, the column it is, and the
+        // slots of the rows that are there
+        let king = Simd::<u32, WIDE>::from_array(std::array::from_fn(|l| kings[gs + l / PAD] as u32));
+        let col = Simd::<u32, WIDE>::from_array(std::array::from_fn(|l| (l % PAD) as u32));
+        let rows = ((1u32 << (height - gs).min(ROWS) * PAD) - 1) as u16;
 
         // `moves` is built offset by offset, so an offset is a run of it
         for group in moves.chunk_by(|a, b| a.mask == b.mask) {
@@ -82,49 +87,93 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
 
             for mv in group {
                 let (from, to) = mv.step;
-                let width_new = mv.width_new as usize;
 
-                // Only the rows differ between these, and only in where they
-                // read: the columns permute the same way for all of them, so
-                // the rotate and the select below are one go for the lot.
-                //
                 // A row that is not there, and one whose king moved onto its
                 // own temple, read nothing and stay all ones. That is the
                 // identity of the and, which is what dropping them means.
-                let mut part = [Simd::<u32, PAD>::splat(u32::MAX); ROWS];
-                for (i, slot) in part.iter_mut().enumerate() {
-                    let r = gs + i;
-                    if r >= height {
-                        break;
-                    }
-                    // `r` is bounded by `height`, which is `MAX_ROWS` at
-                    // most, but that is not something the walk makes obvious
-                    let king0 = unsafe { *kings.get_unchecked(r) };
-                    // the king moved exactly when it was the piece on `from`
-                    let new0 = if king0 == from { to } else { king0 };
-                    if new0 == 22 {
-                        continue;
-                    }
-                    let tbase = (mv.rows_new & (1 << new0) - 1).count_ones() as usize * width_new;
-                    // a row is read whole however short it is, which the `PAD`
-                    // of slack on the table is there to let the last one do
-                    *slot = Simd::from_slice(unsafe { from_raw_parts(mv.src().add(tbase), PAD) });
-                }
+                #[cfg(all(target_feature = "avx512f", target_feature = "avx512vpopcntdq"))]
+                {
+                    use std::arch::x86_64::{
+                        _mm512_mask_and_epi32, _mm512_mask_cmpneq_epu32_mask, _mm512_maskz_loadu_epi32,
+                        _mm512_permutexvar_epi32, _mm512_set1_epi32, _mm512_sllv_epi32,
+                    };
+                    // Every slot reads one word of the target, so the whole move
+                    // is one permute out of a register: the target is at most
+                    // `PAD` by `PAD`, which is a single vector, and the row
+                    // remap, the column rotate and the select all go into the
+                    // index. That index is worked out for every slot at once,
+                    // where the rows used to be a scalar chain each.
+                    //
+                    // The king moved exactly when it was the piece on `from`, and
+                    // where its row lands is its rank among the target's rows.
+                    let moved = king.simd_eq(Simd::splat(from as u32));
+                    let new0 = moved.select(Simd::splat(to as u32), king);
+                    // the shift is the instruction's own, which needs no
+                    // masking of the count the way `<<` does
+                    let below: Simd<u32, WIDE> = unsafe {
+                        _mm512_sllv_epi32(Simd::splat(u32::MAX).into(), new0.into()).into()
+                    };
+                    let rank = (!below & Simd::splat(mv.rows_new)).count_ones();
+                    let idx = rank * Simd::splat(mv.width_new as u32) + col;
+                    // the columns past the break read the one before
+                    let keep = Mask::<i32, WIDE>::from_bitmask(mv.keep as u64);
+                    let idx = keep.select(idx, idx - Simd::splat(1));
 
-                let low = simd_swizzle!(part[0], part[1], [0, 1, 2, 3, 4, 5, 6, 7]);
-                let high = simd_swizzle!(part[2], part[3], [0, 1, 2, 3, 4, 5, 6, 7]);
-                let src: Simd<u32, WIDE> = simd_swizzle!(
-                    low,
-                    high,
-                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-                );
-                // the rotate is per row, so it stays inside each row's slots
-                let shifted = simd_swizzle!(
-                    src,
-                    [3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14]
-                );
-                let keep = Mask::<i32, WIDE>::from_bitmask(mv.keep as u64);
-                all &= keep.select(src, shifted);
+                    // the target's own length, which is all of it there is
+                    let size = mv.rows_new.count_ones() * mv.width_new as u32;
+                    unsafe {
+                        // a king onto its own temple reads nothing, like a row
+                        // that is not there; one compare under the rows' mask
+                        // keeps that in a mask register
+                        let live = _mm512_mask_cmpneq_epu32_mask(rows, new0.into(), _mm512_set1_epi32(22));
+                        // the lanes past the target are masked off, so they
+                        // neither read nor fault even at the end of the table
+                        let src = _mm512_maskz_loadu_epi32(((1u32 << size) - 1) as u16, mv.src().cast());
+                        let picked = _mm512_permutexvar_epi32(idx.into(), src);
+                        all = _mm512_mask_and_epi32(all.into(), live, all.into(), picked).into();
+                    }
+                }
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512vpopcntdq")))]
+                {
+                    use std::simd::simd_swizzle;
+                    let _ = (king, col, rows);
+                    let width_new = mv.width_new as usize;
+                    // Only the rows differ between these, and only in where they
+                    // read: the columns permute the same way for all of them, so
+                    // the rotate and the select below are one go for the lot.
+                    let mut part = [Simd::<u32, PAD>::splat(u32::MAX); ROWS];
+                    for (i, slot) in part.iter_mut().enumerate() {
+                        let r = gs + i;
+                        if r >= height {
+                            break;
+                        }
+                        // `r` is bounded by `height`, which is `MAX_ROWS` at
+                        // most, but that is not something the walk makes obvious
+                        let king0 = unsafe { *kings.get_unchecked(r) };
+                        // the king moved exactly when it was the piece on `from`
+                        let new0 = if king0 == from { to } else { king0 };
+                        if new0 == 22 {
+                            continue;
+                        }
+                        let tbase = (mv.rows_new & (1 << new0) - 1).count_ones() as usize * width_new;
+                        // a row is read whole however short it is, which the `PAD`
+                        // of slack on the table is there to let the last one do
+                        *slot = Simd::from_slice(unsafe { from_raw_parts(mv.src().add(tbase), PAD) });
+                    }
+
+                    let low = simd_swizzle!(part[0], part[1], [0, 1, 2, 3, 4, 5, 6, 7]);
+                    let high = simd_swizzle!(part[2], part[3], [0, 1, 2, 3, 4, 5, 6, 7]);
+                    let src: Simd<u32, WIDE> = simd_swizzle!(
+                        low,
+                        high,
+                        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+                    );
+                    // the rotate is per row, so it stays inside each row's slots
+                    let shifted =
+                        simd_swizzle!(src, [3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14]);
+                    let keep = Mask::<i32, WIDE>::from_bitmask(mv.keep as u64);
+                    all &= keep.select(src, shifted);
+                }
             }
 
             // if no move of this offset is won, then the state is not lost
