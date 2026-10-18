@@ -542,9 +542,12 @@ pub struct ImmutableUpdate<'a> {
     directions: u32,
 }
 
-pub struct Update<'a> {
+/// `'a` is how long this one update borrows its scratch, and `'t` how long the
+/// tables live, which is past it: the mirrored chunk located for the next update
+/// is carried over to it as a plain slice.
+pub struct Update<'a, 't> {
     layout: TeamLayout,
-    immutable: &'a ImmutableUpdate<'a>,
+    immutable: &'a ImmutableUpdate<'t>,
     mem: &'a mut LocalMem,
 }
 
@@ -775,8 +778,11 @@ impl AllTables {
 ///
 /// Each block is one parallel task and one recorded seed, so this trades
 /// scheduling overhead against how much of the enumeration has to be replayed
-/// to reach the live layouts of a sparse late pass.
-const BLOCK: usize = 1024;
+/// to reach the live layouts of a sparse late pass. The blocks are handed out
+/// in order (see [`TableJob::next`]), so the threads together cover this many
+/// layouts per thread of the table at a time: 1024 was measured 2% slower at 8
+/// men, 256 5%, and 16384 the same.
+const BLOCK: usize = 4096;
 
 struct TableJob<'a> {
     tb: &'a AllTables,

@@ -1,6 +1,6 @@
 use std::{
     iter::zip,
-    sync::atomic::Ordering,
+    sync::atomic::AtomicU32,
 };
 
 use bit_iter::BitIter;
@@ -8,9 +8,10 @@ use bit_iter::BitIter;
 use crate::card::offset_mask_fixed as offset_mask;
 
 use super::{
-    accum_spread::accumulate, locate, prefetch, Block, Chunk, Expanded, ImmutableUpdate, LocalMem, PreparedMove, Spread, SubTable,
+    accum_spread::accumulate, locate, prefetch, Block, Chunk, Expanded, ImmutableUpdate, LocalMem, PreparedMove, Spread,
     SpreadStatus, TeamLayout, Update, BLOCK_MASK, PAD,
 };
+
 
 pub struct UpdateStatus {
     pub(crate) progress: bool,
@@ -20,9 +21,16 @@ pub struct UpdateStatus {
     pub(crate) went_up: bool,
 }
 
-impl Update<'_> {
+impl<'t> Update<'_, 't> {
     pub fn get_unresolved<const COUNT: bool>(&mut self) -> u64 {
-        let layout = self.layout;
+        let inv = self.prepare_forward(self.layout);
+        self.finish_unresolved::<COUNT>(inv)
+    }
+
+    /// Locate and prefetch the mirrored chunk and every forward move of
+    /// `layout`, which need not be this update's own: see
+    /// [`Self::update_layout`].
+    fn prepare_forward(&mut self, layout: TeamLayout) -> &'t [AtomicU32] {
         let mem = &mut *self.mem;
         let ImmutableUpdate {
             inv_current,
@@ -34,7 +42,7 @@ impl Update<'_> {
         } = *self.immutable;
         let pieces0 = layout.pieces0;
         let chunk = Chunk::new(layout);
-        let padded = chunk.padded();
+
 
         // the mirrored chunk is only read at the very end, but its address does
         // not depend on any of the work in between, so start the miss now
@@ -99,7 +107,15 @@ impl Update<'_> {
             }
         }
         locate(&mut mem.moves);
+        inv_slice.slice
+    }
 
+    /// Build `status` and `wins` from the moves [`Self::prepare_forward`]
+    /// located.
+    fn finish_unresolved<const COUNT: bool>(&mut self, inv: &[AtomicU32]) -> u64 {
+        let chunk = Chunk::new(self.layout);
+        let padded = chunk.padded();
+        let mem = &mut *self.mem;
         let LocalMem { status, moves, .. } = &mut *mem;
         // no clearing first: `accumulate` writes every slot it covers, and it
         // covers the whole of `padded`
@@ -114,13 +130,20 @@ impl Update<'_> {
         // the slots no king position uses are set to won, which makes them
         // resolved and contributes nothing, so the walks below need no bounds
         // of their own
-        mem.wins[..padded].fill(BLOCK_MASK);
-        self.load_stuff(&inv_slice, chunk);
+        self.load_stuff(inv, chunk);
 
         self.check_unresolved::<COUNT>(padded)
     }
 
-    pub fn update_layout(mut self, live: &mut u32) -> UpdateStatus {
+    /// `pre` is what [`Self::prepare_forward`] gave for this layout if the
+    /// previous update already ran it, and `next` the layout to run it for in
+    /// turn. The return carries that on to the next update.
+    pub fn update_layout(
+        mut self,
+        live: &mut u32,
+        pre: Option<&'t [AtomicU32]>,
+        next: Option<TeamLayout>,
+    ) -> (UpdateStatus, Option<&'t [AtomicU32]>) {
         let go_up = self.immutable.go_up;
 
         // The backward moves are located first and read last. Locating one is a
@@ -133,9 +156,12 @@ impl Update<'_> {
         // the `go_up` pass prepares a different set of moves, so the bits would
         // not line up. It only runs once, so there is nothing to remember.
         let live = if go_up { &mut scratch } else { live };
+        let inv = pre.unwrap_or_else(|| self.prepare_forward(self.layout));
         self.prepare_spread(go_up, *live);
-
-        let unresolved = self.get_unresolved::<false>();
+        let unresolved = self.finish_unresolved::<false>(inv);
+        // this layout's forward moves are spent, so their buffer is free for
+        // the next one's, and everything from here on is distance for them
+        let ahead = next.map(|next| self.prepare_forward(next));
 
         let res = self.run_spread(go_up, live);
 
@@ -161,7 +187,7 @@ impl Update<'_> {
             unresolved == 0 || !up.could
         };
 
-        UpdateStatus {
+        let status = UpdateStatus {
             progress: res.progress,
             // a chunk that can never spread anything new again is done, even if
             // some of its own states are still unresolved: it is only kept in
@@ -169,7 +195,8 @@ impl Update<'_> {
             // and only runs once, so leave its bookkeeping alone.
             unresolved: if go_up || res.could { unresolved } else { 0 },
             went_up,
-        }
+        };
+        (status, ahead)
     }
 
     /// Locate and prefetch every backward move.
@@ -367,23 +394,60 @@ impl Update<'_> {
     /// and the other way about. That makes the position it wants a transpose
     /// and two reversals, which is arithmetic on the two counters rather than a
     /// lookup per position.
-    fn load_stuff(&mut self, inv_slice: &SubTable, chunk: Chunk) {
+    fn load_stuff(&mut self, inv: &[AtomicU32], chunk: Chunk) {
         let rows = chunk.height;
         let cols = chunk.width;
 
-        let wins = &mut self.mem.wins[..];
-        let inv = inv_slice.slice;
+        // The whole chunk is one vector, which makes the transpose one permute
+        // and the write one store. That store is also the only thing the walks
+        // after this read `wins` through: a wide load over a run of narrow
+        // stores cannot be forwarded from them and waits for every one of them
+        // to reach the cache, and those stores wait on the mirrored chunk.
+        #[cfg(target_feature = "avx512f")]
+        {
+            use std::arch::x86_64::{_mm512_maskz_loadu_epi32, _mm512_permutexvar_epi32};
+            use std::simd::{cmp::SimdPartialOrd, Select, Simd};
+            const WIDE: usize = PAD * PAD;
+            debug_assert!(chunk.padded() <= WIDE);
+            let lane = Simd::<u32, WIDE>::from_array(std::array::from_fn(|l| l as u32));
+            let (r, c) = (lane / Simd::splat(PAD as u32), lane % Simd::splat(PAD as u32));
+            let (rows, cols) = (Simd::splat(rows as u32), Simd::splat(cols as u32));
+            let idx = (cols - Simd::splat(1) - c) * rows + (rows - Simd::splat(1) - r);
+            let size = chunk.height * chunk.width;
+            let x: Simd<u32, WIDE> = unsafe {
+                let src = _mm512_maskz_loadu_epi32(((1u32 << size) - 1) as u16, inv.as_ptr().cast());
+                _mm512_permutexvar_epi32(idx.into(), src).into()
+            };
+            // `Block::invert`, a lane at a time
+            const MASK0: u32 = 0b001001_001001_001001_001001_001001;
+            const MASK1: u32 = 0b000111_000111_000111_000111_000111;
+            let m0 = Simd::splat(MASK0);
+            let m1 = Simd::splat(MASK1);
+            let x = (x & m0 << 1) << 1 | (x & m0 << 2) >> 1 | (x & m0);
+            let x = (x & m1) << 3 | (x & m1 << 3) >> 3;
+            // the slots no king position uses are set to won, which makes them
+            // resolved and contributes nothing, so the walks below need no
+            // bounds of their own
+            let used = r.simd_lt(rows) & c.simd_lt(cols);
+            let x = used.select(x, Simd::splat(BLOCK_MASK));
+            x.copy_to_slice(&mut self.mem.wins[..WIDE]);
+        }
+        #[cfg(not(target_feature = "avx512f"))]
+        {
+            let wins = &mut self.mem.wins[..];
+            wins[..chunk.padded()].fill(BLOCK_MASK);
 
-        let mut inv_i = 0;
-        for r in 0..cols {
-            let ours = cols - 1 - r;
-            for c in 0..rows {
-                let i = (rows - 1 - c) * PAD + ours;
-                let s = unsafe { wins.get_unchecked_mut(i) };
-                let x = unsafe { inv.get_unchecked(inv_i) };
-                let tmp = x.load(Ordering::Relaxed);
-                *s = Block(tmp).invert().0;
-                inv_i += 1;
+            let mut inv_i = 0;
+            for r in 0..cols {
+                let ours = cols - 1 - r;
+                for c in 0..rows {
+                    let i = (rows - 1 - c) * PAD + ours;
+                    let s = unsafe { wins.get_unchecked_mut(i) };
+                    let x = unsafe { inv.get_unchecked(inv_i) };
+                    let tmp = x.load(std::sync::atomic::Ordering::Relaxed);
+                    *s = Block(tmp).invert().0;
+                    inv_i += 1;
+                }
             }
         }
     }
