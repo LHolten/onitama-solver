@@ -377,9 +377,9 @@ impl Table {
         }
     }
 
-    /// The first chunk, which [`locate`] moves along by the rank.
-    fn first(&self) -> *const [AtomicU32] {
-        std::ptr::slice_from_raw_parts(self.list.ptr, self.chunk_size)
+    /// The chunk at position `rank`, which is what [`locate`] works out.
+    fn chunk(&self, rank: usize) -> &[AtomicU32] {
+        &self.list[self.chunk_size * rank..][..self.chunk_size]
     }
 
     fn count_ones(&self) -> u64 {
@@ -420,11 +420,22 @@ pub struct LocalMem {
     /// already works in, and [`Spread`] reads the pair as the single word it
     /// tests the target against. See [`Spread::expanded`].
     expanded: Padded<Expanded>,
-    moves: Vec<PreparedMove>,
-    /// The backward moves, kept apart from `moves` so that locating them can
+}
+
+/// The moves of the updates in flight, which borrow from the tables.
+///
+/// That keeps them out of [`LocalMem`], which lives in a thread local and so
+/// cannot hold a borrow of anything: these are made per work block instead,
+/// which is often enough for the allocation not to matter.
+#[derive(Default)]
+pub struct Moves<'t> {
+    /// The forward moves, of this update or, once its accumulate is done, of
+    /// the next one: see [`Update::update_layout`].
+    forward: Vec<PreparedMove<'t>>,
+    /// The backward moves, kept apart from `forward` so that locating them can
     /// run before the accumulate rather than after it. See
     /// [`Update::prepare_spread`].
-    spread: Vec<PreparedMove>,
+    spread: Vec<PreparedMove<'t>>,
 }
 
 impl LocalMem {
@@ -433,8 +444,6 @@ impl LocalMem {
             wins: Padded([0; MAX_ROWS * GROUP]),
             status: Padded([0; MAX_ROWS * GROUP]),
             expanded: Padded([Expanded { tmp: 0, may: 0 }; MAX_ROWS * GROUP]),
-            moves: vec![],
-            spread: vec![],
         }
     }
 }
@@ -445,7 +454,7 @@ impl LocalMem {
 /// the (usually DRAM resident) chunk is only known at the very end of a long
 /// dependency chain. Resolving every move of a layout up front lets all of
 /// those misses be prefetched and overlap with each other.
-pub struct PreparedMove {
+pub struct PreparedMove<'t> {
     /// Which bit of `TableJob::live` this move owns, possibly shared with
     /// another move. Kept on the move itself so that skipping one during
     /// preparation does not shift the rest.
@@ -465,23 +474,22 @@ pub struct PreparedMove {
     rows_new: u32,
     width_new: u8,
     keep: u16,
-    // borrows from the tables in `AllTables`, which outlive every update
-    target: *const [AtomicU32],
+    /// The table the target is in, and the target itself once [`locate`] has
+    /// worked out where in it.
+    table: &'t Table,
+    target: &'t [AtomicU32],
 }
 
-impl PreparedMove {
-    fn target(&self) -> &[AtomicU32] {
-        unsafe { &*self.target }
+impl<'t> PreparedMove<'t> {
+    fn target(&self) -> &'t [AtomicU32] {
+        self.target
     }
 
-    /// Move `target` from the first chunk of its table to chunk `rank`, and
-    /// start the miss on it.
+    /// Point `target` at chunk `rank` of the table, and start the miss on it.
     #[inline(always)]
     fn offset(&mut self, rank: usize) {
-        let len = self.target.len();
-        let ptr = (self.target as *const AtomicU32).wrapping_add(len * rank);
-        self.target = std::ptr::slice_from_raw_parts(ptr, len);
-        prefetch(self.target());
+        self.target = self.table.chunk(rank);
+        prefetch(self.target);
     }
 
     /// The target chunk as plain words.
@@ -497,11 +505,10 @@ impl PreparedMove {
 
 /// Point every move at its target chunk, and prefetch it.
 ///
-/// Each `target` comes in as [`Table::first`] of its table, and leaves as the
-/// chunk of `new` in it. The ranks are taken sixteen at a time, which is what
+/// Each `target` leaves as the chunk of `new` in the move's table. The ranks are taken sixteen at a time, which is what
 /// pulling them out of the walk that builds the moves buys: see
 /// [`iter::ranking16`].
-fn locate(moves: &mut [PreparedMove]) {
+fn locate(moves: &mut [PreparedMove<'_>]) {
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
     for batch in moves.chunks_mut(16) {
         use std::simd::Simd;
@@ -522,14 +529,11 @@ fn locate(moves: &mut [PreparedMove]) {
 
 #[inline(always)]
 fn prefetch(slice: &[AtomicU32]) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-        let ptr = slice.as_ptr();
-        _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
-        // a chunk is at most 64 bytes, so it spans at most two lines
-        _mm_prefetch(ptr.wrapping_add(slice.len() - 1) as *const i8, _MM_HINT_T0);
-    }
+    use std::hint::{prefetch_read, Locality};
+    let ptr = slice.as_ptr();
+    prefetch_read(ptr, Locality::L1);
+    // a chunk is at most 64 bytes, so it spans at most two lines
+    prefetch_read(ptr.wrapping_add(slice.len() - 1), Locality::L1);
 }
 
 pub struct ImmutableUpdate<'a> {
@@ -543,12 +547,13 @@ pub struct ImmutableUpdate<'a> {
 }
 
 /// `'a` is how long this one update borrows its scratch, and `'t` how long the
-/// tables live, which is past it: the mirrored chunk located for the next update
-/// is carried over to it as a plain slice.
+/// tables live, which is past it: what is located for the next update, its
+/// moves and its mirrored chunk, is carried over to it as plain borrows.
 pub struct Update<'a, 't> {
     layout: TeamLayout,
     immutable: &'a ImmutableUpdate<'t>,
     mem: &'a mut LocalMem,
+    moves: &'a mut Moves<'t>,
 }
 
 /// The shape of the chunk being written, which every move of it shares.

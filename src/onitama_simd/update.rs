@@ -1,6 +1,6 @@
 use std::{
     iter::zip,
-    sync::atomic::AtomicU32,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use bit_iter::BitIter;
@@ -31,7 +31,6 @@ impl<'t> Update<'_, 't> {
     /// `layout`, which need not be this update's own: see
     /// [`Self::update_layout`].
     fn prepare_forward(&mut self, layout: TeamLayout) -> &'t [AtomicU32] {
-        let mem = &mut *self.mem;
         let ImmutableUpdate {
             inv_current,
             current,
@@ -56,7 +55,8 @@ impl<'t> Update<'_, 't> {
 
         // first locate (and prefetch) the target chunk of every move, then do
         // the actual work; see `PreparedMove`
-        mem.moves.clear();
+        let moves = &mut self.moves.forward;
+        moves.clear();
         for offset in BitIter::from(directions) {
             let mask = mask_lookup[offset];
             let to_mask = offset_mask(offset, pieces0);
@@ -93,7 +93,7 @@ impl<'t> Update<'_, 't> {
                 // the lanes below the break, which is every lane when there
                 // is no capture to break the row, in every row of a vector
                 let keep = (((1u32 << split) - 1) * 0x1111) as u16;
-                mem.moves.push(PreparedMove {
+                moves.push(PreparedMove {
                     bit: 0,
                     step: (from, to),
                     mask,
@@ -101,12 +101,13 @@ impl<'t> Update<'_, 't> {
                     rows_new: new.pieces0 & !(1 << 22),
                     width_new: width_new as u8,
                     keep,
-                    // `locate` takes it from here to the chunk of `new`
-                    target: table.first(),
+                    // `locate` works out which chunk of it
+                    table,
+                    target: &[],
                 });
             }
         }
-        locate(&mut mem.moves);
+        locate(moves);
         inv_slice.slice
     }
 
@@ -116,10 +117,9 @@ impl<'t> Update<'_, 't> {
         let chunk = Chunk::new(self.layout);
         let padded = chunk.padded();
         let mem = &mut *self.mem;
-        let LocalMem { status, moves, .. } = &mut *mem;
         // no clearing first: `accumulate` writes every slot it covers, and it
         // covers the whole of `padded`
-        accumulate(chunk, moves, status);
+        accumulate(chunk, &self.moves.forward, &mut mem.status);
 
         // we expand, marking all states that are not lost because it has the card
         // then we negate to get only the lost states
@@ -219,7 +219,7 @@ impl<'t> Update<'_, 't> {
         // same two phase split as in `get_unresolved`: locate and prefetch every
         // target chunk before touching any of them.
         // Cards are now inverted, but it is also the other team, so not inverted.
-        let moves = &mut self.mem.spread;
+        let moves = &mut self.moves.spread;
         moves.clear();
         let mut seen = 0u32;
         for offset in BitIter::from(directions) {
@@ -269,8 +269,9 @@ impl<'t> Update<'_, 't> {
                     rows_new: 0,
                     width_new: 0,
                     keep: 0,
-                    // `locate` takes it from here to the chunk of `new`
-                    target: table.first(),
+                    // `locate` works out which chunk of it
+                    table,
+                    target: &[],
                 });
             }
         }
@@ -285,9 +286,8 @@ impl<'t> Update<'_, 't> {
             status,
             wins,
             expanded,
-            spread: moves,
-            ..
         } = &mut *self.mem;
+        let moves = &self.moves.spread;
 
 
         let mut progress = false;
@@ -397,58 +397,44 @@ impl<'t> Update<'_, 't> {
     fn load_stuff(&mut self, inv: &[AtomicU32], chunk: Chunk) {
         let rows = chunk.height;
         let cols = chunk.width;
+        use std::simd::{cmp::SimdPartialOrd, Select, Simd, ToBytes};
 
         // The whole chunk is one vector, which makes the transpose one permute
         // and the write one store. That store is also the only thing the walks
         // after this read `wins` through: a wide load over a run of narrow
         // stores cannot be forwarded from them and waits for every one of them
         // to reach the cache, and those stores wait on the mirrored chunk.
-        #[cfg(target_feature = "avx512f")]
-        {
-            use std::arch::x86_64::{_mm512_maskz_loadu_epi32, _mm512_permutexvar_epi32};
-            use std::simd::{cmp::SimdPartialOrd, Select, Simd};
-            const WIDE: usize = PAD * PAD;
-            debug_assert!(chunk.padded() <= WIDE);
-            let lane = Simd::<u32, WIDE>::from_array(std::array::from_fn(|l| l as u32));
-            let (r, c) = (lane / Simd::splat(PAD as u32), lane % Simd::splat(PAD as u32));
-            let (rows, cols) = (Simd::splat(rows as u32), Simd::splat(cols as u32));
-            let idx = (cols - Simd::splat(1) - c) * rows + (rows - Simd::splat(1) - r);
-            let size = chunk.height * chunk.width;
-            let x: Simd<u32, WIDE> = unsafe {
-                let src = _mm512_maskz_loadu_epi32(((1u32 << size) - 1) as u16, inv.as_ptr().cast());
-                _mm512_permutexvar_epi32(idx.into(), src).into()
-            };
-            // `Block::invert`, a lane at a time
-            const MASK0: u32 = 0b001001_001001_001001_001001_001001;
-            const MASK1: u32 = 0b000111_000111_000111_000111_000111;
-            let m0 = Simd::splat(MASK0);
-            let m1 = Simd::splat(MASK1);
-            let x = (x & m0 << 1) << 1 | (x & m0 << 2) >> 1 | (x & m0);
-            let x = (x & m1) << 3 | (x & m1 << 3) >> 3;
-            // the slots no king position uses are set to won, which makes them
-            // resolved and contributes nothing, so the walks below need no
-            // bounds of their own
-            let used = r.simd_lt(rows) & c.simd_lt(cols);
-            let x = used.select(x, Simd::splat(BLOCK_MASK));
-            x.copy_to_slice(&mut self.mem.wins[..WIDE]);
+        const WIDE: usize = PAD * PAD;
+        debug_assert!(chunk.padded() <= WIDE);
+        let lane = Simd::<u32, WIDE>::from_array(std::array::from_fn(|l| l as u32));
+        let (r, c) = (lane / Simd::splat(PAD as u32), lane % Simd::splat(PAD as u32));
+        let (rows, cols) = (Simd::splat(rows as u32), Simd::splat(cols as u32));
+        // the chunk is at most a vector long, and an atomic load a word at
+        // a time is what reading it while other threads `fetch_or` into it
+        // takes
+        let mut words = [0; WIDE];
+        for (word, x) in zip(&mut words, inv) {
+            *word = x.load(Ordering::Relaxed);
         }
-        #[cfg(not(target_feature = "avx512f"))]
-        {
-            let wins = &mut self.mem.wins[..];
-            wins[..chunk.padded()].fill(BLOCK_MASK);
-
-            let mut inv_i = 0;
-            for r in 0..cols {
-                let ours = cols - 1 - r;
-                for c in 0..rows {
-                    let i = (rows - 1 - c) * PAD + ours;
-                    let s = unsafe { wins.get_unchecked_mut(i) };
-                    let x = unsafe { inv.get_unchecked(inv_i) };
-                    let tmp = x.load(std::sync::atomic::Ordering::Relaxed);
-                    *s = Block(tmp).invert().0;
-                    inv_i += 1;
-                }
-            }
-        }
+        // As a byte shuffle, which is the one with a run time index that
+        // `std::simd` has: four bytes per word. That is one `vpermb` only
+        // because `.cargo/config.toml` builds `core` for this machine; with the
+        // prebuilt one it is a byte at a time.
+        let idx = (cols - Simd::splat(1) - c) * rows + (rows - Simd::splat(1) - r);
+        let bytes = (idx * Simd::splat(0x0404_0404) + Simd::splat(0x0302_0100)).to_ne_bytes();
+        let x = Simd::<u32, WIDE>::from_ne_bytes(Simd::from_array(words).to_ne_bytes().swizzle_dyn(bytes));
+        // `Block::invert`, a lane at a time
+        const MASK0: u32 = 0b001001_001001_001001_001001_001001;
+        const MASK1: u32 = 0b000111_000111_000111_000111_000111;
+        let m0 = Simd::splat(MASK0);
+        let m1 = Simd::splat(MASK1);
+        let x = (x & m0 << 1) << 1 | (x & m0 << 2) >> 1 | (x & m0);
+        let x = (x & m1) << 3 | (x & m1 << 3) >> 3;
+        // the slots no king position uses are set to won, which makes them
+        // resolved and contributes nothing, so the walks below need no
+        // bounds of their own
+        let used = r.simd_lt(rows) & c.simd_lt(cols);
+        let x = used.select(x, Simd::splat(BLOCK_MASK));
+        x.copy_to_slice(&mut self.mem.wins[..WIDE]);
     }
 }

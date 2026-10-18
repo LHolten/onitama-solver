@@ -13,7 +13,7 @@ use std::{
 use crate::{index::Indexer, onitama_simd::LocalMem};
 
 use super::{
-    count_indexer, iter::LayoutCursor, AllTables, Block, ImmutableUpdate, PawnCount, TableJob,
+    count_indexer, iter::LayoutCursor, AllTables, Block, ImmutableUpdate, Moves, PawnCount, TableJob,
     TeamLayout, Update, BLOCK, PAD,
 };
 
@@ -199,6 +199,7 @@ impl Iterator for TableJob<'_> {
 
             UPDATE.with(|vals| {
                 let mem = &mut *vals.borrow_mut();
+                let mut moves = Moves::default();
                 // One layout ahead, so the forward moves of the next one are
                 // located while this one is still being worked on. Their lines
                 // come from all over the table, and cheap as locating them is,
@@ -212,6 +213,7 @@ impl Iterator for TableJob<'_> {
                         layout,
                         immutable,
                         mem: &mut *mem,
+                        moves: &mut moves,
                     };
                     let ahead = next.map(|(_, layout)| layout);
                     let (tmp, inv) = update.update_layout(&mut live[i], pre, ahead);
@@ -306,6 +308,7 @@ impl AllTables {
                         let start = b * BLOCK;
                         // every layout is visited, so the cursor only ever steps
                         let mut cursor = LayoutCursor::new(counts);
+                        let mut moves = Moves::default();
                         let mut sum = 0;
                         for i in start..(start + BLOCK).min(total) {
                             let layout = cursor.at(i);
@@ -315,6 +318,7 @@ impl AllTables {
                                     layout,
                                     immutable: &immutable,
                                     mem,
+                                    moves: &mut moves,
                                 };
                                 update.get_unresolved::<true>()
                             });
