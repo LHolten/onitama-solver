@@ -476,7 +476,7 @@ pub struct Moves<'t> {
     spread: Vec<PreparedMove<'t>>,
     /// The ranking of the layout whose forward moves were located last, which
     /// its backward moves are located with in the next update: see
-    /// [`iter::Reranker`]. Unused with the sixteen lane ranking.
+    /// [`iter::Reranker`].
     reranker: iter::Reranker,
 }
 
@@ -524,15 +524,6 @@ impl<'t> PreparedMove<'t> {
     /// Point `target` at chunk `rank` of the table, and start the miss on it.
     #[inline(always)]
     fn offset(&mut self, rank: usize) {
-        // The sixteen lane ranking hands out its moves sixteen at a time, and
-        // so this runs back to back for all of them. There the bounds check
-        // pays for itself: without it the 8-men solve took 2% more cycles,
-        // with its prefetches finding the line in L2 12% less often (measured
-        // 2026-10-19). Presumably the burst of prefetches runs over what the
-        // core keeps in flight and some are dropped; the check spaces them.
-        #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-        let chunk = &self.table.list[self.table.chunk_size * rank..][..self.table.chunk_size];
-        #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512cd")))]
         let chunk = self.table.chunk(rank);
         self.target = chunk.as_ptr();
         prefetch(chunk);
@@ -551,37 +542,22 @@ impl<'t> PreparedMove<'t> {
 
 /// Point every move at its target chunk, and prefetch it.
 ///
-/// Each `target` leaves as the chunk of `new` in the move's table. The ranks are taken sixteen at a time, which is what
-/// pulling them out of the walk that builds the moves buys: see
-/// [`iter::ranking16`].
+/// Each `target` leaves as the chunk of `new` in the move's table. `parent` is
+/// the layout the moves are from, at `rank` in its own table, and `MOVER` the
+/// side whose pieces they move, which is everything ranking a move off the
+/// parent needs: see [`iter::Reranker`].
 ///
-/// `parent` is the layout the moves are from, at `rank` in its own table, and
-/// `MOVER` the side whose pieces they move. A move that only moves one of those
-/// stays in that same table, and without the sixteen lane ranking it is ranked
-/// off the parent: see [`iter::Reranker`].
+/// That also hands out the moves one at a time, with a ranking each between
+/// their prefetches. Ranking sixteen at once in vectors was cheaper, but sent
+/// the prefetches out in one burst, and they found their lines in L2 a
+/// quarter less often (measured at 8 men on Zen 5).
 fn locate<const MOVER: usize>(moves: &mut [PreparedMove<'_>], reranker: &mut iter::Reranker, parent: TeamLayout, rank: usize) {
-    #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-    for batch in moves.chunks_mut(16) {
-        let (mut s_1, mut s_2) = ([0; 16], [0; 16]);
-        for (k, mv) in batch.iter().enumerate() {
-            (s_1[k], s_2[k]) = (mv.new.pieces0, mv.new.pieces1);
-        }
-        let ranks = iter::ranking16(Simd::from_array(s_1), Simd::from_array(s_2));
-        for (mv, &rank) in zip(batch, ranks.as_array()) {
-            mv.offset(rank as usize);
-        }
+    if !reranker.is_for(parent, rank) {
+        reranker.fill(parent, rank);
     }
-    #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-    let _ = (reranker, parent, rank);
-    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512cd")))]
-    {
-        if !reranker.is_for(parent, rank) {
-            reranker.fill(parent, rank);
-        }
-        for mv in moves {
-            let (changed0, changed1) = (mv.new.pieces0 ^ parent.pieces0, mv.new.pieces1 ^ parent.pieces1);
-            mv.offset(reranker.rank::<MOVER>(mv.new, changed0, changed1));
-        }
+    for mv in moves {
+        let (changed0, changed1) = (mv.new.pieces0 ^ parent.pieces0, mv.new.pieces1 ^ parent.pieces1);
+        mv.offset(reranker.rank::<MOVER>(mv.new, changed0, changed1));
     }
 }
 

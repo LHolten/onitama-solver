@@ -1,7 +1,5 @@
 use std::iter::Take;
 use std::simd::Simd;
-#[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-use std::simd::{cmp::SimdPartialEq, num::SimdUint, Select};
 
 use bit_iter::BitIter;
 use seq_macro::seq;
@@ -262,7 +260,6 @@ pub(super) fn ranking(s_1: u32, s_2: u32) -> usize {
 /// The parent's pieces are walked once, into prefix sums of their plain terms
 /// and of the shifted ones less the plain: a move is then a few differences of
 /// those, and the one or two new terms, with no walk of its own.
-#[cfg_attr(all(target_feature = "avx512f", target_feature = "avx512cd"), allow(dead_code))]
 pub(super) struct Reranker {
     /// `u32::MAX` while it is for no layout.
     rank: u32,
@@ -348,7 +345,6 @@ impl Default for Reranker {
     }
 }
 
-#[cfg_attr(all(target_feature = "avx512f", target_feature = "avx512cd"), allow(dead_code))]
 impl Reranker {
     /// For the moves of either side from `parent`, which is at `rank`.
     #[cfg(test)]
@@ -458,120 +454,8 @@ impl Reranker {
     }
 }
 
-/// [`ranking`] of sixteen layouts at once, one per lane.
-///
-/// The scalar walk is a chain of a bit pick, a test and a table read per piece,
-/// and a chunk has dozens of moves to locate, none of which depend on each
-/// other. So the lanes take the walk in step, one set bit of every layout per
-/// round.
-///
-/// The table read is what does not go wide: a gather of sixteen is microcode
-/// on this machine, and slower than the scalar walk it replaces. But what it
-/// reads is a multinomial, `C(i, k1, k2)` for the squares below the piece and
-/// the pieces of each side so far, and that factors as `binom(i, k1 + k2) *
-/// binom(k1 + k2, k1)`. In round `n` every lane is on its `n + 1`st piece, so
-/// `k1 + k2` is the same in all of them, and both factors are lookups in a
-/// table of that round small enough to sit in registers: 25 squares for the
-/// first, which is one two source permute, and a row of Pascal's triangle for
-/// the second, which is one permute.
-///
-/// A lane that runs out of pieces early just stops adding.
-#[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-pub fn ranking16(s_1: Simd<u32, 16>, s_2: Simd<u32, 16>) -> Simd<u32, 16> {
-    use super::accum_spread::{permute, permute16};
-
-    // `binom(i, m)` for every square `i`, as the two halves of one table
-    let squares = |m: usize, i: Simd<u32, 16>| -> Simd<u32, 16> {
-        let [lo, hi] = SQUARES[m].map(Simd::<u32, 16>::from_array);
-        permute(lo, hi, i)
-    };
-    let pascal = |row: &[u32; 16], k: Simd<u32, 16>| -> Simd<u32, 16> { permute16(Simd::from_array(*row), k) };
-
-    let zero = Simd::splat(0);
-    let one = Simd::splat(1);
-    let mut x = s_1 | s_2;
-    let mut k1 = zero;
-    let mut r = zero;
-    for n in 0..PIECES {
-        let live = x.simd_ne(zero);
-        if !live.any() {
-            break;
-        }
-        let low = x & (zero - x);
-        let i = Simd::splat(31) - low.leading_zeros();
-        let ours = (s_1 & low).simd_ne(zero);
-        k1 += ours.select(one, zero);
-
-        // `x.0` in the scalar walk, which a piece of either side adds
-        let both = squares(n + 1, i) * pascal(&PASCAL[n + 1], k1);
-        // and `x.1` adds `C(i, k1 - 1, k2)` on top, which is the same
-        // factoring one piece down
-        let theirs = squares(n, i) * pascal(&PASCAL_BELOW[n], k1);
-        let term = both + ours.select(zero, theirs);
-        r += live.select(term, zero);
-        x &= x - one;
-    }
-    r
-}
-
 /// The most pieces a layout has, both sides and both kings.
 const PIECES: usize = 2 * super::SIDE;
-
-#[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-const fn binom(n: usize, k: usize) -> u32 {
-    if k > n {
-        return 0;
-    }
-    comb_exact_inner(n as i32, k as i32, 0) as u32
-}
-
-/// `binom(i, m)` at `[m][i / 16][i % 16]`.
-#[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-static SQUARES: [[[u32; 16]; 2]; PIECES + 1] = {
-    let mut t = [[[0; 16]; 2]; PIECES + 1];
-    let mut m = 0;
-    while m <= PIECES {
-        let mut i = 0;
-        while i < 32 {
-            t[m][i / 16][i % 16] = binom(i, m);
-            i += 1;
-        }
-        m += 1;
-    }
-    t
-};
-
-/// `binom(m, k)` at `[m][k]`.
-#[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-static PASCAL: [[u32; 16]; PIECES + 1] = {
-    let mut t = [[0; 16]; PIECES + 1];
-    let mut m = 0;
-    while m <= PIECES {
-        let mut k = 0;
-        while k < 16 {
-            t[m][k] = binom(m, k);
-            k += 1;
-        }
-        m += 1;
-    }
-    t
-};
-
-/// `binom(m, k - 1)` at `[m][k]`, which is nothing for `k == 0`.
-#[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-static PASCAL_BELOW: [[u32; 16]; PIECES + 1] = {
-    let mut t = [[0; 16]; PIECES + 1];
-    let mut m = 0;
-    while m <= PIECES {
-        let mut k = 1;
-        while k < 16 {
-            t[m][k] = binom(m, k - 1);
-            k += 1;
-        }
-        m += 1;
-    }
-    t
-};
 
 fn unranking(mut r: usize, n: i32, mut ones: i32, mut twos: i32) -> (u32, u32) {
     let (mut s_1, mut s_2) = (0, 0);
@@ -756,31 +640,6 @@ mod tests {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    /// The lanes have to rank exactly as the scalar walk does, including a mix
-    /// of piece counts in one vector and lanes with no pieces at all.
-    #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-    #[test]
-    fn test_ranking16() {
-        use std::simd::Simd;
-        let mut all = vec![(0u32, 0u32)];
-        for (count0, count1) in [(0, 0), (1, 0), (0, 2), (2, 1), (3, 3), (3, 2), (2, 3)] {
-            all.extend(PawnCount { count0, count1 }.into_iter().map(|l| (l.pieces0, l.pieces1)));
-        }
-        // a stride that is prime to everything keeps the counts mixed per vector
-        let picked: Vec<_> = (0..all.len()).step_by(7).map(|i| all[i * 7919 % all.len()]).collect();
-        for batch in picked.chunks(16) {
-            let mut s_1 = [0; 16];
-            let mut s_2 = [0; 16];
-            for (k, &(a, b)) in batch.iter().enumerate() {
-                (s_1[k], s_2[k]) = (a, b);
-            }
-            let r = super::ranking16(Simd::from_array(s_1), Simd::from_array(s_2));
-            for k in 0..16 {
-                assert_eq!(r[k] as usize, ranking(s_1[k], s_2[k]), "{:b} {:b}", s_1[k], s_2[k]);
             }
         }
     }

@@ -1,6 +1,6 @@
 use std::{
     iter::zip,
-    simd::{Select, Simd},
+    simd::{simd_swizzle, Select, Simd},
     sync::atomic::AtomicU32,
 };
 
@@ -9,7 +9,7 @@ use bit_iter::BitIter;
 use crate::card::offset_mask_fixed as offset_mask;
 
 use super::{
-    accum_spread::{accumulate, invert, load, permute, permute16}, locate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread,
+    accum_spread::{accumulate, invert, load, permute, permute16, SPARE}, locate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread,
     SpreadStatus, TeamLayout, Update, BLOCK_MASK, LANES, LANE_COL, LANE_ROW, ROW, SIDE,
 };
 
@@ -326,65 +326,35 @@ impl<'t> Update<'_, 't> {
         // load across two of those stores would wait for both to reach the
         // cache. The rows are cut out of the registers instead, a vector each,
         // which is the load the spread does per row and per move.
-        // a column per lane, and the second half is the bound
-        #[cfg(target_feature = "avx512f")]
-        let pair = Simd::<u32, LANES>::from_array(std::array::from_fn(|k| (k % ROW) as u32));
-        #[cfg(target_feature = "avx512f")]
-        let high = std::simd::Mask::<i32, LANES>::from_bitmask(!((1 << ROW) - 1) & ((1 << LANES) - 1));
+        // the spare lane of each half zero, for the spread's dead columns to
+        // read
+        let used = Simd::<u32, LANES>::from_array(std::array::from_fn(|l| if l % ROW == SPARE { 0 } else { u32::MAX }));
         let mut built = None;
         for mv in moves.iter() {
             if built != Some(mv.mask) {
                 built = Some(mv.mask);
                 // `Block::expand`, a lane at a time: the bits shifted past the
                 // word are the ones the block mask drops anyway
-                fn expand<const N: usize>(x: Simd<u32, N>) -> Simd<u32, N> {
-                    (x << 10 | x << 20 | x >> 10 | x >> 20) & Simd::splat(BLOCK_MASK)
-                }
-                // we spread out the loses, these are wins for the previous
-                // state. What is going out now is taken off the bound here
-                // rather than in the spread: it does not depend on the target,
-                // so it is the same for every move that reads this slot and for
-                // every row it reads it into
-                #[cfg(target_feature = "avx512f")]
-                {
-                    let mask = Simd::splat(mv.mask);
-                    let [(tmp_lo, may_lo), (tmp_hi, may_hi)] = [0, LANES].map(|start| {
-                        let s = Simd::from_slice(&status[start..start + LANES]);
-                        let w = Simd::from_slice(&wins[start..start + LANES]);
-                        let tmp = expand(s & mask);
-                        (tmp, expand(!w & mask) & !tmp)
-                    });
-                    for (row, e) in expanded[..chunk.height].iter_mut().enumerate() {
-                        // the lanes past the row read the next one's, which the
-                        // spread masks off
-                        let idx = Simd::splat((row * chunk.width) as u32) + pair;
-                        *e = high.select(permute(may_lo, may_hi, idx), permute(tmp_lo, tmp_hi, idx));
-                    }
-                }
-                // Without AVX-512 the row is built from its own slots, which are
-                // contiguous and one register for each half. Cutting it out of
-                // the whole chunk instead is a permute of four registers into
-                // each, for every row.
-                #[cfg(not(target_feature = "avx512f"))]
-                {
-                    use std::simd::simd_swizzle;
-                    let mask = Simd::splat(mv.mask);
-                    for (row, e) in expanded[..chunk.height].iter_mut().enumerate() {
-                        // the lanes past the row read the next one's, which the
-                        // spread masks off
-                        let at = row * chunk.width;
-                        // a chunk and a row past it fit the scratch
-                        debug_assert!(at + ROW <= status.len().min(wins.len()));
-                        let s = Simd::<u32, ROW>::from_slice(unsafe { status.get_unchecked(at..at + ROW) });
-                        let w = Simd::<u32, ROW>::from_slice(unsafe { wins.get_unchecked(at..at + ROW) });
-                        let tmp = expand(s & mask);
-                        let may = expand(!w & mask) & !tmp;
-                        let row = simd_swizzle!(tmp, may, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
-                        // the spare lane of each half zero, for the spread's
-                        // dead columns to read
-                        let used = Simd::<u32, LANES>::from_array(std::array::from_fn(|l| if l % ROW == super::accum_spread::SPARE { 0 } else { u32::MAX }));
-                        *e = row & used;
-                    }
+                let expand = |x: Simd<u32, LANES>| (x << 10 | x << 20 | x >> 10 | x >> 20) & Simd::splat(BLOCK_MASK);
+                let mask = Simd::splat(mv.mask);
+                for (row, e) in expanded[..chunk.height].iter_mut().enumerate() {
+                    // A row is built from its own slots, which are contiguous:
+                    // the losses to spread in the first half, and the not won
+                    // states in the second, expanded together. The lanes past
+                    // the row read the next one's, which the spread masks off.
+                    let at = row * chunk.width;
+                    // a chunk and a row past it fit the scratch
+                    debug_assert!(at + ROW <= status.len().min(wins.len()));
+                    let s = Simd::<u32, ROW>::from_slice(unsafe { status.get_unchecked(at..at + ROW) });
+                    let w = Simd::<u32, ROW>::from_slice(unsafe { wins.get_unchecked(at..at + ROW) });
+                    let both = expand(simd_swizzle!(s, !w, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]) & mask);
+                    // We spread out the losses, these are wins for the previous
+                    // state. What is going out now is taken off the bound here
+                    // rather than in the spread: it does not depend on the
+                    // target, so it is the same for every move that reads this
+                    // slot and for every row it reads it into.
+                    let going = simd_swizzle!(Simd::splat(0), both, [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]);
+                    *e = both & !going & used;
                 }
             }
 
