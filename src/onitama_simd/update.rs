@@ -1,7 +1,7 @@
 use std::{
     iter::zip,
-    simd::{simd_swizzle, Select, Simd},
-    sync::atomic::AtomicU32,
+    simd::{simd_swizzle, Simd},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use bit_iter::BitIter;
@@ -9,8 +9,8 @@ use bit_iter::BitIter;
 use crate::card::offset_mask;
 
 use super::{
-    accum_spread::{accumulate, invert, load, permute, permute16, SPARE}, locate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread,
-    SpreadStatus, TeamLayout, Update, BLOCK_MASK, LANES, LANE_COL, LANE_ROW, ROW, SIDE,
+    accum_spread::{accumulate, SPARE}, locate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread,
+    SpreadStatus, TeamLayout, Update, BLOCK_MASK, LANES, ROW, SIDE,
 };
 
 
@@ -32,7 +32,7 @@ impl<'t> Update<'_, 't> {
     /// Locate and prefetch the mirrored chunk of `layout`, which need not be
     /// this update's own: see [`Self::update_layout`].
     fn mirror(&self, layout: TeamLayout) -> &'t [AtomicU32] {
-        let slice = self.immutable.inv_current.index(layout.invert()).slice;
+        let slice = self.immutable.inv_current.index(layout.invert());
         prefetch(slice);
         slice
     }
@@ -408,41 +408,18 @@ impl<'t> Update<'_, 't> {
     ///
     /// The mirror's piece masks are this one's reversed, and inverting a king
     /// position swaps the two kings, so its rows are our columns read backwards
-    /// and the other way about. That makes the position it wants a transpose
-    /// and two reversals, which is arithmetic on the two counters rather than a
-    /// lookup per position.
+    /// and the other way about. The slots no king position uses are set to won,
+    /// which makes them resolved and contributes nothing, so the walks after
+    /// this need no bounds of their own.
     fn load_stuff(&mut self, inv: &[AtomicU32], chunk: Chunk) {
-        use std::simd::cmp::SimdPartialOrd;
         let (rows, cols) = (chunk.height, chunk.width);
-
-        // The chunk is at most two vectors, which makes the transpose a
-        // permute per vector and the write one store each. That store is also
-        // the only thing the walks after this read `wins` through: a wide load
-        // over a run of narrow stores cannot be forwarded from them and waits
-        // for every one of them to reach the cache.
-        //
-        // So the chunk is read straight into the vectors, although other
-        // threads `fetch_or` into it, which is sound for the reason
-        // `PreparedMove::src` gives. Going through words on the stack would
-        // wait for every store older than these, which this early in the
-        // update is all of the backward moves' ranking.
-        let [low, high] = load(unsafe { std::slice::from_raw_parts(inv.as_ptr().cast::<u32>(), inv.len()) });
-        let (rows_v, cols_v) = (Simd::splat(rows as u32), Simd::splat(cols as u32));
-        let lane = Simd::<u32, LANES>::from_array(std::array::from_fn(|l| l as u32));
-        for start in (0..chunk.padded()).step_by(LANES) {
-            let r = Simd::<u32, LANES>::from_slice(&LANE_ROW[cols][start..start + LANES]);
-            let c = Simd::<u32, LANES>::from_slice(&LANE_COL[cols][start..start + LANES]);
-            // the slots past the chunk read anywhere: they are overwritten
-            let idx = (cols_v - Simd::splat(1) - c) * rows_v + (rows_v - Simd::splat(1) - r);
-            // up to eight men the chunk is one vector, and the permute of one
-            // is half the work of two without AVX-512
-            let x = invert(if inv.len() <= LANES { permute16(low, idx) } else { permute(low, high, idx) });
-            // the slots no king position uses are set to won, which makes them
-            // resolved and contributes nothing, so the walks below need no
-            // bounds of their own
-            let used = (lane + Simd::splat(start as u32)).simd_lt(Simd::splat((rows * cols) as u32));
-            let x = used.select(x, Simd::splat(BLOCK_MASK));
-            x.copy_to_slice(&mut self.mem.wins[start..start + LANES]);
+        let wins = &mut self.mem.wins[..chunk.padded()];
+        wins.fill(BLOCK_MASK);
+        for r in 0..rows {
+            for c in 0..cols {
+                let x = inv[(cols - 1 - c) * rows + (rows - 1 - r)].load(Ordering::Relaxed);
+                wins[r * cols + c] = Block(x).invert().0;
+            }
         }
     }
 }

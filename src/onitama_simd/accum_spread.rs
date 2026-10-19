@@ -267,24 +267,6 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32], wins
     matter.reduce_or()
 }
 
-/// A whole chunk, as the two vectors it fits in, with the lanes past it zero.
-///
-/// Masked loads like [`read`]'s, so the lanes past the chunk neither read nor
-/// fault.
-#[inline(always)]
-pub fn load(chunk: &[u32]) -> [Simd<u32, LANES>; 2] {
-    let low = unsafe { load_masked::<0>(chunk.as_ptr(), chunk.len()) };
-    // the second load only when there is something for it: with every lane
-    // masked off it still costs a microcode assist when the address it would
-    // read is not mapped, and an empty slice's is not
-    let high = if chunk.len() > LANES {
-        unsafe { load_masked::<LANES>(chunk.as_ptr(), chunk.len()) }
-    } else {
-        Simd::splat(0)
-    };
-    [low, high]
-}
-
 /// The words of `target` that `idx` names, a lane each.
 ///
 /// The target is at most two vectors long, so this is a permute out of them,

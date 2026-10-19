@@ -4,8 +4,6 @@ use std::simd::Simd;
 use bit_iter::BitIter;
 use seq_macro::seq;
 
-use crate::index::Indexer;
-
 use super::{PawnCount, TeamLayout};
 
 pub struct TeamLayoutIter(TeamLayout);
@@ -136,12 +134,14 @@ impl IntoIterator for PawnCount {
     }
 }
 
-impl Indexer for PawnCount {
-    fn index(&self, item: &Self::Item) -> usize {
-        ranking(item.pieces0, item.pieces1)
+impl PawnCount {
+    /// Where `layout` is in the enumeration, which is where its chunk is.
+    pub fn index(&self, layout: &TeamLayout) -> usize {
+        ranking(layout.pieces0, layout.pieces1)
     }
 
-    fn total(&self) -> usize {
+    /// How many layouts there are.
+    pub fn total(&self) -> usize {
         combinations(25, self.count0 as i32 + 1, self.count1 as i32 + 1)
     }
 }
@@ -455,12 +455,9 @@ fn combinations(n: i32, k1: i32, k2: i32) -> usize {
 mod tests {
     use std::collections::HashSet;
 
-    use crate::{
-        index::Indexer,
-        onitama_simd::{
-            iter::{combinations, ranking, unranking, Reranker},
-            PawnCount,
-        },
+    use crate::onitama_simd::{
+        iter::{combinations, ranking, unranking, Reranker},
+        PawnCount,
     };
 
     /// The enumeration has to be in ranking order for `nth_layout` to agree

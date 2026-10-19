@@ -7,7 +7,7 @@ use std::{
     fmt,
     iter::zip,
     mem::size_of,
-    ops::{BitAnd, Deref, Index},
+    ops::{BitAnd, Deref},
     simd::Simd,
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -17,20 +17,15 @@ use rayon::prelude::*;
 
 use bit_iter::BitIter;
 
-use crate::{
-    card::{get_one_bitmap, offset_mask},
-    index::{Empty, Indexer},
-    proj,
-};
+use crate::card::{get_one_bitmap, offset_mask};
 
 pub const TABLE_MASK: u32 = (1 << 25) - 1;
 pub const BLOCK_MASK: u32 = (1 << 30) - 1;
 
-fn count_indexer(size: u32) -> impl Indexer<Item = PawnCount> {
-    let count_mask = (1u32 << size) - 1;
-    Empty::default()
-        .choose_one(proj!(|c: PawnCount| c.count0), (count_mask, size))
-        .choose_one(proj!(|c: PawnCount| c.count1), (count_mask, size))
+/// Every piece count of a build of `size` pieces a side, in the order of the
+/// tables: `count0` on the outside.
+fn all_counts(size: u32) -> impl Iterator<Item = PawnCount> {
+    (0..size).flat_map(move |count0| (0..size).map(move |count1| PawnCount { count0, count1 }))
 }
 
 // number of pawns of each player
@@ -58,15 +53,6 @@ pub struct TeamLayout {
 }
 
 impl TeamLayout {
-    fn indexer(self, counts: PawnCount) -> impl Indexer<Item = KingPos> {
-        debug_assert_eq!(self.pieces0.count_ones(), counts.count0 + 1);
-        debug_assert_eq!(self.pieces1.count_ones(), counts.count1 + 1);
-
-        Empty::default()
-            .choose_one(proj!(|p: KingPos| p.king0), (self.pieces0, counts.count0 + 1))
-            .choose_one(proj!(|p: KingPos| p.king1), (self.pieces1, counts.count1 + 1))
-    }
-
     fn invert(self) -> Self {
         TeamLayout {
             pieces0: self.pieces1.reverse_bits() >> 7,
@@ -76,6 +62,7 @@ impl TeamLayout {
 }
 
 // the positions of the kings
+#[cfg(test)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KingPos {
     king0: u32,
@@ -89,6 +76,13 @@ impl TeamLayout {
             count0: self.pieces0.count_ones() - 1,
             count1: self.pieces1.count_ones() - 1,
         }
+    }
+
+    /// The slot of the king positions `kpos` in this layout's chunk: a row per
+    /// square of `pieces0`'s king, a column per square of the other.
+    fn slot(self, kpos: KingPos) -> usize {
+        let below = |pieces: u32, king: u32| (pieces & (1 << king) - 1).count_ones() as usize;
+        below(self.pieces0, kpos.king0) * self.pieces1.count_ones() as usize + below(self.pieces1, kpos.king1)
     }
 }
 
@@ -120,9 +114,7 @@ pub struct AllTables {
 
 impl AllTables {
     fn index_count(&self, counts: PawnCount) -> &Table {
-        let indexer = count_indexer(self.size);
-        let i = indexer.index(&counts);
-        unsafe { self.list.get(i).unwrap_unchecked() }
+        &self.list[(counts.count0 * self.size + counts.count1) as usize]
     }
 
     pub fn count_ones(&self) -> u64 {
@@ -369,18 +361,9 @@ pub struct Table {
 }
 
 impl Table {
-    fn index(&self, layout: TeamLayout) -> SubTable<'_> {
-        let i = self.counts.index(&layout);
-
-        let slice = self
-            .list
-            .get(self.chunk_size * i..self.chunk_size * (i + 1));
-        let slice = unsafe { slice.unwrap_unchecked() };
-        SubTable {
-            layout,
-            slice,
-            counts: self.counts,
-        }
+    /// The chunk of `layout`.
+    fn index(&self, layout: TeamLayout) -> &[AtomicU32] {
+        self.chunk(self.counts.index(&layout))
     }
 
     /// The chunk at position `rank`, which is what [`locate`] works out.
@@ -403,24 +386,6 @@ impl Table {
             .sum();
         let over = self.list.len() as u64 - self.counts.states();
         all - over * BLOCK_MASK.count_ones() as u64
-    }
-}
-
-// contains results for only one layout
-#[derive(Debug, Clone, Copy)]
-pub struct SubTable<'a> {
-    counts: PawnCount,
-    layout: TeamLayout,
-    slice: &'a [AtomicU32],
-}
-
-impl Index<KingPos> for SubTable<'_> {
-    type Output = AtomicU32;
-
-    fn index(&self, index: KingPos) -> &Self::Output {
-        let indexer = self.layout.indexer(self.counts);
-        let i = indexer.index(&index);
-        unsafe { self.slice.get(i).unwrap_unchecked() }
     }
 }
 
@@ -887,8 +852,7 @@ impl AllTables {
             mask_lookup,
             directions,
             seeds: Seeds::new(Cards(cards)),
-            list: count_indexer(size)
-                .into_iter()
+            list: all_counts(size)
                 .map(|counts: PawnCount| {
                     let chunk_size = (counts.count0 + 1) as usize * (counts.count1 + 1) as usize;
                     let num_chunks = counts.total();
@@ -915,8 +879,7 @@ impl AllTables {
         // machine busy; run the whole piece count at once and the ones still
         // going fill in for the ones that are nearly done.
         let mut schedule: Vec<Vec<TableJob>> = vec![];
-        for counts in count_indexer(size) {
-            let counts: PawnCount = counts;
+        for counts in all_counts(size) {
             if counts.count0 < counts.count1 || !tb.has(counts) {
                 continue;
             }
@@ -1136,7 +1099,7 @@ mod tests {
     /// tables are a solution, not that they are the least one, but anything
     /// read from the wrong slot, chunk or configuration breaks it.
     fn check_states(tb: &AllTables, per_table: usize) {
-        use super::{offset_mask, BitIter, Indexer, KingPos, TeamLayout};
+        use super::{offset_mask, BitIter, KingPos, TeamLayout};
         let cards = &tb.seeds.0;
 
         // per configuration, the cards of the side to move and the side card
@@ -1154,7 +1117,7 @@ mod tests {
 
         let won = |layout: TeamLayout, kpos: KingPos, k: usize| {
             let counts = layout.counts();
-            let entry = tb.index_count(counts).index(layout)[kpos].load(Ordering::Relaxed);
+            let entry = tb.index_count(counts).index(layout)[layout.slot(kpos)].load(Ordering::Relaxed);
             entry >> k & 1 != 0
         };
 

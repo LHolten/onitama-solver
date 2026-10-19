@@ -3,7 +3,6 @@ use rayon::prelude::*;
 
 use std::{
     iter::zip,
-    simd::{cmp::SimdPartialEq, Simd},
     cell::RefCell,
     mem::take,
     sync::{
@@ -14,15 +13,14 @@ use std::{
 
 use bit_iter::BitIter;
 
-use crate::{index::Indexer, onitama_simd::LocalMem};
+use crate::onitama_simd::LocalMem;
 
 use super::{
-    count_indexer, iter::LayoutCursor, AllTables, ImmutableUpdate, Moves, PawnCount, TableJob,
+    all_counts, iter::LayoutCursor, AllTables, ImmutableUpdate, Moves, PawnCount, TableJob,
     TeamLayout, Update, BLOCK, SIDE,
 };
 
-/// Layouts covered by one word of [`TableJob::needs_up`], and the granularity
-/// at which a retired run is skipped without being looked at layout by layout.
+/// Layouts covered by one word of [`TableJob::needs_up`].
 const GROUP: usize = 64;
 
 /// Words of [`TableJob::needs_up`] per block.
@@ -113,40 +111,31 @@ impl<'a> TableJob<'a> {
 
         let start = b * BLOCK;
         let mut cursor = LayoutCursor::new(counts);
-        for (g, group) in self.live[start..][..BLOCK].chunks(GROUP).enumerate() {
-            // a retired run is rejected by one scan that stops at the first
-            // live layout, instead of a branch per layout
-            if group.iter().all(|&moves| moves == 0) {
-                continue;
-            }
-            let start = start + g * GROUP;
-            for (j, &moves) in group.iter().enumerate() {
-                if moves == 0 {
-                    continue;
-                }
-                let layout = cursor.at(start + j);
-                // the enumeration is in ranking order, so where a layout is in
-                // it is where its chunk is
-                let slice = table.chunk(start + j);
-                let TeamLayout { pieces0, pieces1 } = layout;
-                let seeds = &self.tb.seeds;
+        // this runs before any layout is retired, so every one of the block is
+        // live, up to the end of the table
+        for i in start..(start + BLOCK).min(counts.total()) {
+            let layout = cursor.at(i);
+            // the enumeration is in ranking order, so where a layout is in
+            // it is where its chunk is
+            let slice = table.chunk(i);
+            let TeamLayout { pieces0, pieces1 } = layout;
+            let seeds = &self.tb.seeds;
 
-                // a seed is terms of the column and of the row: the wins in
-                // one or'd, and a win in two where both halves allow it
-                let (mut temple, mut run) = ([0; SIDE], [0; SIDE]);
-                for (c, king1) in BitIter::from(pieces1).enumerate() {
-                    temple[c] = seeds.temple(pieces1, king1);
-                    run[c] = seeds.run(pieces0, pieces1, king1);
-                }
-                let width = pieces1.count_ones() as usize;
-                for (row, king0) in slice.chunks(width).zip(BitIter::from(pieces0)) {
-                    let take = seeds.take(pieces1, king0);
-                    let quiet = seeds.quiet(pieces0, king0);
-                    for (val, (&t, &r)) in row.iter().zip(zip(&temple, &run)) {
-                        let seed = t | take | quiet & r;
-                        if seed != 0 {
-                            val.store(seed, Ordering::Relaxed);
-                        }
+            // a seed is terms of the column and of the row: the wins in
+            // one or'd, and a win in two where both halves allow it
+            let (mut temple, mut run) = ([0; SIDE], [0; SIDE]);
+            for (c, king1) in BitIter::from(pieces1).enumerate() {
+                temple[c] = seeds.temple(pieces1, king1);
+                run[c] = seeds.run(pieces0, pieces1, king1);
+            }
+            let width = pieces1.count_ones() as usize;
+            for (row, king0) in slice.chunks(width).zip(BitIter::from(pieces0)) {
+                let take = seeds.take(pieces1, king0);
+                let quiet = seeds.quiet(pieces0, king0);
+                for (val, (&t, &r)) in row.iter().zip(zip(&temple, &run)) {
+                    let seed = t | take | quiet & r;
+                    if seed != 0 {
+                        val.store(seed, Ordering::Relaxed);
                     }
                 }
             }
@@ -175,30 +164,8 @@ impl<'a> Iterator for TableJob<'a> {
             let mut cursor = LayoutCursor::new(counts);
             // no move left worth running means the layout is retired, and a
             // retired layout is never unranked into a layout
-            //
-            // Late in a solve most of them are retired, so the scan is sixteen
-            // at a time once it is aligned to that: a search that stops early
-            // is not one the compiler vectorises. A block is a whole number of
-            // those.
             let find = |live: &[u32], from: usize| {
-                const STRIDE: usize = 16;
-                debug_assert!(live.len() % STRIDE == 0);
-                let mut i = from;
-                while i % STRIDE != 0 {
-                    if live.get(i)? != &0 {
-                        return Some(i);
-                    }
-                    i += 1;
-                }
-                while i < live.len() {
-                    let words = Simd::<u32, STRIDE>::from_slice(unsafe { live.get_unchecked(i..i + STRIDE) });
-                    let set = words.simd_ne(Simd::splat(0)).to_bitmask();
-                    if set != 0 {
-                        return Some(i + set.trailing_zeros() as usize);
-                    }
-                    i += STRIDE;
-                }
-                None
+                live[from..].iter().position(|&moves| moves != 0).map(|k| from + k)
             };
 
             UPDATE.with(|vals| {
@@ -303,8 +270,7 @@ impl AllTables {
     /// list for what it can still spread, not for being settled, so the solve
     /// never finds out what the ones it dropped early settled on.
     pub fn count_unresolved(&self) -> u64 {
-        count_indexer(self.size)
-            .into_iter()
+        all_counts(self.size)
             .filter(|&counts| self.has(counts))
             .map(|counts: PawnCount| {
                 let immutable = ImmutableUpdate::new(self, counts);

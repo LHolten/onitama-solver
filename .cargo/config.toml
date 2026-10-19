@@ -16,21 +16,6 @@ rustflags = ["-Cllvm-args=-align-all-nofallthru-blocks=5"]
 # with `nm --defined-only <bin> | grep __global_pointer`, which only wild emits.
 rustflags = ["-Ctarget-cpu=native"]
 
-# Build the standard library from source with the flags above, instead of
-# linking the prebuilt one, which is compiled for baseline x86-64. Its generic
-# code is monomorphised here either way, but anything in it that picks an
-# implementation with `#[cfg(target_feature)]` decided that when it was built:
-# `Simd::swizzle_dyn` only becomes one `vpermb` with a `core` that knows about
-# AVX-512 VBMI, and is a byte by byte loop otherwise.
-#
-# Needs nightly and the `rust-src` component, and an explicit target, which puts
-# the output under `target/x86_64-unknown-linux-gnu/` rather than `target/`.
-[unstable]
-build-std = ["std"]
-
-[build]
-target = "x86_64-unknown-linux-gnu"
-
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-Ctarget-cpu=alderlake", "-Ctarget-feature=+crt-static"]
 
