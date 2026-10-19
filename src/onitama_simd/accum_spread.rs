@@ -10,7 +10,7 @@ use std::{
 
 use bit_iter::BitIter;
 
-use super::{Chunk, PreparedMove, Spread, SpreadStatus, MAX_ROWS, PAD};
+use super::{Chunk, PreparedMove, Spread, SpreadStatus, TeamLayout, MAX_ROWS, PAD};
 
 /// `src` read through `idx`, with every lane `keep` leaves out zeroed.
 ///
@@ -88,14 +88,14 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
             for mv in group {
                 let (from, to) = mv.step;
 
-                // A row that is not there, and one whose king moved onto its
-                // own temple, read nothing and stay all ones. That is the
-                // identity of the and, which is what dropping them means.
+                // A row that is not there reads nothing and stays all ones.
+                // That is the identity of the and, which is what dropping it
+                // means.
                 #[cfg(all(target_feature = "avx512f", target_feature = "avx512vpopcntdq"))]
                 {
                     use std::arch::x86_64::{
-                        _mm512_mask_and_epi32, _mm512_mask_cmpneq_epu32_mask, _mm512_maskz_loadu_epi32,
-                        _mm512_permutexvar_epi32, _mm512_set1_epi32, _mm512_sllv_epi32,
+                        _mm512_mask_and_epi32, _mm512_maskz_loadu_epi32, _mm512_permutexvar_epi32,
+                        _mm512_sllv_epi32,
                     };
                     // Every slot reads one word of the target, so the whole move
                     // is one permute out of a register: the target is at most
@@ -122,15 +122,11 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
                     // the target's own length, which is all of it there is
                     let size = mv.rows_new.count_ones() * mv.width_new as u32;
                     unsafe {
-                        // a king onto its own temple reads nothing, like a row
-                        // that is not there; one compare under the rows' mask
-                        // keeps that in a mask register
-                        let live = _mm512_mask_cmpneq_epu32_mask(rows, new0.into(), _mm512_set1_epi32(22));
                         // the lanes past the target are masked off, so they
                         // neither read nor fault even at the end of the table
                         let src = _mm512_maskz_loadu_epi32(((1u32 << size) - 1) as u16, mv.src().cast());
                         let picked = _mm512_permutexvar_epi32(idx.into(), src);
-                        all = _mm512_mask_and_epi32(all.into(), live, all.into(), picked).into();
+                        all = _mm512_mask_and_epi32(all.into(), rows, all.into(), picked).into();
                     }
                 }
                 #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512vpopcntdq")))]
@@ -152,9 +148,6 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
                         let king0 = unsafe { *kings.get_unchecked(r) };
                         // the king moved exactly when it was the piece on `from`
                         let new0 = if king0 == from { to } else { king0 };
-                        if new0 == 22 {
-                            continue;
-                        }
                         let tbase = (mv.rows_new & (1 << new0) - 1).count_ones() as usize * width_new;
                         // a row is read whole however short it is, which the `PAD`
                         // of slack on the table is there to let the last one do
@@ -201,8 +194,10 @@ impl Spread<'_> {
             cols: cols_old,
             ..
         } = self.old;
-        let rows_new = self.new.pieces0 & !(1 << 22);
-        let cols_new = self.new.pieces1 & !(1 << 2);
+        let TeamLayout {
+            pieces0: rows_new,
+            pieces1: cols_new,
+        } = self.new;
         let width_new = cols_new.count_ones() as usize;
 
         // Which slot each target column reads is a rotate of a run of them. The
@@ -210,22 +205,8 @@ impl Spread<'_> {
         // so the columns between the two shift along by one and every column
         // outside stays where it was. `p` is the column it arrives in, which is
         // the one that reads the slot `f` it left.
-        //
-        // A piece on the temple has no column, so `from` there means `p` reads
-        // nothing and `to` there means the piece leaves the chunk and there is
-        // no arrival column at all. Both only ever drop lanes, so they are a
-        // bound on the run and a bit out of `live` rather than a case.
-        let gone = from == 2;
-        let f = if gone {
-            width_new.saturating_sub(1)
-        } else {
-            (cols_old & (1 << from) - 1).count_ones() as usize
-        };
-        let p = if to == 2 {
-            width_new
-        } else {
-            (cols_new & (1 << to) - 1).count_ones() as usize
-        };
+        let f = (cols_old & (1 << from) - 1).count_ones() as usize;
+        let p = (cols_new & (1 << to) - 1).count_ones() as usize;
 
         let lane = Simd::<u64, PAD>::from_array(std::array::from_fn(|k| k as u64));
         let at_p = lane.simd_eq(Simd::splat(p as u64));
@@ -239,7 +220,7 @@ impl Spread<'_> {
             let run = lane.simd_gt(Simd::splat(p as u64)) & lane.simd_le(Simd::splat(f as u64));
             (run, lane - Simd::splat(1))
         };
-        let live = lane.simd_lt(Simd::splat(width_new as u64)) & !(at_p & Mask::splat(gone));
+        let live = lane.simd_lt(Simd::splat(width_new as u64));
         // which slot every column reads, which is the whole mapping and the
         // same for every row, so it is settled once for the move
         let idx = at_p.select(Simd::splat(f as u64), run.select(step, lane));

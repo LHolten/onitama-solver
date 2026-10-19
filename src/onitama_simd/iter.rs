@@ -51,13 +51,14 @@ impl LayoutCursor {
 }
 
 impl PawnCount {
-    /// How many states the table for these counts holds.
+    /// How many states of the table for these counts are still in play.
     ///
-    /// A chunk only has a slot per king position that can exist, and neither
-    /// king can stand on its own temple, so a layout with a piece there has one
-    /// fewer choice for that king. The layouts that do have one are just a
-    /// multinomial with that square spoken for, which makes the whole sum
-    /// closed form instead of a walk over every layout.
+    /// A chunk has a slot for every king position, but one with a king on its
+    /// own temple is a game that is already [`over`](super::KingPos::over), so
+    /// a layout with a piece there has one fewer choice for that king. The
+    /// layouts that do have one are just a multinomial with that square spoken
+    /// for, which makes the whole sum closed form instead of a walk over every
+    /// layout.
     pub fn states(self) -> u64 {
         let (k0, k1) = (self.count0 as i32 + 1, self.count1 as i32 + 1);
         let comb = |n, a, b| combinations(n, a, b) as u64;
@@ -450,7 +451,7 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::{
-        index::Indexer,
+        index::{Indexer, InternalIter},
         onitama_simd::{
             iter::{combinations, combinations_old, g, ranking, unranking},
             PawnCount,
@@ -476,16 +477,16 @@ mod tests {
         }
     }
 
-    /// `states` has to agree with adding up what every layout actually holds,
-    /// which is the walk it replaces.
+    /// `states` has to agree with counting the king positions of every layout
+    /// that are still in play, which is the walk it replaces.
     #[test]
     fn test_states() {
         for (count0, count1) in [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (0, 2), (2, 1), (1, 2)] {
             let counts = PawnCount { count0, count1 };
-            let walked: u64 = counts
-                .into_iter()
-                .map(|layout| layout.indexer(counts).total() as u64)
-                .sum();
+            let mut walked = 0u64;
+            for layout in counts {
+                layout.indexer(counts).for_each(|kpos| walked += !kpos.over() as u64);
+            }
             assert_eq!(counts.states(), walked, "{counts:?}");
         }
     }

@@ -66,20 +66,8 @@ impl TeamLayout {
         debug_assert_eq!(self.pieces1.count_ones(), counts.count1 + 1);
 
         Empty::default()
-            .choose_one(
-                proj!(|p: KingPos| p.king0),
-                (
-                    self.pieces0 & !(1 << 22),
-                    counts.count0 + (self.pieces0 & 1 << 22 == 0) as u32,
-                ),
-            )
-            .choose_one(
-                proj!(|p: KingPos| p.king1),
-                (
-                    self.pieces1 & !(1 << 2),
-                    counts.count1 + (self.pieces1 & 1 << 2 == 0) as u32,
-                ),
-            )
+            .choose_one(proj!(|p: KingPos| p.king0), (self.pieces0, counts.count0 + 1))
+            .choose_one(proj!(|p: KingPos| p.king1), (self.pieces1, counts.count1 + 1))
     }
 
     fn counts(self) -> PawnCount {
@@ -105,6 +93,17 @@ pub struct KingPos {
 }
 
 impl KingPos {
+    /// Whether a king stands on the temple it wins on, so the game is already
+    /// over.
+    ///
+    /// These still get a slot, which keeps every chunk of a table the full
+    /// rectangle of king positions, but no state still in play depends on what
+    /// it holds. It holds all ones from the seed on, which is what keeps it out
+    /// of the way: see [`AllTables::ez_win_for_each`].
+    fn over(self) -> bool {
+        self.king0 == 22 || self.king1 == 2
+    }
+
     fn invert(self) -> Self {
         Self {
             king0: 24 - self.king1,
@@ -382,11 +381,19 @@ impl Table {
         &self.list[self.chunk_size * rank..][..self.chunk_size]
     }
 
+    /// The won states, of the ones still in play.
+    ///
+    /// The slots of a game that is already over hold all ones, and they are
+    /// every slot [`PawnCount::states`] leaves out, so they come off as a
+    /// count instead of being picked out one by one.
     fn count_ones(&self) -> u64 {
-        self.list
+        let all: u64 = self
+            .list
             .iter()
             .map(|x| x.load(Ordering::Relaxed).bitand(BLOCK_MASK).count_ones() as u64)
-            .sum()
+            .sum();
+        let over = self.list.len() as u64 - self.counts.states();
+        all - over * BLOCK_MASK.count_ones() as u64
     }
 }
 
@@ -562,8 +569,7 @@ pub struct Update<'a, 't> {
 /// layout once instead of out of every [`Accum`] and [`Spread`] it builds.
 #[derive(Debug, Clone, Copy)]
 pub struct Chunk {
-    /// Where this side's king can stand, which is its pieces without its
-    /// temple: a king on its own temple has already won.
+    /// Where this side's king can stand, which is on any of its pieces.
     rows: u32,
     /// The same for the other side, and how long a row really is.
     cols: u32,
@@ -573,15 +579,24 @@ pub struct Chunk {
 
 impl Chunk {
     fn new(layout: TeamLayout) -> Self {
-        let rows = layout.pieces0 & !(1 << 22);
-        let cols = layout.pieces1 & !(1 << 2);
+        let TeamLayout {
+            pieces0: rows,
+            pieces1: cols,
+        } = layout;
         let this = Self {
             rows,
             cols,
             height: rows.count_ones() as usize,
             width: cols.count_ones() as usize,
         };
-        debug_assert!(this.height <= MAX_ROWS && this.width <= PAD);
+        // Not a check but a bound for the vectoriser, which it needs to keep
+        // the walks over `padded` slots a whole vector at a time: told nothing,
+        // it sees a popcount of up to 32 rows, and the expansion in the spread
+        // falls back to a pair at a time for +20% instructions on the solve.
+        //
+        // SAFETY: a side has at most `PAD` pieces, which `AllTables::build`
+        // holds the sizes to
+        unsafe { std::hint::assert_unchecked(this.height <= MAX_ROWS && this.width <= PAD) };
         this
     }
 
@@ -633,6 +648,23 @@ pub struct SpreadStatus {
 }
 
 impl AllTables {
+    /// The states won outright, which is what the solve is seeded with.
+    ///
+    /// Those are the ones where the side to move can step its king onto the
+    /// temple or take the other king, and the ones where the game is already
+    /// [`over`](KingPos::over), which count as won with every card. That last
+    /// is not true of the game, but nothing still in play can tell:
+    ///
+    /// - The only move from a state in play into such a slot is a king onto its
+    ///   temple, and that state is seeded as won for every card the move is
+    ///   made with. Reading all ones there is the same as not reading it.
+    /// - Its mirror is another such slot, so a chunk's game over rows read all
+    ///   ones for their wins. That leaves them nothing lost to spread and
+    ///   nothing they could still spread, so they retire with the rest.
+    /// - A spread into one finds every bit already there.
+    ///
+    /// And all ones is something the counts can take back out exactly: see
+    /// [`Table::count_ones`].
     pub fn ez_win_for_each(
         &self,
         counts: PawnCount,
@@ -647,15 +679,12 @@ impl AllTables {
             let from_mask = offset_mask(2, bitmap);
 
             layout.indexer(counts).for_enumerate(|i, kpos| {
-                if 1 << kpos.king1 & from_mask == 0 || 1 << 2 & pieces1 != 0 {
-                    // no attack on temple
-                    let from_mask = offset_mask(kpos.king0 as usize, bitmap);
-                    if from_mask & pieces1 == 0 {
-                        // no attack on king
-                        return;
-                    }
+                // a piece of your own on the temple is in the way
+                let temple = 1 << kpos.king1 & from_mask != 0 && 1 << 2 & pieces1 == 0;
+                let king = offset_mask(kpos.king0 as usize, bitmap) & pieces1 != 0;
+                if kpos.over() || temple || king {
+                    f(i, mask);
                 }
-                f(i, mask);
             })
         }
     }

@@ -82,7 +82,7 @@ impl<'t> Update<'_, 't> {
                     current
                 };
 
-                let width_new = (new.pieces1 & !(1 << 2)).count_ones();
+                let width_new = new.pieces1.count_ones();
                 // the column a capture takes out of the source, which is where
                 // the row breaks; without one it never does
                 let split = if width_new == chunk.width as u32 {
@@ -98,7 +98,7 @@ impl<'t> Update<'_, 't> {
                     step: (from, to),
                     mask,
                     new,
-                    rows_new: new.pieces0 & !(1 << 22),
+                    rows_new: new.pieces0,
                     width_new: width_new as u8,
                     keep,
                     // `locate` works out which chunk of it
