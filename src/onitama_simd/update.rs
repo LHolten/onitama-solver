@@ -1,7 +1,7 @@
 use std::{
     iter::zip,
     simd::{Mask, Select, Simd, ToBytes},
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::AtomicU32,
 };
 
 use bit_iter::BitIter;
@@ -9,8 +9,8 @@ use bit_iter::BitIter;
 use crate::card::offset_mask_fixed as offset_mask;
 
 use super::{
-    accum_spread::{accumulate, permute}, locate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread,
-    SpreadStatus, TeamLayout, Update, BLOCK_MASK, LANES, LANE_COL, LANE_ROW, SLOTS,
+    accum_spread::{accumulate, invert, load, permute}, locate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread,
+    SpreadStatus, TeamLayout, Update, BLOCK_MASK, LANES, LANE_COL, LANE_ROW,
 };
 
 
@@ -24,16 +24,24 @@ pub struct UpdateStatus {
 
 impl<'t> Update<'_, 't> {
     pub fn get_unresolved<const COUNT: bool>(&mut self) -> u64 {
-        let inv = self.prepare_forward(self.layout);
-        self.finish_unresolved::<COUNT>(inv)
+        let inv = self.mirror(self.layout);
+        self.prepare_forward(self.layout, 0);
+        self.finish_unresolved::<COUNT>(inv).0
     }
 
-    /// Locate and prefetch the mirrored chunk and every forward move of
-    /// `layout`, which need not be this update's own: see
-    /// [`Self::update_layout`].
-    fn prepare_forward(&mut self, layout: TeamLayout) -> &'t [AtomicU32] {
+    /// Locate and prefetch the mirrored chunk of `layout`, which need not be
+    /// this update's own: see [`Self::update_layout`].
+    fn mirror(&self, layout: TeamLayout) -> &'t [AtomicU32] {
+        let slice = self.immutable.inv_current.index(layout.invert()).slice;
+        prefetch(slice);
+        slice
+    }
+
+    /// Locate and prefetch every forward move of `layout`, which need not be
+    /// this update's own: see [`Self::update_layout`]. `spent` is the moves
+    /// [`accumulate`] found can no longer change anything, which are left out.
+    fn prepare_forward(&mut self, layout: TeamLayout, spent: u32) {
         let ImmutableUpdate {
-            inv_current,
             current,
             take_one,
             mask_lookup,
@@ -42,12 +50,6 @@ impl<'t> Update<'_, 't> {
         } = *self.immutable;
         let pieces0 = layout.pieces0;
         let chunk = Chunk::new(layout);
-
-
-        // the mirrored chunk is only read at the very end, but its address does
-        // not depend on any of the work in between, so start the miss now
-        let inv_slice = inv_current.index(layout.invert());
-        prefetch(inv_slice.slice);
 
         // every 0 bit means that it could be anything, win loss or draw
         // every 1 bit means that it must be a draw or win
@@ -58,6 +60,7 @@ impl<'t> Update<'_, 't> {
         // the actual work; see `PreparedMove`
         let moves = &mut self.moves.forward;
         moves.clear();
+        let mut seen = 0u32;
         for offset in BitIter::from(directions) {
             let mask = mask_lookup[offset];
             let to_mask = offset_mask(offset, pieces0);
@@ -65,6 +68,13 @@ impl<'t> Update<'_, 't> {
             let to_mask = to_mask & !pieces0;
 
             for to in BitIter::from(to_mask) {
+                // shared and wrapping like the bits of the backward moves, see
+                // `TableJob::live`
+                let bit = 1u32 << (seen & 31);
+                seen += 1;
+                if bit & spent != 0 {
+                    continue;
+                }
                 let from = to + 12 - offset;
 
                 let new = TeamLayout {
@@ -95,7 +105,7 @@ impl<'t> Update<'_, 't> {
                 // there is no capture to break the row, in every row
                 let keep = ((1u32 << split) - 1) * chunk.starts;
                 moves.push(PreparedMove {
-                    bit: 0,
+                    bit,
                     step: (from, to),
                     mask,
                     new,
@@ -107,18 +117,21 @@ impl<'t> Update<'_, 't> {
             }
         }
         locate(moves);
-        inv_slice.slice
     }
 
     /// Build `status` and `wins` from the moves [`Self::prepare_forward`]
-    /// located.
-    fn finish_unresolved<const COUNT: bool>(&mut self, inv: &[AtomicU32]) -> u64 {
+    /// located, and say which of those moves are spent.
+    fn finish_unresolved<const COUNT: bool>(&mut self, inv: &[AtomicU32]) -> (u64, u32) {
         let chunk = Chunk::new(self.layout);
         let padded = chunk.padded();
+        // the wins first, since they decide which reads still matter. The slots
+        // no king position uses are set to won, which makes them resolved and
+        // contributes nothing, so the walks below need no bounds of their own
+        self.load_stuff(inv, chunk);
         let mem = &mut *self.mem;
         // no clearing first: `accumulate` writes every slot it covers, and it
         // covers the whole of `padded`
-        accumulate(chunk, &self.moves.forward, &mut mem.status);
+        let matter = accumulate(chunk, &self.moves.forward, &mut mem.status, &mem.wins);
 
         // we expand, marking all states that are not lost because it has the card
         // then we negate to get only the lost states
@@ -126,22 +139,20 @@ impl<'t> Update<'_, 't> {
             .iter_mut()
             .for_each(|x| *x = !Block(*x).invert().expand().invert().0);
 
-        // the slots no king position uses are set to won, which makes them
-        // resolved and contributes nothing, so the walks below need no bounds
-        // of their own
-        self.load_stuff(inv, chunk);
-
-        self.check_unresolved::<COUNT>(padded)
+        (self.check_unresolved::<COUNT>(padded), !matter)
     }
 
-    /// `pre` is what [`Self::prepare_forward`] gave for this layout if the
-    /// previous update already ran it, and `next` the layout to run it for in
-    /// turn. The return carries that on to the next update.
+    /// `pre` is this layout's mirrored chunk if the previous update already
+    /// located it and ran [`Self::prepare_forward`] for it, and `next` the
+    /// layout, with its spent moves, to do that for in turn. The return carries
+    /// that on to the next update. `spent` is this layout's, and comes back
+    /// updated.
     pub fn update_layout(
         mut self,
         live: &mut u32,
+        spent: &mut u32,
         pre: Option<&'t [AtomicU32]>,
-        next: Option<TeamLayout>,
+        next: Option<(TeamLayout, u32)>,
     ) -> (UpdateStatus, Option<&'t [AtomicU32]>) {
         let go_up = self.immutable.go_up;
 
@@ -155,12 +166,23 @@ impl<'t> Update<'_, 't> {
         // the `go_up` pass prepares a different set of moves, so the bits would
         // not line up. It only runs once, so there is nothing to remember.
         let live = if go_up { &mut scratch } else { live };
-        let inv = pre.unwrap_or_else(|| self.prepare_forward(self.layout));
+        let inv = pre.unwrap_or_else(|| {
+            let inv = self.mirror(self.layout);
+            self.prepare_forward(self.layout, *spent);
+            inv
+        });
+        // The next mirrored chunk is the first thing its update reads, ahead of
+        // the forward moves, since it decides which of their reads matter. So
+        // its miss starts here, a whole update ahead of the read.
+        let inv_next = next.map(|(next, _)| self.mirror(next));
         self.prepare_spread(go_up, *live);
-        let unresolved = self.finish_unresolved::<false>(inv);
-        // this layout's forward moves are spent, so their buffer is free for
-        // the next one's, and everything from here on is distance for them
-        let ahead = next.map(|next| self.prepare_forward(next));
+        let unresolved;
+        (unresolved, *spent) = self.finish_unresolved::<false>(inv);
+        // this layout's forward moves are done with, so their buffer is free
+        // for the next one's, and everything from here on is distance for them
+        if let Some((next, spent)) = next {
+            self.prepare_forward(next, spent);
+        }
 
         let res = self.run_spread(go_up, live);
 
@@ -195,7 +217,7 @@ impl<'t> Update<'_, 't> {
             unresolved: if go_up || res.could { unresolved } else { 0 },
             went_up,
         };
-        (status, ahead)
+        (status, inv_next)
     }
 
     /// Locate and prefetch every backward move.
@@ -413,16 +435,14 @@ impl<'t> Update<'_, 't> {
         // permute per vector and the write one store each. That store is also
         // the only thing the walks after this read `wins` through: a wide load
         // over a run of narrow stores cannot be forwarded from them and waits
-        // for every one of them to reach the cache, and those stores wait on
-        // the mirrored chunk.
+        // for every one of them to reach the cache.
         //
-        // An atomic load a word at a time is what reading it while other
-        // threads `fetch_or` into it takes.
-        let mut words = [0; SLOTS];
-        for (word, x) in zip(&mut words, inv) {
-            *word = x.load(Ordering::Relaxed);
-        }
-        let (low, high) = (Simd::from_slice(&words[..LANES]), Simd::from_slice(&words[LANES..]));
+        // So the chunk is read straight into the vectors, although other
+        // threads `fetch_or` into it, which is sound for the reason
+        // `PreparedMove::src` gives. Going through words on the stack would
+        // wait for every store older than these, which this early in the
+        // update is all of the backward moves' ranking.
+        let [low, high] = load(unsafe { std::slice::from_raw_parts(inv.as_ptr().cast::<u32>(), inv.len()) });
         let (rows_v, cols_v) = (Simd::splat(rows as u32), Simd::splat(cols as u32));
         let lane = Simd::<u32, LANES>::from_array(std::array::from_fn(|l| l as u32));
         for start in (0..chunk.padded()).step_by(LANES) {
@@ -430,14 +450,7 @@ impl<'t> Update<'_, 't> {
             let c = Simd::<u32, LANES>::from_slice(&LANE_COL[cols][start..start + LANES]);
             // the slots past the chunk read anywhere: they are overwritten
             let idx = (cols_v - Simd::splat(1) - c) * rows_v + (rows_v - Simd::splat(1) - r);
-            let x = permute(low, high, idx);
-            // `Block::invert`, a lane at a time
-            const MASK0: u32 = 0b001001_001001_001001_001001_001001;
-            const MASK1: u32 = 0b000111_000111_000111_000111_000111;
-            let m0 = Simd::splat(MASK0);
-            let m1 = Simd::splat(MASK1);
-            let x = (x & m0 << 1) << 1 | (x & m0 << 2) >> 1 | (x & m0);
-            let x = (x & m1) << 3 | (x & m1 << 3) >> 3;
+            let x = invert(permute(low, high, idx));
             // the slots no king position uses are set to won, which makes them
             // resolved and contributes nothing, so the walks below need no
             // bounds of their own

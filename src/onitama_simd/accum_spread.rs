@@ -10,7 +10,7 @@ use std::{
 
 use bit_iter::BitIter;
 
-use super::{Chunk, PreparedMove, Spread, SpreadStatus, TeamLayout, LANES, LANE_COL, LANE_ROW, ROW, SIDE};
+use super::{BLOCK_MASK, Chunk, PreparedMove, Spread, SpreadStatus, TeamLayout, LANES, LANE_COL, LANE_ROW, ROW, SIDE};
 
 /// The words of `low` and then `high` that `idx` names, a lane each.
 ///
@@ -53,6 +53,28 @@ fn pick(src: Simd<u64, ROW>, idx: Simd<u64, ROW>, keep: Mask<i64, ROW>) -> Simd<
     }
 }
 
+/// `Block::invert`, a lane at a time.
+#[inline(always)]
+pub fn invert(x: Simd<u32, LANES>) -> Simd<u32, LANES> {
+    const MASK0: u32 = 0b001001_001001_001001_001001_001001;
+    const MASK1: u32 = 0b000111_000111_000111_000111_000111;
+    let (m0, m1) = (Simd::splat(MASK0), Simd::splat(MASK1));
+    let x = (x & m0 << 1) << 1 | (x & m0 << 2) >> 1 | (x & m0);
+    (x & m1) << 3 | (x & m1 << 3) >> 3
+}
+
+/// The bits of the accumulator that cannot change a state `wins` leaves open.
+///
+/// A slot's not lost states are `invert(expand(invert(acc)))`, which is an or
+/// of two rotations of every bit, so a bit only matters if one of the two
+/// states it lands on is not won yet. That is the same rotations with an and.
+#[inline(always)]
+pub fn settled(wins: Simd<u32, LANES>) -> Simd<u32, LANES> {
+    let w = invert(wins);
+    let rot = |x: Simd<u32, LANES>, by: u32| (x << by | x >> (30 - by)) & Simd::splat(BLOCK_MASK);
+    invert(rot(w, 10) & rot(w, 20))
+}
+
 /// Add what every move says about the source chunk.
 ///
 /// The moves come off the card offsets, so every move of one offset carries the
@@ -70,7 +92,12 @@ fn pick(src: Simd<u64, ROW>, idx: Simd<u64, ROW>, keep: Mask<i64, ROW>) -> Simd<
 /// holding its neighbour is the one with the king on the captured square: this
 /// move takes that king for every card it has, so the slot is won and anything
 /// claiming it is not lost is true there.
-pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
+///
+/// Returns the bits of the moves that can still change something, the same way
+/// the spread does. A move whose every read is all ones where it matters adds
+/// nothing, and as the targets and `wins` only ever gain bits, it never will:
+/// the caller stops reading it.
+pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32], wins: &[u32]) -> u32 {
     let Chunk {
         rows, height, width, ..
     } = chunk;
@@ -84,6 +111,7 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
         kings |= (king0 as u32) << 5 * i;
     }
 
+    let mut matter = Simd::<u32, LANES>::splat(0);
     // The slots on the outside and the offsets within, so what every offset
     // contributes to these slots adds up in a register and `status` is written
     // once. It is also the only write, which is what lets the caller hand this
@@ -96,10 +124,13 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
         let col = Simd::<u32, LANES>::from_slice(&LANE_COL[width][start..start + LANES]);
         let king = Simd::splat(kings) >> row * Simd::splat(5) & Simd::splat(31);
         let live = ((1u32 << (slots - start).min(LANES)) - 1) as u16;
+        // the slots past the chunk are all won, so nothing there matters
+        let settled = settled(Simd::from_slice(&wins[start..start + LANES]));
 
         // `moves` is built offset by offset, so an offset is a run of it
         for group in moves.chunk_by(|a, b| a.mask == b.mask) {
             let card = Simd::<u32, LANES>::splat(group[0].mask);
+            let open = card & !settled;
             let mut all = Simd::<u32, LANES>::splat(u32::MAX);
 
             for mv in group {
@@ -130,7 +161,13 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
                 // A slot that is not there reads nothing and stays all ones.
                 // That is the identity of the and, which is what dropping it
                 // means.
-                all = Mask::<i32, LANES>::from_bitmask(live as u64).select(all & read(target, idx), all);
+                let word = read(target, idx);
+                all = Mask::<i32, LANES>::from_bitmask(live as u64).select(all & word, all);
+                // A coin flip in the first pass, so not a branch, which is
+                // what a scalar test turns into whatever it is written as: an
+                // or into the lanes that still need it, folded at the end.
+                let open_read = (open & !word).simd_ne(Simd::splat(0));
+                matter = open_read.select(matter | Simd::splat(mv.bit), matter);
             }
 
             // if no move of this offset is won, then the state is not lost
@@ -139,6 +176,31 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
 
         let out = unsafe { status.get_unchecked_mut(start..start + LANES) };
         acc.copy_to_slice(out);
+    }
+    matter.reduce_or()
+}
+
+/// A whole chunk, as the two vectors it fits in, with the lanes past it zero.
+///
+/// Masked loads like [`read`]'s, so the lanes past the chunk neither read nor
+/// fault.
+#[inline(always)]
+pub fn load(chunk: &[u32]) -> [Simd<u32, LANES>; 2] {
+    #[cfg(target_feature = "avx512f")]
+    unsafe {
+        use std::arch::x86_64::{_mm512_maskz_loadu_epi32, _mm512_setzero_si512};
+        let lanes = (1u32 << chunk.len()) - 1;
+        let low = _mm512_maskz_loadu_epi32(lanes as u16, chunk.as_ptr().cast());
+        let high = if chunk.len() > LANES {
+            _mm512_maskz_loadu_epi32((lanes >> LANES) as u16, chunk.as_ptr().add(LANES).cast())
+        } else {
+            _mm512_setzero_si512()
+        };
+        [low.into(), high.into()]
+    }
+    #[cfg(not(target_feature = "avx512f"))]
+    {
+        [0, LANES].map(|start| Simd::from_array(std::array::from_fn(|l| chunk.get(start + l).copied().unwrap_or(0))))
     }
 }
 

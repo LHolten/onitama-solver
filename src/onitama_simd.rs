@@ -1060,6 +1060,11 @@ struct TableJob<'a> {
     /// together. That loses skips rather than correctness, and only on the
     /// chunks that actually overflow.
     live: Vec<u32>,
+    /// Per layout, one bit per forward move: its target can no longer change
+    /// anything here, so it is not read. Shared and wrapping like `live`, and
+    /// set rather than cleared, so the zeroed allocation starts with every move
+    /// read.
+    spent: Vec<u32>,
     /// One bit per layout: retired, but its capture predecessors still have to
     /// be written by the `go_up` pass.
     needs_up: Vec<u64>,
@@ -1452,6 +1457,26 @@ mod tests {
     /// The card masks [`Seeds`] uses partition every configuration: the side
     /// card is a card in 6 of them, the side to move holds it in 12 and the
     /// opponent in the other 12, and the side to move always holds two.
+    /// A bit is settled exactly when every not lost state it would make is
+    /// already won.
+    #[test]
+    fn settled_bits() {
+        use std::simd::Simd;
+        let mut x = 0x9e37_79b9u32;
+        for _ in 0..2000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            // dense wins, so both answers turn up
+            let wins = (x | x.rotate_left(7) | x.rotate_left(19)) & super::BLOCK_MASK;
+            let settled = super::accum_spread::settled(Simd::splat(wins))[0];
+            for p in 0..30 {
+                let lands = Block(1 << p).invert().expand().invert().0;
+                assert_eq!(settled >> p & 1 != 0, lands & !wins == 0, "wins {wins:#x} bit {p}");
+            }
+        }
+    }
+
     #[test]
     fn card_masks() {
         use super::{Cards, Seeds, BLOCK_MASK};

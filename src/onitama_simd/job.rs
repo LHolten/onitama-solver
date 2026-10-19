@@ -71,10 +71,17 @@ impl<'a> TableJob<'a> {
         live[..total].par_iter_mut().for_each(|x| *x = u32::MAX);
         #[cfg(not(feature = "parallell"))]
         live[..total].fill(u32::MAX);
+        // no move is spent yet, which is what the zeroed pages say already, but
+        // faulted in here and in parallel: left to the first pass, every thread
+        // would take its faults at once and queue on them
+        let mut spent = vec![0u32; padded];
+        #[cfg(feature = "parallell")]
+        spent.par_chunks_mut(1024).for_each(|x| x[0] = 0);
 
         Self {
             counts,
             live,
+            spent,
             needs_up: vec![0; padded / 64],
             total,
             update,
@@ -202,7 +209,7 @@ impl Iterator for TableJob<'_> {
         let counts = self.counts;
         let immutable = &self.update;
 
-        let block = |b: usize, live: &mut [u32], needs_up: &mut [u64]| {
+        let block = |b: usize, live: &mut [u32], spent: &mut [u32], needs_up: &mut [u64]| {
             let start = b * BLOCK;
             let mut cursor = LayoutCursor::new(counts);
             // no move left worth running means the layout is retired, and a
@@ -229,8 +236,8 @@ impl Iterator for TableJob<'_> {
                         mem: &mut *mem,
                         moves: &mut moves,
                     };
-                    let ahead = next.map(|(_, layout)| layout);
-                    let (tmp, inv) = update.update_layout(&mut live[i], pre, ahead);
+                    let ahead = next.map(|(k, layout)| (layout, spent[k]));
+                    let (tmp, inv) = update.update_layout(&mut live[i], &mut spent[i], pre, ahead);
                     pre = inv;
                     // a `fetch_or` per layout ping-pongs this cache line
                     // between all threads; a relaxed load keeps the line
@@ -263,8 +270,9 @@ impl Iterator for TableJob<'_> {
         let blocks: Vec<_> = self
             .live
             .chunks_mut(BLOCK)
+            .zip(self.spent.chunks_mut(BLOCK))
             .zip(self.needs_up.chunks_mut(WORDS))
-            .map(Mutex::new)
+            .map(|((live, spent), needs_up)| Mutex::new((live, spent, needs_up)))
             .collect();
         let next = AtomicUsize::new(0);
         let work = || loop {
@@ -272,8 +280,8 @@ impl Iterator for TableJob<'_> {
             let Some(slot) = blocks.get(b) else { break };
             // only ever this thread's, so never contended
             let mut guard = slot.lock().unwrap();
-            let (live, needs_up) = &mut *guard;
-            block(b, live, needs_up);
+            let (live, spent, needs_up) = &mut *guard;
+            block(b, live, spent, needs_up);
         };
         #[cfg(feature = "parallell")]
         rayon::broadcast(|_| work());
