@@ -10,10 +10,12 @@ use std::{
     },
 };
 
+use bit_iter::BitIter;
+
 use crate::{index::Indexer, onitama_simd::LocalMem};
 
 use super::{
-    count_indexer, iter::LayoutCursor, AllTables, Block, ImmutableUpdate, Moves, PawnCount, TableJob,
+    count_indexer, iter::LayoutCursor, AllTables, ImmutableUpdate, Moves, PawnCount, TableJob,
     TeamLayout, Update, BLOCK, PAD,
 };
 
@@ -153,18 +155,24 @@ impl<'a> TableJob<'a> {
                     continue;
                 }
                 let layout = cursor.at(start + j);
-                // the slice only depends on the layout, so look it up once
-                let slice = table.index(layout).slice;
+                // the enumeration is in ranking order, so where a layout is in
+                // it is where its chunk is
+                let slice = table.chunk(start + j);
+                let TeamLayout { pieces0, pieces1 } = layout;
+                let seeds = &self.tb.seeds;
 
-                let mut acc = [0u32; PAD * PAD];
-                // mask is the future cards
-                self.tb.ez_win_for_each(counts, layout, &mut |i, mask| {
-                    acc[i] |= Block(mask).invert().expand().0;
-                });
-
-                for (val, &new) in slice.iter().zip(&acc) {
-                    if new != 0 {
-                        val.store(new, Ordering::Relaxed);
+                // a seed is a term of the column or'd with one of the row
+                let mut temple = [0; PAD];
+                for (t, king1) in temple.iter_mut().zip(BitIter::from(pieces1)) {
+                    *t = seeds.temple(pieces1, king1);
+                }
+                let width = pieces1.count_ones() as usize;
+                for (row, king0) in slice.chunks(width).zip(BitIter::from(pieces0)) {
+                    let take = seeds.take(pieces1, king0);
+                    for (val, &t) in row.iter().zip(&temple) {
+                        if t | take != 0 {
+                            val.store(t | take, Ordering::Relaxed);
+                        }
                     }
                 }
             }

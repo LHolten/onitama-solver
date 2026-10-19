@@ -99,7 +99,7 @@ impl KingPos {
     /// These still get a slot, which keeps every chunk of a table the full
     /// rectangle of king positions, but no state still in play depends on what
     /// it holds. It holds all ones from the seed on, which is what keeps it out
-    /// of the way: see [`AllTables::ez_win_for_each`].
+    /// of the way: see [`Seeds`].
     fn over(self) -> bool {
         self.king0 == 22 || self.king1 == 2
     }
@@ -118,6 +118,7 @@ pub struct AllTables {
     cards: Cards,
     mask_lookup: [u32; 25],
     directions: u32,
+    seeds: Seeds,
     list: Box<[Table]>,
     pub block_done: AtomicU64,
     pub block_not_done: AtomicU64,
@@ -553,6 +554,86 @@ pub struct ImmutableUpdate<'a> {
     directions: u32,
 }
 
+/// What the solve is seeded with, per card: the states won outright.
+///
+/// Those are the ones where the side to move can step its king onto the temple
+/// or take the other king, and the ones where the game is already
+/// [`over`](KingPos::over), which count as won with every card. That last is
+/// not true of the game, but nothing still in play can tell:
+///
+/// - The only move from a state in play into such a slot is a king onto its
+///   temple, and that state is seeded as won for every card the move is made
+///   with. Reading all ones there is the same as not reading it.
+/// - Its mirror is another such slot, so a chunk's game over rows read all
+///   ones for their wins. That leaves them nothing lost to spread and nothing
+///   they could still spread, so they retire with the rest.
+/// - A spread into one finds every bit already there.
+///
+/// And all ones is something the counts can take back out exactly: see
+/// [`Table::count_ones`].
+///
+/// A seed is a term of where `pieces1`'s king stands or'd with one of where
+/// the other king does, so a chunk takes one per column and one per row
+/// instead of a walk over every king position per card.
+pub struct Seeds([SeedCard; 5]);
+
+#[derive(Clone, Copy, Default)]
+struct SeedCard {
+    /// The squares this card reaches from the centre.
+    to: u32,
+    /// From where `pieces1`'s king steps onto its temple with it.
+    temple: u32,
+    /// The configurations `pieces1`, to move, holds the card in.
+    mover: u32,
+}
+
+impl Seeds {
+    fn new(cards: Cards) -> Self {
+        let mut seeds = [SeedCard::default(); 5];
+        for (seed, (card, side)) in seeds.iter_mut().zip(zip(cards.iter(), mask_iter())) {
+            // the raw mask is the configurations where it is the side card
+            *seed = SeedCard {
+                to: card.bitmap::<false>(),
+                temple: offset_mask(2, card.bitmap::<false>()),
+                mover: Block(side).invert().expand().0,
+            };
+        }
+        Self(seeds)
+    }
+
+    /// The term of `pieces1`'s king on `king1`: whether it steps onto the
+    /// temple.
+    fn temple(&self, pieces1: u32, king1: usize) -> u32 {
+        if king1 == 2 {
+            return BLOCK_MASK;
+        }
+        let mut win = 0;
+        // a piece of your own on the temple is in the way
+        if pieces1 & 1 << 2 == 0 {
+            for card in &self.0 {
+                if 1 << king1 & card.temple != 0 {
+                    win |= card.mover;
+                }
+            }
+        }
+        win
+    }
+
+    /// The term of the other king on `king0`: whether `pieces1` takes it.
+    fn take(&self, pieces1: u32, king0: usize) -> u32 {
+        if king0 == 22 {
+            return BLOCK_MASK;
+        }
+        let mut win = 0;
+        for card in &self.0 {
+            if offset_mask(king0, card.to) & pieces1 != 0 {
+                win |= card.mover;
+            }
+        }
+        win
+    }
+}
+
 /// `'a` is how long this one update borrows its scratch, and `'t` how long the
 /// tables live, which is past it: what is located for the next update, its
 /// moves and its mirrored chunk, is carried over to it as plain borrows.
@@ -648,23 +729,8 @@ pub struct SpreadStatus {
 }
 
 impl AllTables {
-    /// The states won outright, which is what the solve is seeded with.
-    ///
-    /// Those are the ones where the side to move can step its king onto the
-    /// temple or take the other king, and the ones where the game is already
-    /// [`over`](KingPos::over), which count as won with every card. That last
-    /// is not true of the game, but nothing still in play can tell:
-    ///
-    /// - The only move from a state in play into such a slot is a king onto its
-    ///   temple, and that state is seeded as won for every card the move is
-    ///   made with. Reading all ones there is the same as not reading it.
-    /// - Its mirror is another such slot, so a chunk's game over rows read all
-    ///   ones for their wins. That leaves them nothing lost to spread and
-    ///   nothing they could still spread, so they retire with the rest.
-    /// - A spread into one finds every bit already there.
-    ///
-    /// And all ones is something the counts can take back out exactly: see
-    /// [`Table::count_ones`].
+    /// The seed written out per card and king position, which is the
+    /// definition [`Seeds`] is held to.
     pub fn ez_win_for_each(
         &self,
         counts: PawnCount,
@@ -711,6 +777,7 @@ impl AllTables {
             cards: Cards(cards),
             mask_lookup,
             directions,
+            seeds: Seeds::new(Cards(cards)),
             list: count_indexer(size)
                 .into_iter()
                 .map(|counts: PawnCount| {
@@ -1027,6 +1094,47 @@ mod tests {
     fn counts0() {
         for layout in PawnCount::default() {
             dbg!(layout);
+        }
+    }
+
+    /// What [`Seeds`] works out has to be exactly what the seed is.
+    #[test]
+    fn seeds_match() {
+        use super::{Cards, Indexer, InternalIter, Seeds, BLOCK_MASK};
+        let tb = AllTables {
+            size: 0,
+            cards: Cards(0b11111),
+            mask_lookup: [0; 25],
+            directions: 0,
+            seeds: Seeds::new(Cards(0b11111)),
+            list: Box::new([]),
+            block_done: Default::default(),
+            block_not_done: Default::default(),
+            card_done: Default::default(),
+            card_not_done: Default::default(),
+        };
+        let seed = |counts: PawnCount, layout| {
+            let mut acc = vec![0u32; layout_total(layout, counts)];
+            tb.ez_win_for_each(counts, layout, &mut |i, mask| acc[i] |= Block(mask).invert().expand().0);
+            acc
+        };
+        fn layout_total(layout: super::TeamLayout, counts: PawnCount) -> usize {
+            layout.indexer(counts).total()
+        }
+        for (count0, count1) in [(0, 0), (1, 0), (0, 1), (1, 1), (2, 1), (1, 2), (2, 2)] {
+            let counts = PawnCount { count0, count1 };
+            for layout in counts {
+                let own = seed(counts, layout);
+                layout.indexer(counts).for_enumerate(|i, kpos| {
+                    let (k0, k1) = (kpos.king0 as usize, kpos.king1 as usize);
+                    let computed = if kpos.over() {
+                        BLOCK_MASK
+                    } else {
+                        tb.seeds.temple(layout.pieces1, k1) | tb.seeds.take(layout.pieces1, k0)
+                    };
+                    assert_eq!(computed, own[i], "{layout:?} {kpos:?}");
+                });
+            }
         }
     }
 
