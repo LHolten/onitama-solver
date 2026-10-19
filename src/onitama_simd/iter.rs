@@ -263,16 +263,14 @@ pub(super) fn ranking(s_1: u32, s_2: u32) -> usize {
 /// A lane that runs out of pieces early just stops adding.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
 pub fn ranking16(s_1: Simd<u32, 16>, s_2: Simd<u32, 16>) -> Simd<u32, 16> {
-    use std::arch::x86_64::{_mm512_permutex2var_epi32, _mm512_permutexvar_epi32};
+    use super::accum_spread::{permute, permute16};
 
     // `binom(i, m)` for every square `i`, as the two halves of one table
     let squares = |m: usize, i: Simd<u32, 16>| -> Simd<u32, 16> {
         let [lo, hi] = SQUARES[m].map(Simd::<u32, 16>::from_array);
-        unsafe { _mm512_permutex2var_epi32(lo.into(), i.into(), hi.into()).into() }
+        permute(lo, hi, i)
     };
-    let pascal = |row: &[u32; 16], k: Simd<u32, 16>| -> Simd<u32, 16> {
-        unsafe { _mm512_permutexvar_epi32(k.into(), Simd::from_array(*row).into()).into() }
-    };
+    let pascal = |row: &[u32; 16], k: Simd<u32, 16>| -> Simd<u32, 16> { permute16(Simd::from_array(*row), k) };
 
     let zero = Simd::splat(0);
     let one = Simd::splat(1);

@@ -12,9 +12,8 @@ use bit_iter::BitIter;
 
 use super::{BLOCK_MASK, Chunk, PreparedMove, Spread, SpreadStatus, TeamLayout, LANES, LANE_COL, LANE_ROW, ROW, SIDE};
 
-/// The words of `low` and then `high` that `idx` names, a lane each.
-///
-/// One instruction, which takes the index modulo the two vectors' length.
+/// The words of `low` and then `high` that `idx` names, a lane each, the
+/// index taken modulo the two vectors' length.
 #[inline(always)]
 pub fn permute(low: Simd<u32, LANES>, high: Simd<u32, LANES>, idx: Simd<u32, LANES>) -> Simd<u32, LANES> {
     #[cfg(target_feature = "avx512f")]
@@ -22,24 +21,57 @@ pub fn permute(low: Simd<u32, LANES>, high: Simd<u32, LANES>, idx: Simd<u32, LAN
         use std::arch::x86_64::_mm512_permutex2var_epi32;
         _mm512_permutex2var_epi32(low.into(), idx.into(), high.into()).into()
     }
+    // which of the two the word is in is bit 4 of the index
     #[cfg(not(target_feature = "avx512f"))]
     {
-        Simd::from_array(std::array::from_fn(|l| {
-            let i = idx[l] as usize % (2 * LANES);
-            if i < LANES {
-                low[i]
-            } else {
-                high[i - LANES]
-            }
+        let upper = (idx & Simd::splat(LANES as u32)).simd_ne(Simd::splat(0));
+        upper.select(permute16(high, idx), permute16(low, idx))
+    }
+}
+
+/// The words of `table` that `idx` names, a lane each, the index taken modulo
+/// sixteen.
+///
+/// This and [`permute`] are the only places that name a target, because a
+/// dynamic word permute is the one thing the compiler does not find on its
+/// own: a lane by lane lookup becomes a gather out of a copy on the stack. The
+/// portable form is the byte swizzle, which costs a multiply, an add, a compare
+/// and a masked `vpermb` where AVX-512 has one `vpermd`. AVX2 has the permute
+/// of a half, so there it is one per half and a select on bit 3.
+#[inline(always)]
+pub fn permute16(table: Simd<u32, LANES>, idx: Simd<u32, LANES>) -> Simd<u32, LANES> {
+    #[cfg(target_feature = "avx512f")]
+    unsafe {
+        use std::arch::x86_64::_mm512_permutexvar_epi32;
+        _mm512_permutexvar_epi32(idx.into(), table.into()).into()
+    }
+    #[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
+    unsafe {
+        use std::{arch::x86_64::_mm256_permutevar8x32_epi32, mem::transmute};
+        let [t0, t1]: [Simd<u32, 8>; 2] = transmute(table);
+        let idx: [Simd<u32, 8>; 2] = transmute(idx);
+        transmute(idx.map(|i| {
+            let lo: Simd<u32, 8> = _mm256_permutevar8x32_epi32(t0.into(), i.into()).into();
+            let hi: Simd<u32, 8> = _mm256_permutevar8x32_epi32(t1.into(), i.into()).into();
+            (i & Simd::splat(8)).simd_ne(Simd::splat(0)).select(hi, lo)
         }))
+    }
+    // the four byte indices of the word, as no byte of it carries
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        use std::simd::ToBytes;
+        let bytes = (idx & Simd::splat(LANES as u32 - 1)) * Simd::splat(0x0404_0404) + Simd::splat(0x0302_0100);
+        Simd::from_ne_bytes(table.to_ne_bytes().swizzle_dyn(bytes.to_ne_bytes()))
     }
 }
 
 /// The words of `src` that `idx` names, one per lane, with every lane `keep`
 /// leaves out zeroed.
 ///
-/// The zeroing is the same instruction's mask rather than an and per test that
-/// reads the result.
+/// With AVX-512 the zeroing is the same instruction's mask rather than an and
+/// per test that reads the result, and folding it into the index instead does
+/// not pay for widening that. Elsewhere it is a [`permute16`] of the halves of
+/// the words: word `2k + h` of the result is word `2 idx[k] + h` of `src`.
 #[inline(always)]
 fn pick(src: Simd<u64, ROW>, idx: Simd<u64, ROW>, keep: Mask<i64, ROW>) -> Simd<u64, ROW> {
     #[cfg(target_feature = "avx512f")]
@@ -49,7 +81,11 @@ fn pick(src: Simd<u64, ROW>, idx: Simd<u64, ROW>, keep: Mask<i64, ROW>) -> Simd<
     }
     #[cfg(not(target_feature = "avx512f"))]
     {
-        Simd::from_array(std::array::from_fn(|k| if keep.test(k) { src[idx[k] as usize % ROW] } else { 0 }))
+        use std::simd::{simd_swizzle, ToBytes};
+        let idx = simd_swizzle!(idx.cast::<u32>(), [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]);
+        let half = Simd::from_array(std::array::from_fn(|l| (l % 2) as u32));
+        let words = permute16(Simd::<u32, LANES>::from_ne_bytes(src.to_ne_bytes()), idx + idx + half);
+        keep.select(Simd::<u64, ROW>::from_ne_bytes(words.to_ne_bytes()), Simd::splat(0))
     }
 }
 
@@ -186,22 +222,16 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32], wins
 /// fault.
 #[inline(always)]
 pub fn load(chunk: &[u32]) -> [Simd<u32, LANES>; 2] {
-    #[cfg(target_feature = "avx512f")]
-    unsafe {
-        use std::arch::x86_64::{_mm512_maskz_loadu_epi32, _mm512_setzero_si512};
-        let lanes = (1u32 << chunk.len()) - 1;
-        let low = _mm512_maskz_loadu_epi32(lanes as u16, chunk.as_ptr().cast());
-        let high = if chunk.len() > LANES {
-            _mm512_maskz_loadu_epi32((lanes >> LANES) as u16, chunk.as_ptr().add(LANES).cast())
-        } else {
-            _mm512_setzero_si512()
-        };
-        [low.into(), high.into()]
-    }
-    #[cfg(not(target_feature = "avx512f"))]
-    {
-        [0, LANES].map(|start| Simd::from_array(std::array::from_fn(|l| chunk.get(start + l).copied().unwrap_or(0))))
-    }
+    let low = unsafe { load_masked::<0>(chunk.as_ptr(), chunk.len()) };
+    // the second load only when there is something for it: with every lane
+    // masked off it still costs a microcode assist when the address it would
+    // read is not mapped, and an empty slice's is not
+    let high = if chunk.len() > LANES {
+        unsafe { load_masked::<LANES>(chunk.as_ptr(), chunk.len()) }
+    } else {
+        Simd::splat(0)
+    };
+    [low, high]
 }
 
 /// The words of `target` that `idx` names, a lane each.
@@ -212,24 +242,29 @@ pub fn load(chunk: &[u32]) -> [Simd<u32, LANES>; 2] {
 /// end of the table.
 #[inline(always)]
 fn read(target: &[u32], idx: Simd<u32, LANES>) -> Simd<u32, LANES> {
-    #[cfg(target_feature = "avx512f")]
-    unsafe {
-        use std::arch::x86_64::{_mm512_maskz_loadu_epi32, _mm512_permutexvar_epi32};
-        // a target is at most 25 words, so the shift stays in the word and
-        // its halves are the two vectors' lanes
-        let lanes = (1u32 << target.len()) - 1;
-        let low = _mm512_maskz_loadu_epi32(lanes as u16, target.as_ptr().cast());
-        if target.len() <= LANES {
-            _mm512_permutexvar_epi32(idx.into(), low).into()
-        } else {
-            let high = _mm512_maskz_loadu_epi32((lanes >> LANES) as u16, target.as_ptr().add(LANES).cast());
-            permute(low.into(), high.into(), idx)
-        }
+    let low = unsafe { load_masked::<0>(target.as_ptr(), target.len()) };
+    if target.len() <= LANES {
+        permute16(low, idx)
+    } else {
+        permute(low, unsafe { load_masked::<LANES>(target.as_ptr(), target.len()) }, idx)
     }
-    #[cfg(not(target_feature = "avx512f"))]
-    {
-        Simd::from_array(std::array::from_fn(|l| target.get(idx[l] as usize).copied().unwrap_or(u32::MAX)))
-    }
+}
+
+/// The vector of words `START` on from `ptr`, with the lanes at or past `len`
+/// zero, which neither read nor fault.
+///
+/// The mask is a signed compare of the lane numbers against the length, one
+/// per vector whatever the target. `load_or_default` compares `usize` lanes,
+/// which is four vectors of them for sixteen words and a pack to bring them
+/// back down, and a mask out of a bitmask is two more steps without AVX-512.
+///
+/// # Safety
+/// The `len` words from `ptr` on have to be readable.
+#[inline(always)]
+unsafe fn load_masked<const START: usize>(ptr: *const u32, len: usize) -> Simd<u32, LANES> {
+    let lane = Simd::<i32, LANES>::from_array(std::array::from_fn(|l| (START + l) as i32));
+    let enable = lane.simd_lt(Simd::splat(len as i32));
+    unsafe { Simd::load_select_ptr(ptr.add(START), enable, Simd::splat(0)) }
 }
 
 impl Spread<'_> {
