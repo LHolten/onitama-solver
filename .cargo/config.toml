@@ -1,17 +1,20 @@
-[target.x86_64-unknown-linux-gnu]
-# The second one puts the loop headers on a 32 byte boundary.
+# Every target: put the loop headers on a 32 byte boundary. A `cfg` table's
+# flags are added to those of the target's own table, not replaced by them.
 #
 # The solve is sensitive to where its hot loops sit, and on a 32 byte period:
 # padding inserted in front of the vectorised loop walks the time up and down
 # again every 32 bytes, without the instruction count moving at all. Pinning the
 # headers to that boundary takes the bad positions away. 16 and 64 are both
 # worse, so it is the boundary and not just alignment in general.
-#
+[target.'cfg(true)']
+rustflags = ["-Cllvm-args=-align-all-nofallthru-blocks=5"]
+
+[target.x86_64-unknown-linux-gnu]
 # Note that setting RUSTFLAGS in the environment replaces this list instead of
 # adding to it, which drops the `--ld-path=wild` the global cargo config sets
 # and quietly benchmarks a different binary. Check which linker a binary used
 # with `nm --defined-only <bin> | grep __global_pointer`, which only wild emits.
-rustflags = ["-Ctarget-cpu=native", "-Cllvm-args=-align-all-nofallthru-blocks=5"]
+rustflags = ["-Ctarget-cpu=native"]
 
 # Build the standard library from source with the flags above, instead of
 # linking the prebuilt one, which is compiled for baseline x86-64. Its generic
@@ -29,7 +32,7 @@ build-std = ["std"]
 target = "x86_64-unknown-linux-gnu"
 
 [target.x86_64-unknown-linux-musl]
-rustflags = ["-Ctarget-cpu=znver5", "-Ctarget-feature=+crt-static"]
+rustflags = ["-Ctarget-cpu=native", "-Ctarget-feature=+crt-static"]
 
 # [target.x86_64-pc-windows-gnu]
 # rustflags = ["-Ctarget-cpu=znver2"]

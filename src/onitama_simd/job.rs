@@ -197,7 +197,7 @@ thread_local! {
     static UPDATE: RefCell<LocalMem> = RefCell::new(LocalMem::new());
 }
 
-impl Iterator for TableJob<'_> {
+impl<'a> Iterator for TableJob<'a> {
     type Item = ();
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -209,7 +209,7 @@ impl Iterator for TableJob<'_> {
         let counts = self.counts;
         let immutable = &self.update;
 
-        let block = |b: usize, live: &mut [u32], spent: &mut [u32], needs_up: &mut [u64]| {
+        let block = |b: usize, live: &mut [u32], spent: &mut [u32], needs_up: &mut [u64], moves: &mut Moves<'a>| {
             let start = b * BLOCK;
             let mut cursor = LayoutCursor::new(counts);
             // no move left worth running means the layout is retired, and a
@@ -220,7 +220,6 @@ impl Iterator for TableJob<'_> {
 
             UPDATE.with(|vals| {
                 let mem = &mut *vals.borrow_mut();
-                let mut moves = Moves::default();
                 // One layout ahead, so the forward moves of the next one are
                 // located while this one is still being worked on. Their lines
                 // come from all over the table, and cheap as locating them is,
@@ -234,7 +233,7 @@ impl Iterator for TableJob<'_> {
                         layout,
                         immutable,
                         mem: &mut *mem,
-                        moves: &mut moves,
+                        moves: &mut *moves,
                     };
                     let ahead = next.map(|(k, layout)| (layout, spent[k]));
                     let (tmp, inv) = update.update_layout(&mut live[i], &mut spent[i], pre, ahead);
@@ -275,13 +274,19 @@ impl Iterator for TableJob<'_> {
             .map(|((live, spent), needs_up)| Mutex::new((live, spent, needs_up)))
             .collect();
         let next = AtomicUsize::new(0);
-        let work = || loop {
-            let b = next.fetch_add(1, Ordering::Relaxed);
-            let Some(slot) = blocks.get(b) else { break };
-            // only ever this thread's, so never contended
-            let mut guard = slot.lock().unwrap();
-            let (live, spent, needs_up) = &mut *guard;
-            block(b, live, spent, needs_up);
+        let work = || {
+            // once per thread rather than per block: every thread starts its
+            // blocks at about the same time, and with musl's allocator, which
+            // has one lock for everyone, they would queue on it there
+            let mut moves = Moves::default();
+            loop {
+                let b = next.fetch_add(1, Ordering::Relaxed);
+                let Some(slot) = blocks.get(b) else { break };
+                // only ever this thread's, so never contended
+                let mut guard = slot.lock().unwrap();
+                let (live, spent, needs_up) = &mut *guard;
+                block(b, live, spent, needs_up, &mut moves);
+            }
         };
         #[cfg(feature = "parallell")]
         rayon::broadcast(|_| work());
