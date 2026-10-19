@@ -1,8 +1,8 @@
 use std::{
     simd::{
         cmp::{SimdPartialEq, SimdPartialOrd},
-        num::SimdUint,
-        Mask, Select, Simd,
+        num::{SimdInt, SimdUint},
+        simd_swizzle, Mask, Select, Simd,
     },
     slice::from_raw_parts,
     sync::atomic::Ordering,
@@ -51,9 +51,12 @@ pub fn permute16(table: Simd<u32, LANES>, idx: Simd<u32, LANES>) -> Simd<u32, LA
         let [t0, t1]: [Simd<u32, 8>; 2] = transmute(table);
         let idx: [Simd<u32, 8>; 2] = transmute(idx);
         transmute(idx.map(|i| {
-            let lo: Simd<u32, 8> = _mm256_permutevar8x32_epi32(t0.into(), i.into()).into();
-            let hi: Simd<u32, 8> = _mm256_permutevar8x32_epi32(t1.into(), i.into()).into();
-            (i & Simd::splat(8)).simd_ne(Simd::splat(0)).select(hi, lo)
+            use std::arch::x86_64::{_mm256_blendv_ps, _mm256_castps_si256, _mm256_castsi256_ps, _mm256_slli_epi32};
+            let lo = _mm256_permutevar8x32_epi32(t0.into(), i.into());
+            let hi = _mm256_permutevar8x32_epi32(t1.into(), i.into());
+            // the select reads the sign, so bit 3 is shifted up to it
+            let upper = _mm256_castsi256_ps(_mm256_slli_epi32::<28>(i.into()));
+            Simd::<u32, 8>::from(_mm256_castps_si256(_mm256_blendv_ps(_mm256_castsi256_ps(lo), _mm256_castsi256_ps(hi), upper)))
         }))
     }
     // the four byte indices of the word, as no byte of it carries
@@ -65,27 +68,65 @@ pub fn permute16(table: Simd<u32, LANES>, idx: Simd<u32, LANES>) -> Simd<u32, LA
     }
 }
 
-/// The words of `src` that `idx` names, one per lane, with every lane `keep`
-/// leaves out zeroed.
+/// The words of `table` that `idx` names, a lane each, where every index is
+/// below [`ROW`].
 ///
-/// With AVX-512 the zeroing is the same instruction's mask rather than an and
-/// per test that reads the result, and folding it into the index instead does
-/// not pay for widening that. Elsewhere it is a [`permute16`] of the halves of
-/// the words: word `2k + h` of the result is word `2 idx[k] + h` of `src`.
+/// [`permute16`] with the table in its first half, but knowing the second is
+/// never read: with AVX2 that is one `vpermd` per half of the index, against
+/// two and a select.
 #[inline(always)]
-fn pick(src: Simd<u64, ROW>, idx: Simd<u64, ROW>, keep: Mask<i64, ROW>) -> Simd<u64, ROW> {
+fn lookup8(table: Simd<u32, ROW>, idx: Simd<u32, LANES>) -> Simd<u32, LANES> {
     #[cfg(target_feature = "avx512f")]
     unsafe {
-        use std::arch::x86_64::_mm512_maskz_permutexvar_epi64;
-        _mm512_maskz_permutexvar_epi64(keep.to_bitmask() as u8, idx.into(), src.into()).into()
+        use std::arch::x86_64::_mm512_permutexvar_epi32;
+        _mm512_permutexvar_epi32(idx.into(), table.resize::<LANES>(0).into()).into()
     }
-    #[cfg(not(target_feature = "avx512f"))]
+    #[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
+    unsafe {
+        use std::{arch::x86_64::_mm256_permutevar8x32_epi32, mem::transmute};
+        let idx: [Simd<u32, ROW>; 2] = transmute(idx);
+        transmute(idx.map(|i| Simd::<u32, ROW>::from(_mm256_permutevar8x32_epi32(table.into(), i.into()))))
+    }
+    #[cfg(not(target_feature = "avx2"))]
     {
-        use std::simd::{simd_swizzle, ToBytes};
-        let idx = simd_swizzle!(idx.cast::<u32>(), [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]);
-        let half = Simd::from_array(std::array::from_fn(|l| (l % 2) as u32));
-        let words = permute16(Simd::<u32, LANES>::from_ne_bytes(src.to_ne_bytes()), idx + idx + half);
-        keep.select(Simd::<u64, ROW>::from_ne_bytes(words.to_ne_bytes()), Simd::splat(0))
+        permute16(table.resize::<LANES>(0), idx)
+    }
+}
+
+/// Each half of `src` permuted within itself, by the same half of `idx`, with
+/// every lane `keep` leaves out zeroed.
+///
+/// One instruction with AVX-512, whose index then carries the half in its
+/// fourth bit, and whose mask does the zeroing rather than an and per test
+/// that reads the result. With AVX2 a half is a register, so it is a `vpermd`
+/// each, which takes the index modulo the half anyway, and there is no mask:
+/// the lanes to zero are pointed at the last of their half instead, which the
+/// rows are built with zero in. See [`SPARE`].
+/// The lane of each half of a spread row that no chunk is wide enough to
+/// use, and that is kept zero for [`pick`] to point the dead columns at.
+pub const SPARE: usize = ROW - 1;
+const _: () = assert!(SIDE <= SPARE);
+
+#[inline(always)]
+fn pick(src: Simd<u32, LANES>, idx: Simd<u32, LANES>, keep: Mask<i32, LANES>) -> Simd<u32, LANES> {
+    #[cfg(target_feature = "avx512f")]
+    unsafe {
+        use std::arch::x86_64::_mm512_maskz_permutexvar_epi32;
+        _mm512_maskz_permutexvar_epi32(keep.to_bitmask() as u16, idx.into(), src.into()).into()
+    }
+    #[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
+    unsafe {
+        use std::{arch::x86_64::_mm256_permutevar8x32_epi32, mem::transmute};
+        let src: [Simd<u32, ROW>; 2] = transmute(src);
+        let idx: [Simd<u32, ROW>; 2] = transmute(idx);
+        let words: Simd<u32, LANES> =
+            transmute([0, 1].map(|h| Simd::<u32, ROW>::from(_mm256_permutevar8x32_epi32(src[h].into(), idx[h].into()))));
+        let _ = keep;
+        words
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        keep.select(permute16(src, idx), Simd::splat(0))
     }
 }
 
@@ -142,10 +183,13 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32], wins
     // the square of each row's king, five bits each, for the slots to shift
     // theirs out of: built in a register, since a vector read of words just
     // stored one by one waits for every one of them to reach the cache
-    let mut kings = 0;
+    let mut kings = [0; ROW];
     for (i, king0) in BitIter::from(rows).enumerate() {
-        kings |= (king0 as u32) << 5 * i;
+        kings[i] = king0 as i32;
     }
+    let kings = Simd::from_array(kings);
+    #[cfg(not(target_feature = "avx512f"))]
+    let row_number = Simd::<i32, ROW>::from_array(std::array::from_fn(|r| r as i32));
 
     let mut matter = Simd::<u32, LANES>::splat(0);
     // The slots on the outside and the offsets within, so what every offset
@@ -158,8 +202,12 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32], wins
         // slots that are there
         let row = Simd::<u32, LANES>::from_slice(&LANE_ROW[width][start..start + LANES]);
         let col = Simd::<u32, LANES>::from_slice(&LANE_COL[width][start..start + LANES]);
-        let king = Simd::splat(kings) >> row * Simd::splat(5) & Simd::splat(31);
-        let live = ((1u32 << (slots - start).min(LANES)) - 1) as u16;
+        #[cfg(not(target_feature = "avx512f"))]
+        let col_i = col.cast::<i32>();
+        // the square of every slot's king, which AVX-512 counts the rows below
+        // of directly
+        #[cfg(target_feature = "avx512f")]
+        let king = lookup8(kings.cast::<u32>(), row);
         // the slots past the chunk are all won, so nothing there matters
         let settled = settled(Simd::from_slice(&wins[start..start + LANES]));
 
@@ -179,17 +227,42 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32], wins
                 //
                 // The king moved exactly when it was the piece on `from`, and
                 // where its row lands is its rank among the target's rows.
-                let moved = king.simd_eq(Simd::splat(from as u32));
-                let new0 = moved.select(Simd::splat(to as u32), king);
-                // no square is past 24, so the shift never runs out of bits
-                let below = Simd::splat(u32::MAX) << new0;
+                // Those are this chunk's with the one piece moved, so any
+                // other king's rank is its row here, one up if the piece
+                // landed below it, and one down if it left from below it: two
+                // compares rather than a count of the bits below, which AVX2
+                // has no instruction for. That is a property of the row, so it
+                // is worked out a row a lane and only then spread over the
+                // slots, which is one lookup.
+                //
+                // Signed, as squares are small, because AVX2 has no unsigned
+                // compare.
                 let TeamLayout { pieces0: rows_new, pieces1: cols_new } = mv.new;
                 let width_new = cols_new.count_ones();
-                let rank = (!below & Simd::splat(rows_new)).count_ones();
-                let idx = rank * Simd::splat(width_new) + col;
-                // the columns past the break read the one before
-                let keep = Mask::<i32, LANES>::from_bitmask((mv.keep >> start) as u64);
-                let idx = keep.select(idx, idx - Simd::splat(1));
+                #[cfg(target_feature = "avx512f")]
+                let idx = {
+                    let moved = king.simd_eq(Simd::splat(from as u32));
+                    let new0 = moved.select(Simd::splat(to as u32), king);
+                    let below = Simd::splat(u32::MAX) << new0;
+                    let rank = (!below & Simd::splat(rows_new)).count_ones();
+                    let idx = rank * Simd::splat(width_new) + col;
+                    col.simd_lt(Simd::splat(mv.split)).select(idx, idx - Simd::splat(1))
+                };
+                #[cfg(not(target_feature = "avx512f"))]
+                let (from_v, to_v) = (Simd::splat(from as i32), Simd::splat(to as i32));
+                #[cfg(not(target_feature = "avx512f"))]
+                let idx = {
+                    let moved = kings.simd_eq(from_v);
+                    let rank_to = (rows_new & (1 << to) - 1).count_ones() as i32;
+                    // the masks are all ones where they hold, which is minus one
+                    let up = kings.simd_gt(to_v).to_simd();
+                    let down = kings.simd_gt(from_v).to_simd();
+                    let rank = moved.select(Simd::splat(rank_to), row_number - up + down);
+                    let start_of_row = rank.cast::<u32>() * Simd::splat(width_new);
+                    // the columns past the break read the one before
+                    let past = col_i.simd_gt(Simd::splat(mv.split as i32 - 1)).to_simd().cast::<u32>();
+                    lookup8(start_of_row, row) + col + past
+                };
 
                 // the target's own length, which is all of it there is
                 let size = (rows_new.count_ones() * width_new) as usize;
@@ -197,8 +270,12 @@ pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32], wins
                 // A slot that is not there reads nothing and stays all ones.
                 // That is the identity of the and, which is what dropping it
                 // means.
+                // The slots past the chunk read whatever the index lands on.
+                // Nothing they come out with is kept: they are won in `wins`,
+                // which `check_unresolved` takes off `status`, and `open` is
+                // empty there, so they do not count as reads that matter.
                 let word = read(target, idx);
-                all = Mask::<i32, LANES>::from_bitmask(live as u64).select(all & word, all);
+                all &= word;
                 // A coin flip in the first pass, so not a branch, which is
                 // what a scalar test turns into whatever it is written as: an
                 // or into the lanes that still need it, folded at the end.
@@ -297,33 +374,44 @@ impl Spread<'_> {
         let f = (cols_old & (1 << from) - 1).count_ones() as usize;
         let p = (cols_new & (1 << to) - 1).count_ones() as usize;
 
-        let lane = Simd::<u64, ROW>::from_array(std::array::from_fn(|k| k as u64));
-        let at_p = lane.simd_eq(Simd::splat(p as u64));
-        // the run is the columns strictly between the two, which is the half
+        // a column per lane, the same in both halves. Signed, as columns are
+        // small, because AVX2 has no unsigned compare.
+        let lane = Simd::<i32, LANES>::from_array(std::array::from_fn(|k| (k % ROW) as i32));
+        let (f_v, p_v) = (Simd::splat(f as i32), Simd::splat(p as i32));
+        let at_p = lane.simd_eq(p_v);
+        // The run is the columns strictly between the two, which is the half
         // open interval on whichever side the piece moved, and it steps towards
-        // the slot the piece left
-        let (run, step) = if p > f {
-            let run = lane.simd_ge(Simd::splat(f as u64)) & lane.simd_lt(Simd::splat(p as u64));
-            (run, lane + Simd::splat(1))
+        // the slot the piece left. As integers rather than masks: a lane is in
+        // `lo..hi` when it is below `hi` and not below `lo`, which is the sign
+        // of the differences, and shifted across the word that is minus one,
+        // the step. An and of two compares instead goes through packing the
+        // masks down to bytes and back without AVX-512.
+        let within = |lo: Simd<i32, LANES>, hi: Simd<i32, LANES>| ((lane - hi) & !(lane - lo)) >> 31;
+        let idx = if p > f {
+            lane - within(f_v, p_v)
         } else {
-            let run = lane.simd_gt(Simd::splat(p as u64)) & lane.simd_le(Simd::splat(f as u64));
-            (run, lane - Simd::splat(1))
+            lane + within(p_v + Simd::splat(1), f_v + Simd::splat(1))
         };
-        let live = lane.simd_lt(Simd::splat(width_new as u64));
+        let live = Simd::splat(width_new as i32).simd_gt(lane);
         // which slot every column reads, which is the whole mapping and the
-        // same for every row, so it is settled once for the move
-        let idx = at_p.select(Simd::splat(f as u64), run.select(step, lane));
+        // same for every row, so it is settled once for the move; the second
+        // half reads its own half
+        let half = Simd::<i32, LANES>::from_array(std::array::from_fn(|k| (k / ROW * ROW) as i32));
+        let idx = at_p.select(f_v, idx);
+        // without the mask of AVX-512 the dead columns read the spare lane
+        #[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
+        let idx = live.select(idx, Simd::splat(SPARE as i32));
+        let idx = (idx + half).cast::<u32>();
 
         let target = self.target.as_ptr();
-        // the target word in both halves, so one and against the pair asks of
-        // the bound and of the losses at the same time
-        const LOW: u64 = u32::MAX as u64;
-        let zero = Simd::<u64, ROW>::splat(0);
+        let zero = Simd::<u32, LANES>::splat(0);
+        // the lanes of the losses, which are the first half
+        const LOW: u64 = (1 << ROW) - 1;
 
         // every row's news folded together, so what the move still owes and
         // whether anything went out at all are two tests after the walk rather
         // than a compare, a mask test and a fold per row
-        let mut seen = Simd::<u64, ROW>::splat(0);
+        let mut seen = Simd::<u32, LANES>::splat(0);
         let mut new_i = 0;
         let mut row = 0;
         for king0 in BitIter::from(rows_new) {
@@ -350,12 +438,16 @@ impl Spread<'_> {
             // only drops the words, the load still covers all of them. So the
             // fifth word, which only ten men have, is a load of its own.
             let row_new = unsafe { from_raw_parts(target.cast::<u32>().add(new_i), width_new) };
-            let mut fetch = Simd::<u32, 4>::load_or_default(&row_new[..width_new.min(4)]).resize::<ROW>(0);
+            // the mask a signed compare of the lane numbers, where
+            // `load_or_default` compares `usize` lanes
+            let enable = Simd::<i32, 4>::from_array([0, 1, 2, 3]).simd_lt(Simd::splat(width_new.min(4) as i32));
+            let mut fetch = unsafe { Simd::<u32, 4>::load_select_ptr(row_new.as_ptr(), enable, Simd::splat(0)) }.resize::<ROW>(0);
             if width_new > 4 {
                 fetch[4] = row_new[4];
             }
-            let fetch = fetch.cast::<u64>();
-            let both = fetch | fetch << Simd::splat(32);
+            // the target row in both halves, so one and against the pair asks
+            // of the bound and of the losses at the same time
+            let both = simd_swizzle!(fetch, [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7]);
             new_i += width_new;
 
             // what the pair says that the target does not have yet, in both
@@ -363,13 +455,13 @@ impl Spread<'_> {
             // is going out taken off it already, so nothing in either means
             // the row has nothing to say and each half then wants its own test
             let news = pair & !both;
-            if !news.simd_ne(zero).any() {
+            if news == zero {
                 continue;
             }
             seen |= news;
 
-            let todo = (news & Simd::splat(LOW)).simd_ne(zero);
-            if !todo.any() {
+            let bits = news.resize::<ROW>(0).simd_ne(Simd::splat(0)).to_bitmask();
+            if bits == 0 {
                 continue;
             }
             // The write is an atomic read modify write per column, which no
@@ -388,19 +480,19 @@ impl Spread<'_> {
             // and not a bit walked out of the mask: a lane picked by a runtime
             // index is one the whole vector has to be on the stack for, and
             // that spill lands on every row rather than on the few that write
-            let bits = todo.to_bitmask();
             for col in 0..SIDE {
                 if bits >> col & 1 != 0 {
                     let slot = unsafe { &*target.add(new_i - width_new + col) };
-                    slot.fetch_or(pair[col] as u32, Ordering::Relaxed);
+                    slot.fetch_or(pair[col], Ordering::Relaxed);
                 }
             }
         }
 
+        let seen = seen.simd_ne(zero).to_bitmask();
         SpreadStatus {
             // the losses that went out, and the bound still owed beyond them
-            progress: (seen & Simd::splat(LOW)).simd_ne(zero).any(),
-            could: (seen & Simd::splat(LOW << 32)).simd_ne(zero).any(),
+            progress: seen & LOW != 0,
+            could: seen & !LOW != 0,
         }
     }
 }

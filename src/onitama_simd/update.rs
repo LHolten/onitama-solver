@@ -1,6 +1,6 @@
 use std::{
     iter::zip,
-    simd::{Mask, Select, Simd, ToBytes},
+    simd::{Select, Simd},
     sync::atomic::AtomicU32,
 };
 
@@ -9,8 +9,8 @@ use bit_iter::BitIter;
 use crate::card::offset_mask_fixed as offset_mask;
 
 use super::{
-    accum_spread::{accumulate, invert, load, permute}, locate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread,
-    SpreadStatus, TeamLayout, Update, BLOCK_MASK, LANES, LANE_COL, LANE_ROW,
+    accum_spread::{accumulate, invert, load, permute, permute16}, locate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread,
+    SpreadStatus, TeamLayout, Update, BLOCK_MASK, LANES, LANE_COL, LANE_ROW, ROW, SIDE,
 };
 
 
@@ -25,7 +25,7 @@ pub struct UpdateStatus {
 impl<'t> Update<'_, 't> {
     pub fn get_unresolved<const COUNT: bool>(&mut self) -> u64 {
         let inv = self.mirror(self.layout);
-        self.prepare_forward(self.layout, 0);
+        self.prepare_forward(self.layout, self.rank, 0);
         self.finish_unresolved::<COUNT>(inv).0
     }
 
@@ -40,7 +40,7 @@ impl<'t> Update<'_, 't> {
     /// Locate and prefetch every forward move of `layout`, which need not be
     /// this update's own: see [`Self::update_layout`]. `spent` is the moves
     /// [`accumulate`] found can no longer change anything, which are left out.
-    fn prepare_forward(&mut self, layout: TeamLayout, spent: u32) {
+    fn prepare_forward(&mut self, layout: TeamLayout, rank: usize, spent: u32) {
         let ImmutableUpdate {
             current,
             take_one,
@@ -60,6 +60,9 @@ impl<'t> Update<'_, 't> {
         // the actual work; see `PreparedMove`
         let moves = &mut self.moves.forward;
         moves.clear();
+        // a move per direction and piece at most, so the pushes below need no
+        // check of their own
+        moves.reserve(directions.count_ones() as usize * SIDE);
         let mut seen = 0u32;
         for offset in BitIter::from(directions) {
             let mask = mask_lookup[offset];
@@ -101,22 +104,19 @@ impl<'t> Update<'_, 't> {
                 } else {
                     (chunk.cols & (1 << to) - 1).count_ones()
                 };
-                // the columns below the break, which is every column when
-                // there is no capture to break the row, in every row
-                let keep = ((1u32 << split) - 1) * chunk.starts;
-                moves.push(PreparedMove {
+                push_unchecked(moves, PreparedMove {
                     bit,
                     step: (from, to),
                     mask,
                     new,
-                    keep,
+                    split,
                     // `locate` works out which chunk of it
                     table,
-                    target: &[],
+                    target: std::ptr::null(),
                 });
             }
         }
-        locate(moves);
+        locate::<0>(moves, &mut self.moves.reranker, layout, rank);
     }
 
     /// Build `status` and `wins` from the moves [`Self::prepare_forward`]
@@ -144,15 +144,15 @@ impl<'t> Update<'_, 't> {
 
     /// `pre` is this layout's mirrored chunk if the previous update already
     /// located it and ran [`Self::prepare_forward`] for it, and `next` the
-    /// layout, with its spent moves, to do that for in turn. The return carries
-    /// that on to the next update. `spent` is this layout's, and comes back
-    /// updated.
+    /// layout, with its rank and its spent moves, to do that for in turn. The
+    /// return carries that on to the next update. `spent` is this layout's,
+    /// and comes back updated.
     pub fn update_layout(
         mut self,
         live: &mut u32,
         spent: &mut u32,
         pre: Option<&'t [AtomicU32]>,
-        next: Option<(TeamLayout, u32)>,
+        next: Option<(TeamLayout, usize, u32)>,
     ) -> (UpdateStatus, Option<&'t [AtomicU32]>) {
         let go_up = self.immutable.go_up;
 
@@ -168,20 +168,20 @@ impl<'t> Update<'_, 't> {
         let live = if go_up { &mut scratch } else { live };
         let inv = pre.unwrap_or_else(|| {
             let inv = self.mirror(self.layout);
-            self.prepare_forward(self.layout, *spent);
+            self.prepare_forward(self.layout, self.rank, *spent);
             inv
         });
         // The next mirrored chunk is the first thing its update reads, ahead of
         // the forward moves, since it decides which of their reads matter. So
         // its miss starts here, a whole update ahead of the read.
-        let inv_next = next.map(|(next, _)| self.mirror(next));
+        let inv_next = next.map(|(next, ..)| self.mirror(next));
         self.prepare_spread(go_up, *live);
         let unresolved;
         (unresolved, *spent) = self.finish_unresolved::<false>(inv);
         // this layout's forward moves are done with, so their buffer is free
         // for the next one's, and everything from here on is distance for them
-        if let Some((next, spent)) = next {
-            self.prepare_forward(next, spent);
+        if let Some((next, rank, spent)) = next {
+            self.prepare_forward(next, rank, spent);
         }
 
         let res = self.run_spread(go_up, live);
@@ -242,6 +242,9 @@ impl<'t> Update<'_, 't> {
         // Cards are now inverted, but it is also the other team, so not inverted.
         let moves = &mut self.moves.spread;
         moves.clear();
+        // a move per direction and piece at most, so the pushes below need no
+        // check of their own
+        moves.reserve(directions.count_ones() as usize * SIDE);
         let mut seen = 0u32;
         for offset in BitIter::from(directions) {
             let mask = mask_lookup[offset];
@@ -282,19 +285,19 @@ impl<'t> Update<'_, 't> {
                     current
                 };
 
-                moves.push(PreparedMove {
+                push_unchecked(moves, PreparedMove {
                     bit,
                     step: (from, to),
                     mask,
                     new,
-                    keep: 0,
+                    split: 0,
                     // `locate` works out which chunk of it
                     table,
-                    target: &[],
+                    target: std::ptr::null(),
                 });
             }
         }
-        locate(moves);
+        locate::<1>(moves, &mut self.moves.reranker, layout, self.rank);
     }
 
     /// Spread every backward move [`Self::prepare_spread`] located.
@@ -323,33 +326,65 @@ impl<'t> Update<'_, 't> {
         // load across two of those stores would wait for both to reach the
         // cache. The rows are cut out of the registers instead, a vector each,
         // which is the load the spread does per row and per move.
-        let pair = Simd::<u32, LANES>::from_array(std::array::from_fn(|k| (k / 2) as u32));
-        let high = Mask::<i32, LANES>::from_bitmask(0xaaaa);
+        // a column per lane, and the second half is the bound
+        #[cfg(target_feature = "avx512f")]
+        let pair = Simd::<u32, LANES>::from_array(std::array::from_fn(|k| (k % ROW) as u32));
+        #[cfg(target_feature = "avx512f")]
+        let high = std::simd::Mask::<i32, LANES>::from_bitmask(!((1 << ROW) - 1) & ((1 << LANES) - 1));
         let mut built = None;
         for mv in moves.iter() {
             if built != Some(mv.mask) {
                 built = Some(mv.mask);
-                let mask = Simd::splat(mv.mask);
                 // `Block::expand`, a lane at a time: the bits shifted past the
                 // word are the ones the block mask drops anyway
-                let expand = |x: Simd<u32, LANES>| (x << 10 | x << 20 | x >> 10 | x >> 20) & Simd::splat(BLOCK_MASK);
-                let [(tmp_lo, may_lo), (tmp_hi, may_hi)] = [0, LANES].map(|start| {
-                    let s = Simd::from_slice(&status[start..start + LANES]);
-                    let w = Simd::from_slice(&wins[start..start + LANES]);
-                    // we spread out the loses, these are wins for the previous state
-                    let tmp = expand(s & mask);
-                    // what is going out now is taken off the bound here rather
-                    // than in the spread: it does not depend on the target, so
-                    // it is the same for every move that reads this slot and
-                    // for every row it reads it into
-                    (tmp, expand(!w & mask) & !tmp)
-                });
-                for (row, e) in expanded[..chunk.height].iter_mut().enumerate() {
-                    // the lanes past the row read the next one's, which the
-                    // spread masks off
-                    let idx = Simd::splat((row * chunk.width) as u32) + pair;
-                    let words = high.select(permute(may_lo, may_hi, idx), permute(tmp_lo, tmp_hi, idx));
-                    *e = Simd::from_ne_bytes(words.to_ne_bytes());
+                fn expand<const N: usize>(x: Simd<u32, N>) -> Simd<u32, N> {
+                    (x << 10 | x << 20 | x >> 10 | x >> 20) & Simd::splat(BLOCK_MASK)
+                }
+                // we spread out the loses, these are wins for the previous
+                // state. What is going out now is taken off the bound here
+                // rather than in the spread: it does not depend on the target,
+                // so it is the same for every move that reads this slot and for
+                // every row it reads it into
+                #[cfg(target_feature = "avx512f")]
+                {
+                    let mask = Simd::splat(mv.mask);
+                    let [(tmp_lo, may_lo), (tmp_hi, may_hi)] = [0, LANES].map(|start| {
+                        let s = Simd::from_slice(&status[start..start + LANES]);
+                        let w = Simd::from_slice(&wins[start..start + LANES]);
+                        let tmp = expand(s & mask);
+                        (tmp, expand(!w & mask) & !tmp)
+                    });
+                    for (row, e) in expanded[..chunk.height].iter_mut().enumerate() {
+                        // the lanes past the row read the next one's, which the
+                        // spread masks off
+                        let idx = Simd::splat((row * chunk.width) as u32) + pair;
+                        *e = high.select(permute(may_lo, may_hi, idx), permute(tmp_lo, tmp_hi, idx));
+                    }
+                }
+                // Without AVX-512 the row is built from its own slots, which are
+                // contiguous and one register for each half. Cutting it out of
+                // the whole chunk instead is a permute of four registers into
+                // each, for every row.
+                #[cfg(not(target_feature = "avx512f"))]
+                {
+                    use std::simd::simd_swizzle;
+                    let mask = Simd::splat(mv.mask);
+                    for (row, e) in expanded[..chunk.height].iter_mut().enumerate() {
+                        // the lanes past the row read the next one's, which the
+                        // spread masks off
+                        let at = row * chunk.width;
+                        // a chunk and a row past it fit the scratch
+                        debug_assert!(at + ROW <= status.len().min(wins.len()));
+                        let s = Simd::<u32, ROW>::from_slice(unsafe { status.get_unchecked(at..at + ROW) });
+                        let w = Simd::<u32, ROW>::from_slice(unsafe { wins.get_unchecked(at..at + ROW) });
+                        let tmp = expand(s & mask);
+                        let may = expand(!w & mask) & !tmp;
+                        let row = simd_swizzle!(tmp, may, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+                        // the spare lane of each half zero, for the spread's
+                        // dead columns to read
+                        let used = Simd::<u32, LANES>::from_array(std::array::from_fn(|l| if l % ROW == super::accum_spread::SPARE { 0 } else { u32::MAX }));
+                        *e = row & used;
+                    }
                 }
             }
 
@@ -450,7 +485,9 @@ impl<'t> Update<'_, 't> {
             let c = Simd::<u32, LANES>::from_slice(&LANE_COL[cols][start..start + LANES]);
             // the slots past the chunk read anywhere: they are overwritten
             let idx = (cols_v - Simd::splat(1) - c) * rows_v + (rows_v - Simd::splat(1) - r);
-            let x = invert(permute(low, high, idx));
+            // up to eight men the chunk is one vector, and the permute of one
+            // is half the work of two without AVX-512
+            let x = invert(if inv.len() <= LANES { permute16(low, idx) } else { permute(low, high, idx) });
             // the slots no king position uses are set to won, which makes them
             // resolved and contributes nothing, so the walks below need no
             // bounds of their own
@@ -458,5 +495,16 @@ impl<'t> Update<'_, 't> {
             let x = used.select(x, Simd::splat(BLOCK_MASK));
             x.copy_to_slice(&mut self.mem.wins[start..start + LANES]);
         }
+    }
+}
+
+/// `vec.push(x)` for a `vec` with room for `x` already, without checking.
+#[inline(always)]
+fn push_unchecked<T>(vec: &mut Vec<T>, x: T) {
+    let len = vec.len();
+    debug_assert!(len < vec.capacity());
+    unsafe {
+        vec.as_mut_ptr().add(len).write(x);
+        vec.set_len(len + 1);
     }
 }

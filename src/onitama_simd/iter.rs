@@ -1,6 +1,7 @@
 use std::iter::Take;
+use std::simd::Simd;
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-use std::simd::{cmp::SimdPartialEq, num::SimdUint, Select, Simd};
+use std::simd::{cmp::SimdPartialEq, num::SimdUint, Select};
 
 use bit_iter::BitIter;
 use seq_macro::seq;
@@ -243,6 +244,220 @@ pub(super) fn ranking(s_1: u32, s_2: u32) -> usize {
     r
 }
 
+/// [`ranking`] of the layouts one move away from a parent, off the parent's.
+///
+/// Every piece adds a term that depends on its square and on how many pieces
+/// of each side are at or below it. When one piece moves within its side, a
+/// piece below both squares sees the same pieces either way, and so does one
+/// above both. The ones in between see one piece of the mover's side fewer
+/// below them if it moved up past them, and one more if it moved down. So the
+/// change is the moved piece's own term, old and new, and for the pieces in
+/// between their terms with that count shifted, against the plain ones.
+///
+/// A capture also takes a piece of the other side away, which every piece
+/// above it sees, and the `go_up` form of a backward move adds one of the
+/// mover's opponent where the mover left: the same again, with the counts
+/// shifted the other way, and a term for the piece that came or went.
+///
+/// The parent's pieces are walked once, into prefix sums of their plain terms
+/// and of the shifted ones less the plain: a move is then a few differences of
+/// those, and the one or two new terms, with no walk of its own.
+#[cfg_attr(all(target_feature = "avx512f", target_feature = "avx512cd"), allow(dead_code))]
+pub(super) struct Reranker {
+    /// `u32::MAX` while it is for no layout.
+    rank: u32,
+    /// Both sides' pieces of the parent, and how many.
+    all: u32,
+    pieces: usize,
+    /// Of the parent's lowest `k` pieces, at `k`: per shift of [`SHIFTS`], the
+    /// shifted terms less their plain ones, and then the plain terms, in the
+    /// lanes of [`TERMS`].
+    sums: [Simd<u32, 8>; PIECES + 1],
+}
+
+/// What a piece of either side adds to [`ranking`]'s count of the pieces at or
+/// below it.
+const STEP: [usize; 2] = [27, 27 * 7];
+
+/// The shifts of the counts the moves of either side make, for the pieces they
+/// pass or that are above them: either side's count down and up by one, and
+/// both changed at once, for a capture or an uncapture moving down past them.
+const SHIFTS: [isize; 5] = [-27, 27, -27 * 7, 27 * 7, 27 - 27 * 7];
+
+/// Which of [`SHIFTS`] a move of either side wants: its own count down and up,
+/// both at once, and the other side's change above a capture or uncapture,
+/// which is the other side down for the first and the first up for the second.
+const USES: [[usize; 4]; 2] = [[0, 1, 4, 2], [2, 3, 4, 1]];
+
+/// The lane of [`TERMS`] with the plain term.
+const PLAIN: usize = SHIFTS.len();
+
+/// What a piece of a side adds to [`ranking`] at an index of [`COMB`], per side
+/// and index: the term with the count moved by every shift of [`SHIFTS`] less
+/// the plain one, and the plain one in lane [`PLAIN`]. A shifted count past the
+/// table is one no move ever reads, as it would need a piece more than the side
+/// has, so it reads zero.
+static TERMS: [[[u32; 8]; COMB.len()]; 2] = {
+    const fn at(j: isize, side: usize) -> u32 {
+        if j < 0 || j as usize >= COMB.len() {
+            0
+        } else if side == 0 {
+            COMB[j as usize].0
+        } else {
+            COMB[j as usize].1
+        }
+    }
+    let mut t = [[[0; 8]; COMB.len()]; 2];
+    let mut side = 0;
+    while side < 2 {
+        let mut j = 0;
+        while j < COMB.len() {
+            let plain = at(j as isize, side);
+            let mut n = 0;
+            while n < SHIFTS.len() {
+                t[side][j][n] = at(j as isize + SHIFTS[n], side).wrapping_sub(plain);
+                n += 1;
+            }
+            t[side][j][PLAIN] = plain;
+            j += 1;
+        }
+        side += 1;
+    }
+    t
+};
+
+/// What a piece of `side` on `square` adds to [`ranking`] of `layout`.
+#[inline(always)]
+fn term(layout: TeamLayout, square: u32, side: usize) -> u32 {
+    let upto = (2u32 << square).wrapping_sub(1);
+    let ctr = STEP[0] * (layout.pieces0 & upto).count_ones() as usize + STEP[1] * (layout.pieces1 & upto).count_ones() as usize;
+    let j = 1 + square as usize + ctr + 27 * (1 + 7);
+    debug_assert!(j < COMB.len());
+    let x = unsafe { *COMB.get_unchecked(j) };
+    if side == 0 { x.0 } else { x.1 }
+}
+
+impl Default for Reranker {
+    fn default() -> Self {
+        Reranker {
+            rank: u32::MAX,
+            all: 0,
+            pieces: 0,
+            sums: [Simd::splat(0); PIECES + 1],
+        }
+    }
+}
+
+#[cfg_attr(all(target_feature = "avx512f", target_feature = "avx512cd"), allow(dead_code))]
+impl Reranker {
+    /// For the moves of either side from `parent`, which is at `rank`.
+    #[cfg(test)]
+    pub(super) fn new(parent: TeamLayout, rank: usize) -> Self {
+        let mut this = Reranker::default();
+        this.fill(parent, rank);
+        this
+    }
+
+    /// Make this the one for the moves of either side from `parent`, which is
+    /// at `rank`, in place: it is too large to build and then move.
+    pub(super) fn fill(&mut self, parent: TeamLayout, rank: usize) {
+        let TeamLayout { pieces0, pieces1 } = parent;
+        let all = pieces0 | pieces1;
+        self.rank = rank as u32;
+        self.all = all;
+        self.pieces = all.count_ones() as usize;
+        // only the entries up to the piece count are ever read
+        self.sums[0] = Simd::splat(0);
+        let mut sum = Simd::splat(0);
+        let mut ctr = 0;
+        for (k, i) in BitIter::from(all).enumerate() {
+            let side = (pieces0 & 1 << i == 0) as usize;
+            ctr += STEP[side];
+            let j = 1 + i + ctr + 27 * (1 + 7);
+            // a layout has at most this many pieces, and its counts are in the
+            // table
+            debug_assert!(k < PIECES && j < COMB.len());
+            sum += Simd::from_array(unsafe { *TERMS.get_unchecked(side).get_unchecked(j) });
+            unsafe { *self.sums.get_unchecked_mut(k + 1) = sum };
+        }
+    }
+
+    /// Whether this is for `parent` at `rank`.
+    pub(super) fn is_for(&self, parent: TeamLayout, rank: usize) -> bool {
+        self.rank == rank as u32 && self.all == parent.pieces0 | parent.pieces1
+    }
+
+    /// The shifted terms less the plain ones of the `n`th shift `MOVER` uses,
+    /// of the parent's pieces from the `lo`th up to before the `hi`th.
+    #[inline(always)]
+    fn shifted<const MOVER: usize>(&self, n: usize, lo: usize, hi: usize) -> u32 {
+        self.sum(USES[MOVER][n], lo, hi)
+    }
+
+    /// Lane `lane` of the sums of the parent's pieces from the `lo`th up to
+    /// before the `hi`th.
+    #[inline(always)]
+    fn sum(&self, lane: usize, lo: usize, hi: usize) -> u32 {
+        debug_assert!(lo <= hi && hi <= PIECES);
+        unsafe { self.sums.get_unchecked(hi)[lane].wrapping_sub(self.sums.get_unchecked(lo)[lane]) }
+    }
+
+    /// The plain term of the parent's `k`th piece.
+    #[inline(always)]
+    fn own(&self, k: usize) -> u32 {
+        self.sum(PLAIN, k, k + 1)
+    }
+
+    /// The parent's pieces below `square`, which is the index of the one on it.
+    #[inline(always)]
+    fn below(&self, square: u32) -> usize {
+        (self.all & square.wrapping_sub(1)).count_ones() as usize
+    }
+
+    /// The rank of `new`, which differs from the parent by one piece of
+    /// `MOVER` moving, by `changed0` and `changed1`: the squares of each side
+    /// that changed. That is a move within the side when the other side has
+    /// none, and a capture or a `go_up` uncapture otherwise.
+    #[inline(always)]
+    pub(super) fn rank<const MOVER: usize>(&self, new: TeamLayout, changed0: u32, changed1: u32) -> usize {
+        let (mine, other, moved) = if MOVER == 0 {
+            (changed0, changed1, new.pieces0)
+        } else {
+            (changed1, changed0, new.pieces1)
+        };
+        let to = mine & moved;
+        let from = mine & !moved;
+        let at = self.below(from);
+        let landed = self.below(to);
+        let mut r = self.rank.wrapping_sub(self.own(at)).wrapping_add(term(new, to.trailing_zeros(), MOVER));
+        if other == 0 {
+            // a move within the side
+            r = r.wrapping_add(if to > from {
+                self.shifted::<MOVER>(0, at + 1, landed)
+            } else {
+                self.shifted::<MOVER>(1, landed, at)
+            });
+        } else if MOVER == 0 {
+            // a capture on `to`, which is the `landed`th piece of the parent
+            r = r.wrapping_sub(self.own(landed));
+            r = r.wrapping_add(if to > from {
+                self.shifted::<MOVER>(0, at + 1, landed).wrapping_add(self.shifted::<MOVER>(3, landed + 1, self.pieces))
+            } else {
+                self.shifted::<MOVER>(2, landed + 1, at).wrapping_add(self.shifted::<MOVER>(3, at + 1, self.pieces))
+            });
+        } else {
+            // a piece of the other side put back where this one left
+            r = r.wrapping_add(term(new, from.trailing_zeros(), 0));
+            r = r.wrapping_add(if to > from {
+                self.shifted::<MOVER>(2, at + 1, landed).wrapping_add(self.shifted::<MOVER>(3, landed, self.pieces))
+            } else {
+                self.shifted::<MOVER>(1, landed, at).wrapping_add(self.shifted::<MOVER>(3, at + 1, self.pieces))
+            });
+        }
+        r as usize
+    }
+}
+
 /// [`ranking`] of sixteen layouts at once, one per lane.
 ///
 /// The scalar walk is a chain of a bit pick, a test and a table read per piece,
@@ -300,7 +515,6 @@ pub fn ranking16(s_1: Simd<u32, 16>, s_2: Simd<u32, 16>) -> Simd<u32, 16> {
 }
 
 /// The most pieces a layout has, both sides and both kings.
-#[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
 const PIECES: usize = 2 * super::SIDE;
 
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
@@ -452,7 +666,7 @@ mod tests {
     use crate::{
         index::{Indexer, InternalIter},
         onitama_simd::{
-            iter::{combinations, combinations_old, g, ranking, unranking},
+            iter::{combinations, combinations_old, g, ranking, unranking, Reranker},
             PawnCount,
         },
     };
@@ -500,6 +714,48 @@ mod tests {
                 assert_eq!(counts.index(&layout), i);
                 let seed = counts.nth_layout(i);
                 assert_eq!((seed.pieces0, seed.pieces1), (layout.pieces0, layout.pieces1));
+            }
+        }
+    }
+
+    /// Every move the solve ranks off a parent has to rank the same as from
+    /// scratch: one piece of either side to a free square, a capture by the
+    /// first side, and the second side moving with a piece of the first put
+    /// back where it left.
+    #[test]
+    fn test_reranking() {
+        use crate::onitama_simd::TeamLayout;
+        for (count0, count1) in [(1, 1), (2, 1), (1, 3), (3, 2), (2, 3), (3, 3), (4, 4)] {
+            let counts = PawnCount { count0, count1 };
+            // the largest only sparsely, as it is most of the layouts
+            let stride = if count0 + count1 > 6 { 37 * 41 } else { 37 };
+            for (rank, old) in counts.into_iter().enumerate().step_by(stride) {
+                assert_eq!(rank, ranking(old.pieces0, old.pieces1));
+                let check = |side: usize, new: TeamLayout| {
+                    let (c0, c1) = (new.pieces0 ^ old.pieces0, new.pieces1 ^ old.pieces1);
+                    let reranker = Reranker::new(old, rank);
+                    let got = if side == 0 { reranker.rank::<0>(new, c0, c1) } else { reranker.rank::<1>(new, c0, c1) };
+                    assert_eq!(got, ranking(new.pieces0, new.pieces1), "{old:?} {new:?}");
+                };
+                let free = !(old.pieces0 | old.pieces1) & (1 << 25) - 1;
+                for from in 0..25 {
+                    for to in (0..25).filter(|&t| free & 1 << t != 0) {
+                        let step = 1 << from | 1 << to;
+                        if old.pieces0 & 1 << from != 0 {
+                            check(0, TeamLayout { pieces0: old.pieces0 ^ step, pieces1: old.pieces1 });
+                        }
+                        if old.pieces1 & 1 << from != 0 {
+                            check(1, TeamLayout { pieces0: old.pieces0, pieces1: old.pieces1 ^ step });
+                            check(1, TeamLayout { pieces0: old.pieces0 | 1 << from, pieces1: old.pieces1 ^ step });
+                        }
+                    }
+                    for to in (0..25).filter(|&t| old.pieces1 & 1 << t != 0) {
+                        if old.pieces0 & 1 << from != 0 && old.pieces1.count_ones() > 1 {
+                            let step = 1 << from | 1 << to;
+                            check(0, TeamLayout { pieces0: old.pieces0 ^ step, pieces1: old.pieces1 & !(1 << to) });
+                        }
+                    }
+                }
             }
         }
     }

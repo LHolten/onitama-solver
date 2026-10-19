@@ -3,6 +3,7 @@ use rayon::prelude::*;
 
 use std::{
     iter::zip,
+    simd::{cmp::SimdPartialEq, Simd},
     cell::RefCell,
     mem::take,
     sync::{
@@ -214,8 +215,30 @@ impl<'a> Iterator for TableJob<'a> {
             let mut cursor = LayoutCursor::new(counts);
             // no move left worth running means the layout is retired, and a
             // retired layout is never unranked into a layout
+            //
+            // Late in a solve most of them are retired, so the scan is sixteen
+            // at a time once it is aligned to that: a search that stops early
+            // is not one the compiler vectorises. A block is a whole number of
+            // those.
             let find = |live: &[u32], from: usize| {
-                live[from..].iter().position(|&moves| moves != 0).map(|k| from + k)
+                const STRIDE: usize = 16;
+                debug_assert!(live.len() % STRIDE == 0);
+                let mut i = from;
+                while i % STRIDE != 0 {
+                    if live.get(i)? != &0 {
+                        return Some(i);
+                    }
+                    i += 1;
+                }
+                while i < live.len() {
+                    let words = Simd::<u32, STRIDE>::from_slice(unsafe { live.get_unchecked(i..i + STRIDE) });
+                    let set = words.simd_ne(Simd::splat(0)).to_bitmask();
+                    if set != 0 {
+                        return Some(i + set.trailing_zeros() as usize);
+                    }
+                    i += STRIDE;
+                }
+                None
             };
 
             UPDATE.with(|vals| {
@@ -231,11 +254,12 @@ impl<'a> Iterator for TableJob<'a> {
                     let next = find(live, i + 1).map(|k| (k, cursor.at(start + k)));
                     let update = Update {
                         layout,
+                        rank: start + i,
                         immutable,
                         mem: &mut *mem,
                         moves: &mut *moves,
                     };
-                    let ahead = next.map(|(k, layout)| (layout, spent[k]));
+                    let ahead = next.map(|(k, layout)| (layout, start + k, spent[k]));
                     let (tmp, inv) = update.update_layout(&mut live[i], &mut spent[i], pre, ahead);
                     pre = inv;
                     // a `fetch_or` per layout ping-pongs this cache line
@@ -344,6 +368,7 @@ impl AllTables {
                                 let mem = &mut *vals.borrow_mut();
                                 let mut update = Update {
                                     layout,
+                                    rank: i,
                                     immutable: &immutable,
                                     mem,
                                     moves: &mut moves,

@@ -191,6 +191,7 @@ const SLOTS: usize = 2 * LANES;
 /// The lanes of a row in [`Spread::spreadout`], which is the vector a row of a
 /// chunk fits in at any width. Also the slack a table carries past its end.
 const ROW: usize = 8;
+const _: () = assert!(2 * ROW == LANES && SIDE <= ROW);
 
 /// The row and the column of every slot of a chunk, per row length, for the
 /// walks that take a chunk [`LANES`] slots at a time.
@@ -406,7 +407,9 @@ impl Table {
 
     /// The chunk at position `rank`, which is what [`locate`] works out.
     fn chunk(&self, rank: usize) -> &[AtomicU32] {
-        &self.list[self.chunk_size * rank..][..self.chunk_size]
+        // a rank is of a layout of this table, so its chunk is in the list
+        debug_assert!(self.chunk_size * (rank + 1) <= self.list.len());
+        unsafe { self.list.get_unchecked(self.chunk_size * rank..self.chunk_size * (rank + 1)) }
     }
 
     /// The won states, of the ones still in play.
@@ -450,11 +453,11 @@ pub struct LocalMem {
     /// Per king position, `status` and the not won states expanded for the
     /// card mask of the current move group, a vector per row.
     ///
-    /// Side by side as one word, the losses this slot spreads in the low half
-    /// and the most it could ever spread beyond those in the high one, because
-    /// [`Spread`] reads the pair as the single word it tests the target
-    /// against. See [`Spread::expanded`].
-    expanded: [Simd<u64, ROW>; SIDE],
+    /// The losses this slot spreads in the first [`ROW`] lanes, a column each,
+    /// and the most it could ever spread beyond those in the next, because
+    /// [`Spread`] tests both against the target row at once. See
+    /// [`Spread::expanded`].
+    expanded: [Simd<u32, LANES>; SIDE],
 }
 
 /// The moves of the updates in flight, which borrow from the tables.
@@ -471,6 +474,10 @@ pub struct Moves<'t> {
     /// run before the accumulate rather than after it. See
     /// [`Update::prepare_spread`].
     spread: Vec<PreparedMove<'t>>,
+    /// The ranking of the layout whose forward moves were located last, which
+    /// its backward moves are located with in the next update: see
+    /// [`iter::Reranker`]. Unused with the sixteen lane ranking.
+    reranker: iter::Reranker,
 }
 
 impl LocalMem {
@@ -478,7 +485,7 @@ impl LocalMem {
         Self {
             wins: Padded([0; 8 * GROUP]),
             status: Padded([0; 8 * GROUP]),
-            expanded: [Simd::from_array([0; ROW]); SIDE],
+            expanded: [Simd::from_array([0; LANES]); SIDE],
         }
     }
 }
@@ -497,30 +504,38 @@ pub struct PreparedMove<'t> {
     step: (usize, usize),
     mask: u32,
     new: TeamLayout,
-    /// Which slots of the source read the target column of the same number
-    /// rather than the one after.
-    ///
-    /// That is a property of the column, so it is the same in every row, but
-    /// it is kept as the slot mask itself rather than the column to compare
-    /// against: the walk reads it straight into a mask register instead of
-    /// rebuilding it. Only the accumulate reads it.
-    keep: u32,
-    /// The table the target is in, and the target itself once [`locate`] has
-    /// worked out where in it.
+    /// The source columns that read the target column of the same number
+    /// rather than the one after, which are the ones below this. A property of
+    /// the column, so the same in every row. Only the accumulate reads it.
+    split: u32,
+    /// The table the target is in, and the start of the target itself once
+    /// [`locate`] has worked out where in it: the length is the table's, and
+    /// a pointer is one word less to write per move.
     table: &'t Table,
-    target: &'t [AtomicU32],
+    target: *const AtomicU32,
 }
 
 impl<'t> PreparedMove<'t> {
     fn target(&self) -> &'t [AtomicU32] {
-        self.target
+        debug_assert!(!self.target.is_null());
+        unsafe { std::slice::from_raw_parts(self.target, self.table.chunk_size) }
     }
 
     /// Point `target` at chunk `rank` of the table, and start the miss on it.
     #[inline(always)]
     fn offset(&mut self, rank: usize) {
-        self.target = self.table.chunk(rank);
-        prefetch(self.target);
+        // The sixteen lane ranking hands out its moves sixteen at a time, and
+        // so this runs back to back for all of them. There the bounds check
+        // pays for itself: without it the 8-men solve took 2% more cycles,
+        // with its prefetches finding the line in L2 12% less often (measured
+        // 2026-10-19). Presumably the burst of prefetches runs over what the
+        // core keeps in flight and some are dropped; the check spaces them.
+        #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
+        let chunk = &self.table.list[self.table.chunk_size * rank..][..self.table.chunk_size];
+        #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512cd")))]
+        let chunk = self.table.chunk(rank);
+        self.target = chunk.as_ptr();
+        prefetch(chunk);
     }
 
     /// The target chunk as plain words.
@@ -539,7 +554,12 @@ impl<'t> PreparedMove<'t> {
 /// Each `target` leaves as the chunk of `new` in the move's table. The ranks are taken sixteen at a time, which is what
 /// pulling them out of the walk that builds the moves buys: see
 /// [`iter::ranking16`].
-fn locate(moves: &mut [PreparedMove<'_>]) {
+///
+/// `parent` is the layout the moves are from, at `rank` in its own table, and
+/// `MOVER` the side whose pieces they move. A move that only moves one of those
+/// stays in that same table, and without the sixteen lane ranking it is ranked
+/// off the parent: see [`iter::Reranker`].
+fn locate<const MOVER: usize>(moves: &mut [PreparedMove<'_>], reranker: &mut iter::Reranker, parent: TeamLayout, rank: usize) {
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
     for batch in moves.chunks_mut(16) {
         let (mut s_1, mut s_2) = ([0; 16], [0; 16]);
@@ -551,9 +571,17 @@ fn locate(moves: &mut [PreparedMove<'_>]) {
             mv.offset(rank as usize);
         }
     }
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
+    let _ = (reranker, parent, rank);
     #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512cd")))]
-    for mv in moves {
-        mv.offset(iter::ranking(mv.new.pieces0, mv.new.pieces1));
+    {
+        if !reranker.is_for(parent, rank) {
+            reranker.fill(parent, rank);
+        }
+        for mv in moves {
+            let (changed0, changed1) = (mv.new.pieces0 ^ parent.pieces0, mv.new.pieces1 ^ parent.pieces1);
+            mv.offset(reranker.rank::<MOVER>(mv.new, changed0, changed1));
+        }
     }
 }
 
@@ -776,6 +804,8 @@ impl Seeds {
 /// moves and its mirrored chunk, is carried over to it as plain borrows.
 pub struct Update<'a, 't> {
     layout: TeamLayout,
+    /// Where `layout` is in its table, which is its index in the enumeration.
+    rank: usize,
     immutable: &'a ImmutableUpdate<'t>,
     mem: &'a mut LocalMem,
     moves: &'a mut Moves<'t>,
@@ -861,9 +891,13 @@ pub struct Spread<'a> {
     /// while the target only gains bits, so once the target subsumes it the
     /// chunk is done contributing, for good.
     ///
-    /// Read as one word per slot: the target broadcast into both halves turns
-    /// the two tests into one and against the pair. See [`Spread::spreadout`].
-    expanded: &'a [Simd<u64, ROW>; SIDE],
+    /// The two side by side in one vector, the losses in the first [`ROW`]
+    /// lanes and the bound in the next: the target row in both halves turns
+    /// the two tests into one and against the pair. Halves rather than the two
+    /// words of a slot next to each other, because then every operation on the
+    /// row is one per half, and a half is one AVX2 register. See
+    /// [`Spread::spreadout`].
+    expanded: &'a [Simd<u32, LANES>; SIDE],
 }
 
 /// What a [`Spread`] did, and whether it could ever do anything again.
