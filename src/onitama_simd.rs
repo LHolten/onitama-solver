@@ -10,6 +10,7 @@ use std::{
     iter::zip,
     mem::size_of,
     ops::{BitAnd, Deref, Index, IndexMut},
+    simd::Simd,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
     time::Instant,
 };
@@ -115,6 +116,9 @@ impl KingPos {
 // contains all the results up to some number of pieces
 pub struct AllTables {
     size: u32,
+    /// The most pieces a table built here has, both kings counted: see
+    /// [`AllTables::build_upto`].
+    pieces: u32,
     cards: Cards,
     mask_lookup: [u32; 25],
     directions: u32,
@@ -134,11 +138,29 @@ impl AllTables {
     }
 
     pub fn count_ones(&self) -> u64 {
-        self.list.iter().map(|x| x.count_ones()).sum()
+        self.built().map(|x| x.count_ones()).sum()
     }
 
     pub fn len(&self) -> u64 {
-        self.list.iter().map(|table| table.counts.states()).sum()
+        self.built().map(|table| table.counts.states()).sum()
+    }
+
+    /// Whether the table for these counts is one this was built with.
+    fn has(&self, counts: PawnCount) -> bool {
+        counts.count0 + counts.count1 + 2 <= self.pieces
+    }
+
+    /// The tables this was built with, which are all of them unless it was
+    /// built with a limit.
+    fn built(&self) -> impl Iterator<Item = &Table> {
+        self.list.iter().filter(|table| self.has(table.counts))
+    }
+
+    /// The won states per table, for every table this was built with.
+    pub fn table_wins(&self) -> Vec<((u32, u32), u64)> {
+        self.built()
+            .map(|table| ((table.counts.count0, table.counts.count1), table.count_ones()))
+            .collect()
     }
 }
 
@@ -152,54 +174,59 @@ const LINE: usize = 64;
 /// The size of a huge page.
 const HUGE: usize = 2 << 20;
 
-/// Slots a row of a chunk is padded to in the local buffers.
-///
-/// A row is then exactly one vector, and always starts on one, so a whole row
-/// is read and written in one aligned access instead of a short loop over a
-/// width only known at runtime.
-///
-/// Four fits the sizes up to eight men, where a side has at most four pieces
-/// and so a row at most four king positions. Nine and ten men need eight, and
-/// a path of their own: see [`Chunk::padded`] for what else has to change, and
-/// [`AllTables::build`] refuses the sizes this does not cover.
-const PAD: usize = 4;
+/// The most pieces a side has, which is all Onitama gives it: a chunk is at
+/// most this many king positions each way.
+const SIDE: usize = 5;
 
-/// Slots the vectorised walks over the padded buffers take at a time.
+/// Slots of a chunk the walks over all of it take at a time, which is one
+/// vector of words.
+///
+/// The local buffers hold a chunk the way the table does, row after row at
+/// its own width, so up to eight men a chunk is one of these and at ten two.
+const LANES: usize = 16;
+
+/// The most slots a chunk has, rounded up to whole [`LANES`].
+const SLOTS: usize = 2 * LANES;
+
+/// The lanes of a row in [`Spread::spreadout`], which is the vector a row of a
+/// chunk fits in at any width. Also the slack a table carries past its end.
+const ROW: usize = 8;
+
+/// The row and the column of every slot of a chunk, per row length, for the
+/// walks that take a chunk [`LANES`] slots at a time.
+static LANE_ROW: [[u32; SLOTS]; SIDE + 1] = lanes(true);
+static LANE_COL: [[u32; SLOTS]; SIDE + 1] = lanes(false);
+
+const fn lanes(row: bool) -> [[u32; SLOTS]; SIDE + 1] {
+    let mut table = [[0; SLOTS]; SIDE + 1];
+    let mut width = 1;
+    while width <= SIDE {
+        let mut slot = 0;
+        while slot < SLOTS {
+            table[width][slot] = (if row { slot / width } else { slot % width }) as u32;
+            slot += 1;
+        }
+        width += 1;
+    }
+    table
+}
+
+/// Slots the vectorised walks over the local buffers take at a time.
 const GROUP: usize = 8;
 
-/// Rows per [`GROUP`], which is what [`Chunk::padded`] rounds to.
-const ROWS_PER_GROUP: usize = GROUP / PAD;
-
-/// The most rows a chunk can have, which is one per piece.
-const MAX_ROWS: usize = 8;
-
-/// A row padded buffer, aligned so every row is.
+/// A buffer for a chunk, aligned so it starts on a line.
 ///
-/// Far longer than the rows can need, which is not slack for them but for the
+/// Far longer than a chunk can need, which is not slack for it but for the
 /// vectoriser: the length bounds how long it can tell the walks over this might
-/// run, and under [`MAX_ROWS`] groups it decides a whole vector at a time is
-/// not worth it and packs a single pair instead.
+/// run, and under eight groups it decides a whole vector at a time is not
+/// worth it.
 ///
 /// That bound is the whole reason for the length, so it is the shortest one
 /// that clears it rather than anything tuned. It is worth re-checking that the
 /// wide loop is still there after a toolchain bump; being wrong about it is a
 /// slowdown and nothing else.
 #[repr(align(64))]
-struct Padded<T>([T; MAX_ROWS * GROUP]);
-
-/// What one slot of [`LocalMem::expanded`] holds.
-///
-/// `repr(C)` so the pair really is `tmp` in the low half of a word and `may` in
-/// the high half, which is how [`Spread::spreadout`] reads it.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Expanded {
-    /// The losses this slot spreads.
-    tmp: u32,
-    /// The most it could ever spread beyond those, which is what decides
-    /// whether a move is finished. The two are disjoint.
-    may: u32,
-}
+struct Padded<T>([T; 8 * GROUP]);
 
 impl<T> std::ops::Deref for Padded<T> {
     type Target = [T];
@@ -269,7 +296,7 @@ impl AlignedTable {
     /// What is actually mapped: a vector of slack, so a read that runs off the
     /// end of the last chunk still lands inside the mapping.
     fn map_size(len: usize) -> usize {
-        Self::size(len + PAD)
+        Self::size(len + ROW)
     }
 
     fn layout(len: usize) -> Layout {
@@ -421,13 +448,13 @@ pub struct LocalMem {
     wins: Padded<u32>,
     status: Padded<u32>,
     /// Per king position, `status` and the not won states expanded for the
-    /// card mask of the current move group.
+    /// card mask of the current move group, a vector per row.
     ///
-    /// Side by side, and in that order, because both ends want it: the build
-    /// writes the two as one contiguous stream of the width the expansion
-    /// already works in, and [`Spread`] reads the pair as the single word it
-    /// tests the target against. See [`Spread::expanded`].
-    expanded: Padded<Expanded>,
+    /// Side by side as one word, the losses this slot spreads in the low half
+    /// and the most it could ever spread beyond those in the high one, because
+    /// [`Spread`] reads the pair as the single word it tests the target
+    /// against. See [`Spread::expanded`].
+    expanded: [Simd<u64, ROW>; SIDE],
 }
 
 /// The moves of the updates in flight, which borrow from the tables.
@@ -449,9 +476,9 @@ pub struct Moves<'t> {
 impl LocalMem {
     const fn new() -> Self {
         Self {
-            wins: Padded([0; MAX_ROWS * GROUP]),
-            status: Padded([0; MAX_ROWS * GROUP]),
-            expanded: Padded([Expanded { tmp: 0, may: 0 }; MAX_ROWS * GROUP]),
+            wins: Padded([0; 8 * GROUP]),
+            status: Padded([0; 8 * GROUP]),
+            expanded: [Simd::from_array([0; ROW]); SIDE],
         }
     }
 }
@@ -470,18 +497,14 @@ pub struct PreparedMove<'t> {
     step: (usize, usize),
     mask: u32,
     new: TeamLayout,
-    /// The target's rows, how long one of them is, and which of its columns
-    /// read the source column of the same number rather than the one after.
+    /// Which slots of the source read the target column of the same number
+    /// rather than the one after.
     ///
-    /// That last one is a property of the move, not of the row, so it is the
-    /// lane mask itself and not the column to compare against: the walk reads
-    /// it straight into a mask register instead of rebuilding it per row. It
-    /// is already spread over the rows of a vector too, since that is the same
-    /// mask in each of them and it never carries. Only the accumulate reads
-    /// these.
-    rows_new: u32,
-    width_new: u8,
-    keep: u16,
+    /// That is a property of the column, so it is the same in every row, but
+    /// it is kept as the slot mask itself rather than the column to compare
+    /// against: the walk reads it straight into a mask register instead of
+    /// rebuilding it. Only the accumulate reads it.
+    keep: u32,
     /// The table the target is in, and the target itself once [`locate`] has
     /// worked out where in it.
     table: &'t Table,
@@ -519,7 +542,6 @@ impl<'t> PreparedMove<'t> {
 fn locate(moves: &mut [PreparedMove<'_>]) {
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
     for batch in moves.chunks_mut(16) {
-        use std::simd::Simd;
         let (mut s_1, mut s_2) = ([0; 16], [0; 16]);
         for (k, mv) in batch.iter().enumerate() {
             (s_1[k], s_2[k]) = (mv.new.pieces0, mv.new.pieces1);
@@ -540,7 +562,9 @@ fn prefetch(slice: &[AtomicU32]) {
     use std::hint::{prefetch_read, Locality};
     let ptr = slice.as_ptr();
     prefetch_read(ptr, Locality::L1);
-    // a chunk is at most 64 bytes, so it spans at most two lines
+    // Up to eight men a chunk is at most 64 bytes, so it spans at most two
+    // lines. At ten it can take three, and the middle one is left to the
+    // demand miss: that costs time, not results.
     prefetch_read(ptr.wrapping_add(slice.len() - 1), Locality::L1);
 }
 
@@ -765,10 +789,13 @@ pub struct Update<'a, 't> {
 pub struct Chunk {
     /// Where this side's king can stand, which is on any of its pieces.
     rows: u32,
-    /// The same for the other side, and how long a row really is.
+    /// The same for the other side, and how long a row is.
     cols: u32,
     height: usize,
     width: usize,
+    /// The slot every row starts on, as a bit each: a mask of columns that is
+    /// the same in every row is a row's mask times this.
+    starts: u32,
 }
 
 impl Chunk {
@@ -777,41 +804,45 @@ impl Chunk {
             pieces0: rows,
             pieces1: cols,
         } = layout;
+        let (height, width) = (rows.count_ones() as usize, cols.count_ones() as usize);
+        let mut starts = 0;
+        for row in 0..height {
+            starts |= 1 << (row * width);
+        }
         let this = Self {
             rows,
             cols,
-            height: rows.count_ones() as usize,
-            width: cols.count_ones() as usize,
+            height,
+            width,
+            starts,
         };
         // Not a check but a bound for the vectoriser, which it needs to keep
         // the walks over `padded` slots a whole vector at a time: told nothing,
         // it sees a popcount of up to 32 rows, and the expansion in the spread
         // falls back to a pair at a time for +20% instructions on the solve.
         //
-        // SAFETY: a side has at most `PAD` pieces, which `AllTables::build`
+        // SAFETY: a side has at most `SIDE` pieces, which `AllTables::build`
         // holds the sizes to
-        unsafe { std::hint::assert_unchecked(this.height <= MAX_ROWS && this.width <= PAD) };
+        unsafe { std::hint::assert_unchecked(this.height <= SIDE && this.width <= SIDE) };
         this
     }
 
-    /// How many slots the chunk takes in the padded buffers.
+    /// How many slots the chunk takes in the local buffers.
     ///
-    /// Rounded up to a whole [`GROUP`], which the rows need not be: the slots
-    /// that buys are past every row and nobody reads them, and `wins` is filled
-    /// with a resolved value so the walks that do reach them get nothing.
+    /// Rounded up to a whole [`GROUP`]: the slots that buys are past the
+    /// chunk and nobody reads them, and `wins` is filled with a resolved value
+    /// so the walks that do reach them get nothing.
     ///
-    /// The rounding is on the rows and not on the slots, which matters. The
-    /// biggest of those walks builds [`Spread::expanded`], and its interleaved
-    /// pairs only vectorise a whole vector at a time if the vectoriser can
-    /// *prove* the count is a multiple of [`GROUP`]. It proves that from the
-    /// multiplication, which an even row count keeps. Rounding the slots
-    /// instead computes the very same number but folds to a bitmask
-    /// (`(n + 7) & !7`, or a `div_ceil` and a multiply, which become one), and
-    /// through that it can only see a multiple of `PAD`: it then gives up and
-    /// packs a single pair at a time, which the whole solve pays for in
-    /// instructions.
+    /// Rounding folds to a bitmask (`(n + 7) & !7`), which the vectoriser
+    /// does not see through, so it is told the count is a multiple of
+    /// [`GROUP`]: that is what lets it take the walks over these a whole
+    /// vector at a time with no tail.
     fn padded(self) -> usize {
-        self.height.next_multiple_of(ROWS_PER_GROUP) * PAD
+        let padded = (self.height * self.width).next_multiple_of(GROUP);
+        // SAFETY: rounded up to a multiple of `GROUP` just now, and a chunk is
+        // at most `SIDE` by `SIDE`
+        unsafe { std::hint::assert_unchecked(padded % GROUP == 0 && padded <= SLOTS) };
+        padded
     }
 }
 
@@ -822,7 +853,7 @@ pub struct Spread<'a> {
     step: (usize, usize),
     target: &'a [AtomicU32],
     /// Per king position, what to spread and the most that could ever be
-    /// spread here.
+    /// spread here, a vector per row of the chunk.
     ///
     /// The second is not just what it spreads now: a state only ever goes from
     /// unresolved to won or to lost, so the losses it can still gain are
@@ -832,7 +863,7 @@ pub struct Spread<'a> {
     ///
     /// Read as one word per slot: the target broadcast into both halves turns
     /// the two tests into one and against the pair. See [`Spread::spreadout`].
-    expanded: &'a [Expanded],
+    expanded: &'a [Simd<u64, ROW>; SIDE],
 }
 
 /// What a [`Spread`] did, and whether it could ever do anything again.
@@ -869,11 +900,22 @@ impl AllTables {
     }
 
     pub fn build(size: u32, cards: u16) -> Self {
+        Self::build_upto(size, cards, 2 * size)
+    }
+
+    /// [`Self::build`], but only the tables of up to `pieces` pieces, both
+    /// kings counted.
+    ///
+    /// Those only ever read tables smaller than themselves, so they come out
+    /// exactly as they do in the whole build. The ones past the limit are not
+    /// even allocated, and nothing spreads into them, which is what lets the
+    /// small tables of a size be solved where the whole of it does not fit.
+    pub fn build_upto(size: u32, cards: u16, pieces: u32) -> Self {
         // a side has `size` pieces, so a chunk has at most that many king
-        // positions each way, and a row has to fit in one vector
+        // positions each way, which is what the walks are built for
         assert!(
-            size as usize <= PAD,
-            "this is built for up to {PAD} pieces a side; {size} needs a wider PAD"
+            size as usize <= SIDE,
+            "a side has at most {SIDE} pieces, not {size}"
         );
 
         let mut mask_lookup = [0; 25];
@@ -887,6 +929,7 @@ impl AllTables {
 
         let tb = Self {
             size,
+            pieces,
             cards: Cards(cards),
             mask_lookup,
             directions,
@@ -896,7 +939,8 @@ impl AllTables {
                 .map(|counts: PawnCount| {
                     let chunk_size = (counts.count0 + 1) as usize * (counts.count1 + 1) as usize;
                     let num_chunks = counts.total();
-                    let len = chunk_size * num_chunks;
+                    let built = counts.count0 + counts.count1 + 2 <= pieces;
+                    let len = if built { chunk_size * num_chunks } else { 0 };
                     let list = AlignedTable::new_zeroed(len);
                     Table {
                         counts,
@@ -924,7 +968,7 @@ impl AllTables {
         let mut schedule: Vec<Vec<TableJob>> = vec![];
         for counts in count_indexer(size) {
             let counts: PawnCount = counts;
-            if counts.count0 < counts.count1 {
+            if counts.count0 < counts.count1 || !tb.has(counts) {
                 continue;
             }
             let total = (counts.count0 + counts.count1) as usize;
@@ -1179,6 +1223,159 @@ mod tests {
         assert_eq!(tb.count_unresolved(), 300597);
     }
 
+    /// The wins of every table of up to seven pieces, as eight men solves
+    /// them. Those are the same tables at ten men, which only adds larger
+    /// ones, so a ten men build has to come out with exactly these.
+    const SEVEN_PIECES: [((u32, u32), u64); 15] = [
+        ((0, 0), 11514),
+        ((0, 1), 315358),
+        ((0, 2), 3638987),
+        ((0, 3), 26229868),
+        ((1, 0), 214905),
+        ((1, 1), 6210802),
+        ((1, 2), 73684072),
+        ((1, 3), 514411418),
+        ((2, 0), 2133650),
+        ((2, 1), 57161872),
+        ((2, 2), 687973091),
+        ((2, 3), 4756101409),
+        ((3, 0), 14050120),
+        ((3, 1), 348163949),
+        ((3, 2), 3943887060),
+    ];
+
+    /// Check random states of every table against the rules, two plies deep.
+    ///
+    /// Nothing of the solver is used but the lookup of a table entry and the
+    /// card masks, which [`card_masks`] pins: the moves, the card exchange
+    /// and the game's ends are all done again here, a state at a time. A state
+    /// of `pieces1` to move is won exactly when it has a move that wins on the
+    /// spot, or one after which every reply either wins on the spot for the
+    /// opponent or leads to an entry marked won. That is only a check that the
+    /// tables are a solution, not that they are the least one, but anything
+    /// read from the wrong slot, chunk or configuration breaks it.
+    fn check_states(tb: &AllTables, per_table: usize) {
+        use super::{offset_mask, BitIter, Indexer, KingPos, TeamLayout};
+        let cards = &tb.seeds.0;
+
+        // per configuration, the cards of the side to move and the side card
+        let mut hand = [0u32; 30];
+        let mut side = [0usize; 30];
+        for (c, card) in cards.iter().enumerate() {
+            for k in 0..30 {
+                hand[k] |= (card.mover >> k & 1) << c;
+                if card.side >> k & 1 != 0 {
+                    side[k] = c;
+                }
+            }
+        }
+        let config = |hand_: u32, side_: usize| (0..30).find(|&k| hand[k] == hand_ && side[k] == side_).unwrap();
+
+        let won = |layout: TeamLayout, kpos: KingPos, k: usize| {
+            let counts = layout.counts();
+            let entry = tb.index_count(counts).index(layout)[kpos].load(Ordering::Relaxed);
+            entry >> k & 1 != 0
+        };
+
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as usize
+        };
+
+        for table in tb.built() {
+            let counts = table.counts;
+            let mut checked = 0;
+            while checked < per_table {
+                let layout = counts.nth_layout(next(counts.total()));
+                let TeamLayout { pieces0, pieces1 } = layout;
+                let pick = |pieces: u32, i: usize| BitIter::from(pieces).nth(i % pieces.count_ones() as usize).unwrap();
+                let (king0, king1) = (pick(pieces0, next(8)), pick(pieces1, next(8)));
+                let kpos = KingPos {
+                    king0: king0 as u32,
+                    king1: king1 as u32,
+                };
+                if kpos.over() {
+                    continue;
+                }
+                let k = next(30);
+                let (mine, kept) = (hand[k], side[k]);
+                let theirs = 0b11111 & !mine & !(1 << kept);
+
+                let mut expected = false;
+                'moves: for c in BitIter::from(mine) {
+                    for p in BitIter::from(pieces1) {
+                        for q in BitIter::from(offset_mask(p, cards[c].from) & !pieces1) {
+                            if q == king0 || p == king1 && q == 2 {
+                                expected = true;
+                                break 'moves;
+                            }
+                            let pieces0 = pieces0 & !(1 << q);
+                            let pieces1 = pieces1 ^ 1 << p ^ 1 << q;
+                            let king1 = if p == king1 { q } else { king1 };
+                            // our next hand, which is the opponent's to keep
+                            let after = mine & !(1 << c) | 1 << kept;
+
+                            let mut lost = true;
+                            'replies: for e in BitIter::from(theirs) {
+                                for p0 in BitIter::from(pieces0) {
+                                    for q0 in BitIter::from(offset_mask(p0, cards[e].to) & !pieces0) {
+                                        if q0 == king1 || p0 == king0 && q0 == 22 {
+                                            lost = false;
+                                            break 'replies;
+                                        }
+                                        let layout = TeamLayout {
+                                            pieces0: pieces0 ^ 1 << p0 ^ 1 << q0,
+                                            pieces1: pieces1 & !(1 << q0),
+                                        };
+                                        let kpos = KingPos {
+                                            king0: if p0 == king0 { q0 } else { king0 } as u32,
+                                            king1: king1 as u32,
+                                        };
+                                        if !won(layout, kpos, config(after, e)) {
+                                            lost = false;
+                                            break 'replies;
+                                        }
+                                    }
+                                }
+                            }
+                            if lost {
+                                expected = true;
+                                break 'moves;
+                            }
+                        }
+                    }
+                }
+                assert_eq!(won(layout, kpos, k), expected, "{counts:?} {layout:?} {kpos:?} configuration {k}");
+                checked += 1;
+            }
+        }
+    }
+
+    /// The check, on tables that are known to be right.
+    #[test]
+    fn checked_states() {
+        check_states(&AllTables::build(3, 0b11111), 20_000);
+    }
+
+    /// Ten men, as far as it fits: every table of up to seven pieces, which
+    /// takes in the ones with five pieces a side. The ones that eight men has
+    /// too have to come out the same, and the rest go through the check.
+    #[test]
+    #[ignore]
+    fn ten_up_to_seven() {
+        let tb = AllTables::build_upto(5, 0b11111, 7);
+        let wins = tb.table_wins();
+        for (counts, expected) in SEVEN_PIECES {
+            let got = wins.iter().find(|(c, _)| *c == counts).unwrap().1;
+            assert_eq!(got, expected, "{counts:?}");
+        }
+        println!("{wins:?}");
+        check_states(&tb, 20_000);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn thp_settings() {
@@ -1216,6 +1413,7 @@ mod tests {
         use super::{Cards, Indexer, InternalIter, Seeds, BLOCK_MASK};
         let tb = AllTables {
             size: 0,
+            pieces: 0,
             cards: Cards(0b11111),
             mask_lookup: [0; 25],
             directions: 0,

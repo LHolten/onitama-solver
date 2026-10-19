@@ -1,5 +1,6 @@
 use std::{
     iter::zip,
+    simd::{Mask, Select, Simd, ToBytes},
     sync::atomic::{AtomicU32, Ordering},
 };
 
@@ -8,8 +9,8 @@ use bit_iter::BitIter;
 use crate::card::offset_mask_fixed as offset_mask;
 
 use super::{
-    accum_spread::accumulate, locate, prefetch, Block, Chunk, Expanded, ImmutableUpdate, LocalMem, PreparedMove, Spread,
-    SpreadStatus, TeamLayout, Update, BLOCK_MASK, PAD,
+    accum_spread::{accumulate, permute}, locate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread,
+    SpreadStatus, TeamLayout, Update, BLOCK_MASK, LANES, LANE_COL, LANE_ROW, SLOTS,
 };
 
 
@@ -90,16 +91,14 @@ impl<'t> Update<'_, 't> {
                 } else {
                     (chunk.cols & (1 << to) - 1).count_ones()
                 };
-                // the lanes below the break, which is every lane when there
-                // is no capture to break the row, in every row of a vector
-                let keep = (((1u32 << split) - 1) * 0x1111) as u16;
+                // the columns below the break, which is every column when
+                // there is no capture to break the row, in every row
+                let keep = ((1u32 << split) - 1) * chunk.starts;
                 moves.push(PreparedMove {
                     bit: 0,
                     step: (from, to),
                     mask,
                     new,
-                    rows_new: new.pieces0,
-                    width_new: width_new as u8,
                     keep,
                     // `locate` works out which chunk of it
                     table,
@@ -266,8 +265,6 @@ impl<'t> Update<'_, 't> {
                     step: (from, to),
                     mask,
                     new,
-                    rows_new: 0,
-                    width_new: 0,
                     keep: 0,
                     // `locate` works out which chunk of it
                     table,
@@ -281,7 +278,6 @@ impl<'t> Update<'_, 't> {
     /// Spread every backward move [`Self::prepare_spread`] located.
     fn run_spread(&mut self, up: bool, live: &mut u32) -> SpreadStatus {
         let chunk = Chunk::new(self.layout);
-        let padded = chunk.padded();
         let LocalMem {
             status,
             wins,
@@ -300,23 +296,38 @@ impl<'t> Update<'_, 't> {
         // `moves` is grouped by offset, so this rebuilds the expansions once per
         // card mask. Both come off the same walk over the chunk: `wins` is kept
         // intact by `get_unresolved` precisely so the bound can be read here.
+        //
+        // `status` and `wins` are read in the vectors they were written in: a
+        // load across two of those stores would wait for both to reach the
+        // cache. The rows are cut out of the registers instead, a vector each,
+        // which is the load the spread does per row and per move.
+        let pair = Simd::<u32, LANES>::from_array(std::array::from_fn(|k| (k / 2) as u32));
+        let high = Mask::<i32, LANES>::from_bitmask(0xaaaa);
         let mut built = None;
         for mv in moves.iter() {
             if built != Some(mv.mask) {
                 built = Some(mv.mask);
-                let mask = mv.mask;
-                let src = zip(&status[..padded], &wins[..padded]);
-                for (e, (&s, &w)) in zip(&mut expanded[..padded], src) {
+                let mask = Simd::splat(mv.mask);
+                // `Block::expand`, a lane at a time: the bits shifted past the
+                // word are the ones the block mask drops anyway
+                let expand = |x: Simd<u32, LANES>| (x << 10 | x << 20 | x >> 10 | x >> 20) & Simd::splat(BLOCK_MASK);
+                let [(tmp_lo, may_lo), (tmp_hi, may_hi)] = [0, LANES].map(|start| {
+                    let s = Simd::from_slice(&status[start..start + LANES]);
+                    let w = Simd::from_slice(&wins[start..start + LANES]);
                     // we spread out the loses, these are wins for the previous state
-                    let tmp = Block(s & mask).expand().0;
-                    *e = Expanded {
-                        tmp,
-                        // what is going out now is taken off the bound here
-                        // rather than in the spread: it does not depend on the
-                        // target, so it is the same for every move that reads
-                        // this slot and for every row it reads it into
-                        may: Block(!w & mask).expand().0 & !tmp,
-                    };
+                    let tmp = expand(s & mask);
+                    // what is going out now is taken off the bound here rather
+                    // than in the spread: it does not depend on the target, so
+                    // it is the same for every move that reads this slot and
+                    // for every row it reads it into
+                    (tmp, expand(!w & mask) & !tmp)
+                });
+                for (row, e) in expanded[..chunk.height].iter_mut().enumerate() {
+                    // the lanes past the row read the next one's, which the
+                    // spread masks off
+                    let idx = Simd::splat((row * chunk.width) as u32) + pair;
+                    let words = high.select(permute(may_lo, may_hi, idx), permute(tmp_lo, tmp_hi, idx));
+                    *e = Simd::from_ne_bytes(words.to_ne_bytes());
                 }
             }
 
@@ -395,46 +406,44 @@ impl<'t> Update<'_, 't> {
     /// and two reversals, which is arithmetic on the two counters rather than a
     /// lookup per position.
     fn load_stuff(&mut self, inv: &[AtomicU32], chunk: Chunk) {
-        let rows = chunk.height;
-        let cols = chunk.width;
-        use std::simd::{cmp::SimdPartialOrd, Select, Simd, ToBytes};
+        use std::simd::cmp::SimdPartialOrd;
+        let (rows, cols) = (chunk.height, chunk.width);
 
-        // The whole chunk is one vector, which makes the transpose one permute
-        // and the write one store. That store is also the only thing the walks
-        // after this read `wins` through: a wide load over a run of narrow
-        // stores cannot be forwarded from them and waits for every one of them
-        // to reach the cache, and those stores wait on the mirrored chunk.
-        const WIDE: usize = PAD * PAD;
-        debug_assert!(chunk.padded() <= WIDE);
-        let lane = Simd::<u32, WIDE>::from_array(std::array::from_fn(|l| l as u32));
-        let (r, c) = (lane / Simd::splat(PAD as u32), lane % Simd::splat(PAD as u32));
-        let (rows, cols) = (Simd::splat(rows as u32), Simd::splat(cols as u32));
-        // the chunk is at most a vector long, and an atomic load a word at
-        // a time is what reading it while other threads `fetch_or` into it
-        // takes
-        let mut words = [0; WIDE];
+        // The chunk is at most two vectors, which makes the transpose a
+        // permute per vector and the write one store each. That store is also
+        // the only thing the walks after this read `wins` through: a wide load
+        // over a run of narrow stores cannot be forwarded from them and waits
+        // for every one of them to reach the cache, and those stores wait on
+        // the mirrored chunk.
+        //
+        // An atomic load a word at a time is what reading it while other
+        // threads `fetch_or` into it takes.
+        let mut words = [0; SLOTS];
         for (word, x) in zip(&mut words, inv) {
             *word = x.load(Ordering::Relaxed);
         }
-        // As a byte shuffle, which is the one with a run time index that
-        // `std::simd` has: four bytes per word. That is one `vpermb` only
-        // because `.cargo/config.toml` builds `core` for this machine; with the
-        // prebuilt one it is a byte at a time.
-        let idx = (cols - Simd::splat(1) - c) * rows + (rows - Simd::splat(1) - r);
-        let bytes = (idx * Simd::splat(0x0404_0404) + Simd::splat(0x0302_0100)).to_ne_bytes();
-        let x = Simd::<u32, WIDE>::from_ne_bytes(Simd::from_array(words).to_ne_bytes().swizzle_dyn(bytes));
-        // `Block::invert`, a lane at a time
-        const MASK0: u32 = 0b001001_001001_001001_001001_001001;
-        const MASK1: u32 = 0b000111_000111_000111_000111_000111;
-        let m0 = Simd::splat(MASK0);
-        let m1 = Simd::splat(MASK1);
-        let x = (x & m0 << 1) << 1 | (x & m0 << 2) >> 1 | (x & m0);
-        let x = (x & m1) << 3 | (x & m1 << 3) >> 3;
-        // the slots no king position uses are set to won, which makes them
-        // resolved and contributes nothing, so the walks below need no
-        // bounds of their own
-        let used = r.simd_lt(rows) & c.simd_lt(cols);
-        let x = used.select(x, Simd::splat(BLOCK_MASK));
-        x.copy_to_slice(&mut self.mem.wins[..WIDE]);
+        let (low, high) = (Simd::from_slice(&words[..LANES]), Simd::from_slice(&words[LANES..]));
+        let (rows_v, cols_v) = (Simd::splat(rows as u32), Simd::splat(cols as u32));
+        let lane = Simd::<u32, LANES>::from_array(std::array::from_fn(|l| l as u32));
+        for start in (0..chunk.padded()).step_by(LANES) {
+            let r = Simd::<u32, LANES>::from_slice(&LANE_ROW[cols][start..start + LANES]);
+            let c = Simd::<u32, LANES>::from_slice(&LANE_COL[cols][start..start + LANES]);
+            // the slots past the chunk read anywhere: they are overwritten
+            let idx = (cols_v - Simd::splat(1) - c) * rows_v + (rows_v - Simd::splat(1) - r);
+            let x = permute(low, high, idx);
+            // `Block::invert`, a lane at a time
+            const MASK0: u32 = 0b001001_001001_001001_001001_001001;
+            const MASK1: u32 = 0b000111_000111_000111_000111_000111;
+            let m0 = Simd::splat(MASK0);
+            let m1 = Simd::splat(MASK1);
+            let x = (x & m0 << 1) << 1 | (x & m0 << 2) >> 1 | (x & m0);
+            let x = (x & m1) << 3 | (x & m1 << 3) >> 3;
+            // the slots no king position uses are set to won, which makes them
+            // resolved and contributes nothing, so the walks below need no
+            // bounds of their own
+            let used = (lane + Simd::splat(start as u32)).simd_lt(Simd::splat((rows * cols) as u32));
+            let x = used.select(x, Simd::splat(BLOCK_MASK));
+            x.copy_to_slice(&mut self.mem.wins[start..start + LANES]);
+        }
     }
 }

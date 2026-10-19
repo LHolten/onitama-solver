@@ -303,7 +303,7 @@ pub fn ranking16(s_1: Simd<u32, 16>, s_2: Simd<u32, 16>) -> Simd<u32, 16> {
 
 /// The most pieces a layout has, both sides and both kings.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
-const PIECES: usize = 2 * super::PAD;
+const PIECES: usize = 2 * super::SIDE;
 
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512cd"))]
 const fn binom(n: usize, k: usize) -> u32 {

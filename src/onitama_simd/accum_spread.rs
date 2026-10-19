@@ -10,29 +10,46 @@ use std::{
 
 use bit_iter::BitIter;
 
-use super::{Chunk, PreparedMove, Spread, SpreadStatus, TeamLayout, MAX_ROWS, PAD};
+use super::{Chunk, PreparedMove, Spread, SpreadStatus, TeamLayout, LANES, LANE_COL, LANE_ROW, ROW, SIDE};
 
-/// `src` read through `idx`, with every lane `keep` leaves out zeroed.
+/// The words of `low` and then `high` that `idx` names, a lane each.
 ///
-/// One instruction where the permutation it stands for is a rotate, a broadcast
-/// and two selects, and the zeroing is the same instruction's mask rather than
-/// an and per test that reads the result.
+/// One instruction, which takes the index modulo the two vectors' length.
 #[inline(always)]
-fn pick(src: Simd<u64, PAD>, idx: Simd<u64, PAD>, keep: Mask<i64, PAD>) -> Simd<u64, PAD> {
-    #[cfg(target_feature = "avx512vl")]
+pub fn permute(low: Simd<u32, LANES>, high: Simd<u32, LANES>, idx: Simd<u32, LANES>) -> Simd<u32, LANES> {
+    #[cfg(target_feature = "avx512f")]
     unsafe {
-        use std::arch::x86_64::_mm256_maskz_permutexvar_epi64;
-        _mm256_maskz_permutexvar_epi64(keep.to_bitmask() as u8, idx.into(), src.into()).into()
+        use std::arch::x86_64::_mm512_permutex2var_epi32;
+        _mm512_permutex2var_epi32(low.into(), idx.into(), high.into()).into()
     }
-    #[cfg(not(target_feature = "avx512vl"))]
+    #[cfg(not(target_feature = "avx512f"))]
     {
-        let mut out = [0; PAD];
-        for (k, slot) in out.iter_mut().enumerate() {
-            if keep.test(k) {
-                *slot = src[idx[k] as usize];
+        Simd::from_array(std::array::from_fn(|l| {
+            let i = idx[l] as usize % (2 * LANES);
+            if i < LANES {
+                low[i]
+            } else {
+                high[i - LANES]
             }
-        }
-        Simd::from_array(out)
+        }))
+    }
+}
+
+/// The words of `src` that `idx` names, one per lane, with every lane `keep`
+/// leaves out zeroed.
+///
+/// The zeroing is the same instruction's mask rather than an and per test that
+/// reads the result.
+#[inline(always)]
+fn pick(src: Simd<u64, ROW>, idx: Simd<u64, ROW>, keep: Mask<i64, ROW>) -> Simd<u64, ROW> {
+    #[cfg(target_feature = "avx512f")]
+    unsafe {
+        use std::arch::x86_64::_mm512_maskz_permutexvar_epi64;
+        _mm512_maskz_permutexvar_epi64(keep.to_bitmask() as u8, idx.into(), src.into()).into()
+    }
+    #[cfg(not(target_feature = "avx512f"))]
+    {
+        Simd::from_array(std::array::from_fn(|k| if keep.test(k) { src[idx[k] as usize % ROW] } else { 0 }))
     }
 }
 
@@ -44,7 +61,7 @@ fn pick(src: Simd<u64, PAD>, idx: Simd<u64, PAD>, keep: Mask<i64, PAD>) -> Simd<
 /// offset is one and per move and a single not and mask at the end of it. And
 /// is associative, so that accumulator stays in a register instead of being an
 /// or back into `status` per move, and the ors across offsets stay in one too,
-/// which leaves one store per vector of rows for the whole chunk.
+/// which leaves one store per vector of slots for the whole chunk.
 ///
 /// Both dimensions keep their order apart from the squares the move touches.
 /// The row the king moved off is the only one that does not map to itself, and
@@ -54,127 +71,102 @@ fn pick(src: Simd<u64, PAD>, idx: Simd<u64, PAD>, keep: Mask<i64, PAD>) -> Simd<
 /// move takes that king for every card it has, so the slot is won and anything
 /// claiming it is not lost is true there.
 pub fn accumulate(chunk: Chunk, moves: &[PreparedMove], status: &mut [u32]) {
-    /// Rows taken at a time, so one vector holds this many of them side by
-    /// side. Every row of a chunk fits in one at the sizes this is built for.
-    const ROWS: usize = 4;
-    /// Slots in that vector.
-    const WIDE: usize = PAD * ROWS;
+    let Chunk {
+        rows, height, width, ..
+    } = chunk;
+    let slots = height * width;
 
-    // the square of each row, so the walks below index it instead of stepping a
-    // bit iterator they cannot start in the middle of
-    let mut kings = [0usize; MAX_ROWS];
-    for (slot, king0) in kings.iter_mut().zip(BitIter::from(chunk.rows)) {
-        *slot = king0;
+    // the square of each row's king, five bits each, for the slots to shift
+    // theirs out of: built in a register, since a vector read of words just
+    // stored one by one waits for every one of them to reach the cache
+    let mut kings = 0;
+    for (i, king0) in BitIter::from(rows).enumerate() {
+        kings |= (king0 as u32) << 5 * i;
     }
-    let height = chunk.height;
 
-    // The rows on the outside and the offsets within, so what every offset
-    // contributes to these rows adds up in a register and `status` is written
+    // The slots on the outside and the offsets within, so what every offset
+    // contributes to these slots adds up in a register and `status` is written
     // once. It is also the only write, which is what lets the caller hand this
     // whatever it last held rather than zeroing it first.
-    for gs in (0..height).step_by(ROWS) {
-        let mut acc = Simd::<u32, WIDE>::splat(0);
+    for start in (0..slots).step_by(LANES) {
+        let mut acc = Simd::<u32, LANES>::splat(0);
         // the square of the row every slot is in, the column it is, and the
-        // slots of the rows that are there
-        let king = Simd::<u32, WIDE>::from_array(std::array::from_fn(|l| kings[gs + l / PAD] as u32));
-        let col = Simd::<u32, WIDE>::from_array(std::array::from_fn(|l| (l % PAD) as u32));
-        let rows = ((1u32 << (height - gs).min(ROWS) * PAD) - 1) as u16;
+        // slots that are there
+        let row = Simd::<u32, LANES>::from_slice(&LANE_ROW[width][start..start + LANES]);
+        let col = Simd::<u32, LANES>::from_slice(&LANE_COL[width][start..start + LANES]);
+        let king = Simd::splat(kings) >> row * Simd::splat(5) & Simd::splat(31);
+        let live = ((1u32 << (slots - start).min(LANES)) - 1) as u16;
 
         // `moves` is built offset by offset, so an offset is a run of it
         for group in moves.chunk_by(|a, b| a.mask == b.mask) {
-            let card = Simd::<u32, WIDE>::splat(group[0].mask);
-            let mut all = Simd::<u32, WIDE>::splat(u32::MAX);
+            let card = Simd::<u32, LANES>::splat(group[0].mask);
+            let mut all = Simd::<u32, LANES>::splat(u32::MAX);
 
             for mv in group {
                 let (from, to) = mv.step;
 
-                // A row that is not there reads nothing and stays all ones.
+                // Every slot reads one word of the target, so the whole move
+                // is one permute out of a register, or two at ten men, and the
+                // row remap, the column rotate and the select all go into the
+                // index. That index is worked out for every slot at once.
+                //
+                // The king moved exactly when it was the piece on `from`, and
+                // where its row lands is its rank among the target's rows.
+                let moved = king.simd_eq(Simd::splat(from as u32));
+                let new0 = moved.select(Simd::splat(to as u32), king);
+                // no square is past 24, so the shift never runs out of bits
+                let below = Simd::splat(u32::MAX) << new0;
+                let TeamLayout { pieces0: rows_new, pieces1: cols_new } = mv.new;
+                let width_new = cols_new.count_ones();
+                let rank = (!below & Simd::splat(rows_new)).count_ones();
+                let idx = rank * Simd::splat(width_new) + col;
+                // the columns past the break read the one before
+                let keep = Mask::<i32, LANES>::from_bitmask((mv.keep >> start) as u64);
+                let idx = keep.select(idx, idx - Simd::splat(1));
+
+                // the target's own length, which is all of it there is
+                let size = (rows_new.count_ones() * width_new) as usize;
+                let target = unsafe { from_raw_parts(mv.src(), size) };
+                // A slot that is not there reads nothing and stays all ones.
                 // That is the identity of the and, which is what dropping it
                 // means.
-                #[cfg(all(target_feature = "avx512f", target_feature = "avx512vpopcntdq"))]
-                {
-                    use std::arch::x86_64::{
-                        _mm512_mask_and_epi32, _mm512_maskz_loadu_epi32, _mm512_permutexvar_epi32,
-                        _mm512_sllv_epi32,
-                    };
-                    // Every slot reads one word of the target, so the whole move
-                    // is one permute out of a register: the target is at most
-                    // `PAD` by `PAD`, which is a single vector, and the row
-                    // remap, the column rotate and the select all go into the
-                    // index. That index is worked out for every slot at once,
-                    // where the rows used to be a scalar chain each.
-                    //
-                    // The king moved exactly when it was the piece on `from`, and
-                    // where its row lands is its rank among the target's rows.
-                    let moved = king.simd_eq(Simd::splat(from as u32));
-                    let new0 = moved.select(Simd::splat(to as u32), king);
-                    // the shift is the instruction's own, which needs no
-                    // masking of the count the way `<<` does
-                    let below: Simd<u32, WIDE> = unsafe {
-                        _mm512_sllv_epi32(Simd::splat(u32::MAX).into(), new0.into()).into()
-                    };
-                    let rank = (!below & Simd::splat(mv.rows_new)).count_ones();
-                    let idx = rank * Simd::splat(mv.width_new as u32) + col;
-                    // the columns past the break read the one before
-                    let keep = Mask::<i32, WIDE>::from_bitmask(mv.keep as u64);
-                    let idx = keep.select(idx, idx - Simd::splat(1));
-
-                    // the target's own length, which is all of it there is
-                    let size = mv.rows_new.count_ones() * mv.width_new as u32;
-                    unsafe {
-                        // the lanes past the target are masked off, so they
-                        // neither read nor fault even at the end of the table
-                        let src = _mm512_maskz_loadu_epi32(((1u32 << size) - 1) as u16, mv.src().cast());
-                        let picked = _mm512_permutexvar_epi32(idx.into(), src);
-                        all = _mm512_mask_and_epi32(all.into(), rows, all.into(), picked).into();
-                    }
-                }
-                #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512vpopcntdq")))]
-                {
-                    use std::simd::simd_swizzle;
-                    let _ = (king, col, rows);
-                    let width_new = mv.width_new as usize;
-                    // Only the rows differ between these, and only in where they
-                    // read: the columns permute the same way for all of them, so
-                    // the rotate and the select below are one go for the lot.
-                    let mut part = [Simd::<u32, PAD>::splat(u32::MAX); ROWS];
-                    for (i, slot) in part.iter_mut().enumerate() {
-                        let r = gs + i;
-                        if r >= height {
-                            break;
-                        }
-                        // `r` is bounded by `height`, which is `MAX_ROWS` at
-                        // most, but that is not something the walk makes obvious
-                        let king0 = unsafe { *kings.get_unchecked(r) };
-                        // the king moved exactly when it was the piece on `from`
-                        let new0 = if king0 == from { to } else { king0 };
-                        let tbase = (mv.rows_new & (1 << new0) - 1).count_ones() as usize * width_new;
-                        // a row is read whole however short it is, which the `PAD`
-                        // of slack on the table is there to let the last one do
-                        *slot = Simd::from_slice(unsafe { from_raw_parts(mv.src().add(tbase), PAD) });
-                    }
-
-                    let low = simd_swizzle!(part[0], part[1], [0, 1, 2, 3, 4, 5, 6, 7]);
-                    let high = simd_swizzle!(part[2], part[3], [0, 1, 2, 3, 4, 5, 6, 7]);
-                    let src: Simd<u32, WIDE> = simd_swizzle!(
-                        low,
-                        high,
-                        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-                    );
-                    // the rotate is per row, so it stays inside each row's slots
-                    let shifted =
-                        simd_swizzle!(src, [3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14]);
-                    let keep = Mask::<i32, WIDE>::from_bitmask(mv.keep as u64);
-                    all &= keep.select(src, shifted);
-                }
+                all = Mask::<i32, LANES>::from_bitmask(live as u64).select(all & read(target, idx), all);
             }
 
             // if no move of this offset is won, then the state is not lost
             acc |= !all & card;
         }
 
-        let row = unsafe { status.get_unchecked_mut(gs * PAD..gs * PAD + WIDE) };
-        acc.copy_to_slice(row);
+        let out = unsafe { status.get_unchecked_mut(start..start + LANES) };
+        acc.copy_to_slice(out);
+    }
+}
+
+/// The words of `target` that `idx` names, a lane each.
+///
+/// The target is at most two vectors long, so this is a permute out of them,
+/// and only reads the second one when the target reaches into it. The lanes
+/// past the target are masked off, so they neither read nor fault even at the
+/// end of the table.
+#[inline(always)]
+fn read(target: &[u32], idx: Simd<u32, LANES>) -> Simd<u32, LANES> {
+    #[cfg(target_feature = "avx512f")]
+    unsafe {
+        use std::arch::x86_64::{_mm512_maskz_loadu_epi32, _mm512_permutexvar_epi32};
+        // a target is at most 25 words, so the shift stays in the word and
+        // its halves are the two vectors' lanes
+        let lanes = (1u32 << target.len()) - 1;
+        let low = _mm512_maskz_loadu_epi32(lanes as u16, target.as_ptr().cast());
+        if target.len() <= LANES {
+            _mm512_permutexvar_epi32(idx.into(), low).into()
+        } else {
+            let high = _mm512_maskz_loadu_epi32((lanes >> LANES) as u16, target.as_ptr().add(LANES).cast());
+            permute(low.into(), high.into(), idx)
+        }
+    }
+    #[cfg(not(target_feature = "avx512f"))]
+    {
+        Simd::from_array(std::array::from_fn(|l| target.get(idx[l] as usize).copied().unwrap_or(u32::MAX)))
     }
 }
 
@@ -208,7 +200,7 @@ impl Spread<'_> {
         let f = (cols_old & (1 << from) - 1).count_ones() as usize;
         let p = (cols_new & (1 << to) - 1).count_ones() as usize;
 
-        let lane = Simd::<u64, PAD>::from_array(std::array::from_fn(|k| k as u64));
+        let lane = Simd::<u64, ROW>::from_array(std::array::from_fn(|k| k as u64));
         let at_p = lane.simd_eq(Simd::splat(p as u64));
         // the run is the columns strictly between the two, which is the half
         // open interval on whichever side the piece moved, and it steps towards
@@ -226,17 +218,15 @@ impl Spread<'_> {
         let idx = at_p.select(Simd::splat(f as u64), run.select(step, lane));
 
         let target = self.target.as_ptr();
-        // the pair is one word, so a row of them is one vector
-        let row_at = |i: usize| unsafe { self.expanded.as_ptr().add(i).cast::<u64>() };
         // the target word in both halves, so one and against the pair asks of
         // the bound and of the losses at the same time
         const LOW: u64 = u32::MAX as u64;
-        let zero = Simd::<u64, PAD>::splat(0);
+        let zero = Simd::<u64, ROW>::splat(0);
 
         // every row's news folded together, so what the move still owes and
         // whether anything went out at all are two tests after the walk rather
         // than a compare, a mask test and a fold per row
-        let mut seen = Simd::<u64, PAD>::splat(0);
+        let mut seen = Simd::<u64, ROW>::splat(0);
         let mut new_i = 0;
         let mut row = 0;
         for king0 in BitIter::from(rows_new) {
@@ -247,21 +237,26 @@ impl Spread<'_> {
             }
             // only the `go_up` form moves the rows around
             let base = if UP {
-                (rows_old & (1 << king0) - 1).count_ones() as usize * PAD
+                (rows_old & (1 << king0) - 1).count_ones() as usize
             } else {
-                row * PAD
+                row
             };
             row += 1;
 
-            let src = Simd::<u64, PAD>::from_slice(unsafe { from_raw_parts(row_at(base), PAD) });
             // the dead columns come back zeroed, which is what every test below
             // would otherwise have to mask off one by one
-            let pair = pick(src, idx, live);
+            let pair = pick(unsafe { *self.expanded.get_unchecked(base) }, idx, live);
 
-            // the row of the target is contiguous, and the table carries `PAD`
-            // of slack precisely so the last one can be read whole
-            let fetch: Simd<u32, PAD> =
-                Simd::from_slice(unsafe { from_raw_parts(target.cast::<u32>().add(new_i), PAD) });
+            // The row of the target is contiguous, and read in at most four
+            // words. A wider read runs into the line of the next chunk, which
+            // nothing prefetched, and waits for it, masked or not: the mask
+            // only drops the words, the load still covers all of them. So the
+            // fifth word, which only ten men have, is a load of its own.
+            let row_new = unsafe { from_raw_parts(target.cast::<u32>().add(new_i), width_new) };
+            let mut fetch = Simd::<u32, 4>::load_or_default(&row_new[..width_new.min(4)]).resize::<ROW>(0);
+            if width_new > 4 {
+                fetch[4] = row_new[4];
+            }
             let fetch = fetch.cast::<u64>();
             let both = fetch | fetch << Simd::splat(32);
             new_i += width_new;
@@ -297,7 +292,7 @@ impl Spread<'_> {
             // index is one the whole vector has to be on the stack for, and
             // that spill lands on every row rather than on the few that write
             let bits = todo.to_bitmask();
-            for col in 0..PAD {
+            for col in 0..SIDE {
                 if bits >> col & 1 != 0 {
                     let slot = unsafe { &*target.add(new_i - width_new + col) };
                     slot.fetch_or(pair[col] as u32, Ordering::Relaxed);

@@ -17,7 +17,7 @@ use crate::{index::Indexer, onitama_simd::LocalMem};
 
 use super::{
     count_indexer, iter::LayoutCursor, AllTables, ImmutableUpdate, Moves, PawnCount, TableJob,
-    TeamLayout, Update, BLOCK, PAD,
+    TeamLayout, Update, BLOCK, SIDE,
 };
 
 /// Layouts covered by one word of [`TableJob::needs_up`], and the granularity
@@ -40,12 +40,13 @@ impl<'a> ImmutableUpdate<'a> {
                     count1: count1 - 1,
                 })
             }),
-            leave_one: (count0 + 1 != tb.size).then(|| {
-                tb.index_count(PawnCount {
+            leave_one: {
+                let larger = PawnCount {
                     count0: count0 + 1,
                     count1,
-                })
-            }),
+                };
+                (count0 + 1 != tb.size && tb.has(larger)).then(|| tb.index_count(larger))
+            },
             go_up: false,
             mask_lookup: &tb.mask_lookup,
             directions: tb.directions,
@@ -164,7 +165,7 @@ impl<'a> TableJob<'a> {
 
                 // a seed is terms of the column and of the row: the wins in
                 // one or'd, and a win in two where both halves allow it
-                let (mut temple, mut run) = ([0; PAD], [0; PAD]);
+                let (mut temple, mut run) = ([0; SIDE], [0; SIDE]);
                 for (c, king1) in BitIter::from(pieces1).enumerate() {
                     temple[c] = seeds.temple(pieces1, king1);
                     run[c] = seeds.run(pieces0, pieces1, king1);
@@ -307,6 +308,7 @@ impl AllTables {
     pub fn count_unresolved(&self) -> u64 {
         count_indexer(self.size)
             .into_iter()
+            .filter(|&counts| self.has(counts))
             .map(|counts: PawnCount| {
                 let immutable = ImmutableUpdate::new(self, counts);
                 let total = counts.total();
