@@ -2,6 +2,7 @@
 use rayon::prelude::*;
 
 use std::{
+    iter::zip,
     cell::RefCell,
     mem::take,
     sync::{
@@ -161,17 +162,21 @@ impl<'a> TableJob<'a> {
                 let TeamLayout { pieces0, pieces1 } = layout;
                 let seeds = &self.tb.seeds;
 
-                // a seed is a term of the column or'd with one of the row
-                let mut temple = [0; PAD];
-                for (t, king1) in temple.iter_mut().zip(BitIter::from(pieces1)) {
-                    *t = seeds.temple(pieces1, king1);
+                // a seed is terms of the column and of the row: the wins in
+                // one or'd, and a win in two where both halves allow it
+                let (mut temple, mut run) = ([0; PAD], [0; PAD]);
+                for (c, king1) in BitIter::from(pieces1).enumerate() {
+                    temple[c] = seeds.temple(pieces1, king1);
+                    run[c] = seeds.run(pieces0, pieces1, king1);
                 }
                 let width = pieces1.count_ones() as usize;
                 for (row, king0) in slice.chunks(width).zip(BitIter::from(pieces0)) {
                     let take = seeds.take(pieces1, king0);
-                    for (val, &t) in row.iter().zip(&temple) {
-                        if t | take != 0 {
-                            val.store(t | take, Ordering::Relaxed);
+                    let quiet = seeds.quiet(pieces0, king0);
+                    for (val, (&t, &r)) in row.iter().zip(zip(&temple, &run)) {
+                        let seed = t | take | quiet & r;
+                        if seed != 0 {
+                            val.store(seed, Ordering::Relaxed);
                         }
                     }
                 }

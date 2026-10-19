@@ -53,9 +53,10 @@ impl LayoutCursor {
 impl PawnCount {
     /// How many states of the table for these counts are still in play.
     ///
-    /// A chunk has a slot for every king position, but one with a king on its
-    /// own temple is a game that is already [`over`](super::KingPos::over), so
-    /// a layout with a piece there has one fewer choice for that king. The
+    /// A chunk has a slot for every king position, but one with a king on the
+    /// opponent's temple is a game that is already
+    /// [`over`](super::KingPos::over), so a layout with a piece there has one
+    /// fewer choice for that king. The
     /// layouts that do have one are just a multinomial with that square spoken
     /// for, which makes the whole sum closed form instead of a walk over every
     /// layout.

@@ -93,7 +93,7 @@ pub struct KingPos {
 }
 
 impl KingPos {
-    /// Whether a king stands on the temple it wins on, so the game is already
+    /// Whether a king stands on the opponent's temple, so the game is already
     /// over.
     ///
     /// These still get a slot, which keeps every chunk of a table the full
@@ -554,16 +554,22 @@ pub struct ImmutableUpdate<'a> {
     directions: u32,
 }
 
-/// What the solve is seeded with, per card: the states won outright.
+/// What the solve is seeded with, per card: the states won outright, and some
+/// of the ones won in two.
 ///
-/// Those are the ones where the side to move can step its king onto the temple
-/// or take the other king, and the ones where the game is already
+/// The wins in one are the ones where the side to move can step its king onto
+/// the opponent's temple or take the opponent's king. The wins in two are the
+/// ones where it gets its king within a step of the opponent's temple and the
+/// opponent can not stop it: see [`Self::run`]. They
+/// cost nothing but the seed's own work, since all they need is the layout,
+/// and they save the passes that would otherwise find them. Then there are the
+/// ones where the game is already
 /// [`over`](KingPos::over), which count as won with every card. That last is
 /// not true of the game, but nothing still in play can tell:
 ///
-/// - The only move from a state in play into such a slot is a king onto its
-///   temple, and that state is seeded as won for every card the move is made
-///   with. Reading all ones there is the same as not reading it.
+/// - The only move from a state in play into such a slot is a king onto the
+///   opponent's temple, and that state is seeded as won for every card the
+///   move is made with. Reading all ones there is the same as not reading it.
 /// - Its mirror is another such slot, so a chunk's game over rows read all
 ///   ones for their wins. That leaves them nothing lost to spread and nothing
 ///   they could still spread, so they retire with the rest.
@@ -572,43 +578,150 @@ pub struct ImmutableUpdate<'a> {
 /// And all ones is something the counts can take back out exactly: see
 /// [`Table::count_ones`].
 ///
-/// A seed is a term of where `pieces1`'s king stands or'd with one of where
-/// the other king does, so a chunk takes one per column and one per row
-/// instead of a walk over every king position per card.
+/// Every one of these is made of terms of where `pieces1`'s king stands and
+/// of where the other king does, so a chunk takes a few per column and a few
+/// per row instead of a walk over every king position per card.
 pub struct Seeds([SeedCard; 5]);
 
 #[derive(Clone, Copy, Default)]
 struct SeedCard {
-    /// The squares this card reaches from the centre.
+    /// The squares `pieces0` reaches from the centre with this card, and the
+    /// ones `pieces1` does, which is the card turned around.
     to: u32,
-    /// From where `pieces1`'s king steps onto its temple with it.
+    from: u32,
+    /// From where `pieces1`'s king steps onto the opponent's temple with it.
     temple: u32,
-    /// The configurations `pieces1`, to move, holds the card in.
+    /// The configurations `pieces1`, to move, holds the card in, the ones it
+    /// is the side card in, and the ones the opponent holds it in.
     mover: u32,
+    side: u32,
+    opponent: u32,
 }
 
 impl Seeds {
     fn new(cards: Cards) -> Self {
         let mut seeds = [SeedCard::default(); 5];
         for (seed, (card, side)) in seeds.iter_mut().zip(zip(cards.iter(), mask_iter())) {
-            // the raw mask is the configurations where it is the side card
+            // the raw mask is the configurations where it is the side card,
+            // seen from the side that just moved
+            let mover = Block(side).invert().expand().0;
+            let side = Block(side).invert().0;
             *seed = SeedCard {
                 to: card.bitmap::<false>(),
+                from: card.bitmap::<true>(),
                 temple: offset_mask(2, card.bitmap::<false>()),
-                mover: Block(side).invert().expand().0,
+                mover,
+                side,
+                opponent: BLOCK_MASK & !mover & !side,
             };
         }
         Self(seeds)
     }
 
+    /// The configurations where the opponent can not win right away by
+    /// stepping onto our temple, with its king on `king0`.
+    ///
+    /// This is the half of a win in two that depends on the row: see
+    /// [`Self::run`].
+    fn quiet(&self, pieces0: u32, king0: usize) -> u32 {
+        let mut lost = 0;
+        if pieces0 & 1 << 22 == 0 {
+            for card in &self.0 {
+                if offset_mask(king0, card.to) & 1 << 22 != 0 {
+                    lost |= card.opponent;
+                }
+            }
+        }
+        BLOCK_MASK & !lost
+    }
+
+    /// The configurations where no piece of the opponent can take a king on
+    /// `square`.
+    fn safe(&self, pieces0: u32, square: usize) -> u32 {
+        let mut lost = 0;
+        for card in &self.0 {
+            if offset_mask(square, card.from) & pieces0 != 0 {
+                lost |= card.opponent;
+            }
+        }
+        BLOCK_MASK & !lost
+    }
+
+    /// The half of a win in two that depends on the column: `pieces1`'s king
+    /// on `king1` gets to where it reaches the opponent's temple next turn,
+    /// with a card it will hold then, and the opponent can not take it there.
+    ///
+    /// Then the opponent has nothing. Every move is a jump, so nothing can be
+    /// put in the way, and an opponent piece standing on its own temple is
+    /// just taken by the king on the way in. It can only win first, by taking the
+    /// king, which this rules out, or by stepping onto our temple, which
+    /// [`Self::quiet`] does. The card played goes to the side, and the one
+    /// that was there comes into the hand, so next turn's cards are the one
+    /// not played and the old side card.
+    ///
+    /// Either the king walks there, or it is there already and only needs the
+    /// side card, and another piece passes the turn with a card of the hand.
+    /// Taking a piece on the way only ever takes away from what the opponent
+    /// can do, except taking one that stands on our temple, which would let
+    /// the opponent's king onto it. A passing move is kept from that, and a
+    /// king that walks never gets near our temple: it ends next to the
+    /// opponent's.
+    fn run(&self, pieces0: u32, pieces1: u32, king1: usize) -> u32 {
+        // a piece of our own on the opponent's temple is in the way, and
+        // nothing can move it off and have the king arrive in the same turn
+        if king1 == 2 || pieces1 & 1 << 2 != 0 {
+            return 0;
+        }
+        let sources = self.0.iter().fold(0, |acc, card| acc | card.temple);
+        let mut win = 0;
+
+        for (u, played) in self.0.iter().enumerate() {
+            let walks = offset_mask(king1, played.from) & sources & !pieces1;
+            for square in BitIter::from(walks) {
+                // the cards that take the king on from there next turn
+                let mut next = 0;
+                for (y, card) in self.0.iter().enumerate() {
+                    if y != u && 1 << square & card.temple != 0 {
+                        next |= card.mover | card.side;
+                    }
+                }
+                if next != 0 {
+                    win |= played.mover & next & self.safe(pieces0, square);
+                }
+            }
+        }
+
+        // it is there already, but only with the side card
+        let mut side = 0;
+        for card in &self.0 {
+            if 1 << king1 & card.temple != 0 {
+                side |= card.side;
+            }
+        }
+        if side != 0 {
+            // somewhere another piece can go without blocking the opponent's
+            // temple, or taking a piece off ours
+            let free = !pieces1 & !(1 << 2) & !(pieces0 & 1 << 22) & TABLE_MASK;
+            let mut pass = 0;
+            for card in &self.0 {
+                let others = pieces1 & !(1 << king1);
+                if BitIter::from(others).any(|p| offset_mask(p, card.from) & free != 0) {
+                    pass |= card.mover;
+                }
+            }
+            win |= side & pass & self.safe(pieces0, king1);
+        }
+        win
+    }
+
     /// The term of `pieces1`'s king on `king1`: whether it steps onto the
-    /// temple.
+    /// opponent's temple.
     fn temple(&self, pieces1: u32, king1: usize) -> u32 {
         if king1 == 2 {
             return BLOCK_MASK;
         }
         let mut win = 0;
-        // a piece of your own on the temple is in the way
+        // a piece of our own on the opponent's temple is in the way
         if pieces1 & 1 << 2 == 0 {
             for card in &self.0 {
                 if 1 << king1 & card.temple != 0 {
@@ -741,11 +854,11 @@ impl AllTables {
 
         for (card, mask) in zip(self.cards.iter(), mask_iter()) {
             let bitmap = card.bitmap::<false>();
-            // from where can you attack the temple?
+            // from where can you reach the opponent's temple?
             let from_mask = offset_mask(2, bitmap);
 
             layout.indexer(counts).for_enumerate(|i, kpos| {
-                // a piece of your own on the temple is in the way
+                // a piece of our own on the opponent's temple is in the way
                 let temple = 1 << kpos.king1 & from_mask != 0 && 1 << 2 & pieces1 == 0;
                 let king = offset_mask(kpos.king0 as usize, bitmap) & pieces1 != 0;
                 if kpos.over() || temple || king {
@@ -1136,6 +1249,27 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// The card masks [`Seeds`] uses partition every configuration: the side
+    /// card is a card in 6 of them, the side to move holds it in 12 and the
+    /// opponent in the other 12, and the side to move always holds two.
+    #[test]
+    fn card_masks() {
+        use super::{Cards, Seeds, BLOCK_MASK};
+        let seeds = Seeds::new(Cards(0b11111));
+        let mut held = [0; 30];
+        for card in &seeds.0 {
+            assert_eq!(card.side.count_ones(), 6);
+            assert_eq!(card.mover.count_ones(), 12);
+            assert_eq!(card.opponent.count_ones(), 12);
+            assert_eq!(card.side | card.mover | card.opponent, BLOCK_MASK);
+            assert_eq!(card.side & card.mover, 0);
+            for (k, h) in held.iter_mut().enumerate() {
+                *h += card.mover >> k & 1;
+            }
+        }
+        assert_eq!(held, [2; 30]);
     }
 
     #[test]
