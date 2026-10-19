@@ -6,7 +6,7 @@ use std::{
 
 use bit_iter::BitIter;
 
-use crate::card::offset_mask_fixed as offset_mask;
+use crate::card::offset_mask;
 
 use super::{
     accum_spread::{accumulate, invert, load, permute, permute16, SPARE}, locate, prefetch, Block, Chunk, ImmutableUpdate, LocalMem, PreparedMove, Spread,
@@ -388,8 +388,6 @@ impl<'t> Update<'_, 't> {
 
         let mut all_done = BLOCK_MASK;
         let mut total_unresolved = 0;
-        // let mut num_done = 0;
-        // let mut num_not_done = 0;
         for (s, &w) in zip(&mut mem.status[..padded], &mem.wins[..padded]) {
             let l = *s;
             *s &= !w;
@@ -398,26 +396,7 @@ impl<'t> Update<'_, 't> {
             } else {
                 all_done &= w | l;
             }
-            // if (w | l) & BLOCK_MASK == BLOCK_MASK {
-            //     inv_slice[kpos.invert()].fetch_or(RESOLVED_BIT, Ordering::Relaxed);
-            //     num_done += 1;
-            // } else {
-            //     num_not_done += 1;
-            //     // for mask in mask_iter().take(5) {
-            //     //     let mask = Block(mask).invert().expand().invert().0;
-            //     //     if (w | l) & mask == mask {
-            //     //         self.card_done.fetch_add(1, Ordering::Relaxed);
-            //     //     } else {
-            //     //         self.card_not_done.fetch_add(1, Ordering::Relaxed);
-            //     //     }
-            //     // }
-            // }
         }
-        // if all_done != BLOCK_MASK {
-        //     self.block_done.fetch_add(num_done, Ordering::Relaxed);
-        //     self.block_not_done
-        //         .fetch_add(num_not_done, Ordering::Relaxed);
-        // }
         if COUNT {
             total_unresolved
         } else {

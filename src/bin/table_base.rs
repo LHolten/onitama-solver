@@ -1,4 +1,4 @@
-use std::{env::args, sync::atomic::Ordering, time::Instant};
+use std::{env::args, time::Instant};
 
 use onitama_solver::onitama_simd::AllTables;
 
@@ -31,16 +31,6 @@ pub fn main() {
         }
         None => println!("unresolved states not counted, pass --unresolved"),
     }
-    println!(
-        "{} blocks done, {} blocks not done",
-        tb.block_done.load(Ordering::Relaxed),
-        tb.block_not_done.load(Ordering::Relaxed)
-    );
-    println!(
-        "{} cards done, {} cards not done",
-        tb.card_done.load(Ordering::Relaxed),
-        tb.card_not_done.load(Ordering::Relaxed)
-    );
     println!("took {:.3} seconds", time.as_secs_f32());
 
     match size {

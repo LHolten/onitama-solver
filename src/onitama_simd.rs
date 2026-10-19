@@ -1,18 +1,15 @@
-#![allow(dead_code)]
 pub mod accum_spread;
 mod iter;
 mod job;
 mod update;
 
 use std::{
-    alloc::Layout,
     fmt,
     iter::zip,
     mem::size_of,
-    ops::{BitAnd, Deref, Index, IndexMut},
+    ops::{BitAnd, Deref, Index},
     simd::Simd,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
-    time::Instant,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 #[cfg(feature = "parallell")]
@@ -21,14 +18,13 @@ use rayon::prelude::*;
 use bit_iter::BitIter;
 
 use crate::{
-    card::{get_one_bitmap, offset_mask_fixed as offset_mask},
-    index::{Empty, Indexer, InternalIter},
+    card::{get_one_bitmap, offset_mask},
+    index::{Empty, Indexer},
     proj,
 };
 
 pub const TABLE_MASK: u32 = (1 << 25) - 1;
 pub const BLOCK_MASK: u32 = (1 << 30) - 1;
-pub const RESOLVED_BIT: u32 = 1 << 30;
 
 fn count_indexer(size: u32) -> impl Indexer<Item = PawnCount> {
     let count_mask = (1u32 << size) - 1;
@@ -71,13 +67,6 @@ impl TeamLayout {
             .choose_one(proj!(|p: KingPos| p.king1), (self.pieces1, counts.count1 + 1))
     }
 
-    fn counts(self) -> PawnCount {
-        PawnCount {
-            count0: self.pieces0.count_ones() - 1,
-            count1: self.pieces1.count_ones() - 1,
-        }
-    }
-
     fn invert(self) -> Self {
         TeamLayout {
             pieces0: self.pieces1.reverse_bits() >> 7,
@@ -93,6 +82,17 @@ pub struct KingPos {
     king1: u32,
 }
 
+#[cfg(test)]
+impl TeamLayout {
+    fn counts(self) -> PawnCount {
+        PawnCount {
+            count0: self.pieces0.count_ones() - 1,
+            count1: self.pieces1.count_ones() - 1,
+        }
+    }
+}
+
+#[cfg(test)]
 impl KingPos {
     /// Whether a king stands on the opponent's temple, so the game is already
     /// over.
@@ -104,13 +104,6 @@ impl KingPos {
     fn over(self) -> bool {
         self.king0 == 22 || self.king1 == 2
     }
-
-    fn invert(self) -> Self {
-        Self {
-            king0: 24 - self.king1,
-            king1: 24 - self.king0,
-        }
-    }
 }
 
 // contains all the results up to some number of pieces
@@ -119,15 +112,10 @@ pub struct AllTables {
     /// The most pieces a table built here has, both kings counted: see
     /// [`AllTables::build_upto`].
     pieces: u32,
-    cards: Cards,
     mask_lookup: [u32; 25],
     directions: u32,
     seeds: Seeds,
     list: Box<[Table]>,
-    pub block_done: AtomicU64,
-    pub block_not_done: AtomicU64,
-    pub card_done: AtomicU64,
-    pub card_not_done: AtomicU64,
 }
 
 impl AllTables {
@@ -157,19 +145,13 @@ impl AllTables {
     }
 
     /// The won states per table, for every table this was built with.
-    pub fn table_wins(&self) -> Vec<((u32, u32), u64)> {
+    #[cfg(test)]
+    fn table_wins(&self) -> Vec<((u32, u32), u64)> {
         self.built()
             .map(|table| ((table.counts.count0, table.counts.count1), table.count_ones()))
             .collect()
     }
 }
-
-/// The size of a cache line.
-///
-/// A chunk (all king positions of one layout) is read and written as a unit, so
-/// aligning the table to this means a chunk that fits in a line only touches
-/// one, instead of straddling two.
-const LINE: usize = 64;
 
 /// The size of a huge page.
 const HUGE: usize = 2 << 20;
@@ -298,10 +280,6 @@ impl AlignedTable {
     /// end of the last chunk still lands inside the mapping.
     fn map_size(len: usize) -> usize {
         Self::size(len + ROW)
-    }
-
-    fn layout(len: usize) -> Layout {
-        Layout::from_size_align(Self::map_size(len), LINE).unwrap()
     }
 
     /// Map the table directly instead of going through the allocator.
@@ -799,9 +777,6 @@ pub struct Chunk {
     cols: u32,
     height: usize,
     width: usize,
-    /// The slot every row starts on, as a bit each: a mask of columns that is
-    /// the same in every row is a row's mask times this.
-    starts: u32,
 }
 
 impl Chunk {
@@ -811,16 +786,11 @@ impl Chunk {
             pieces1: cols,
         } = layout;
         let (height, width) = (rows.count_ones() as usize, cols.count_ones() as usize);
-        let mut starts = 0;
-        for row in 0..height {
-            starts |= 1 << (row * width);
-        }
         let this = Self {
             rows,
             cols,
             height,
             width,
-            starts,
         };
         // Not a check but a bound for the vectoriser, which it needs to keep
         // the walks over `padded` slots a whole vector at a time: told nothing,
@@ -883,32 +853,6 @@ pub struct SpreadStatus {
 }
 
 impl AllTables {
-    /// The seed written out per card and king position, which is the
-    /// definition [`Seeds`] is held to.
-    pub fn ez_win_for_each(
-        &self,
-        counts: PawnCount,
-        layout: TeamLayout,
-        f: &mut impl FnMut(usize, u32),
-    ) {
-        let pieces1 = layout.pieces1;
-
-        for (card, mask) in zip(self.cards.iter(), mask_iter()) {
-            let bitmap = card.bitmap::<false>();
-            // from where can you reach the opponent's temple?
-            let from_mask = offset_mask(2, bitmap);
-
-            layout.indexer(counts).for_enumerate(|i, kpos| {
-                // a piece of our own on the opponent's temple is in the way
-                let temple = 1 << kpos.king1 & from_mask != 0 && 1 << 2 & pieces1 == 0;
-                let king = offset_mask(kpos.king0 as usize, bitmap) & pieces1 != 0;
-                if kpos.over() || temple || king {
-                    f(i, mask);
-                }
-            })
-        }
-    }
-
     pub fn build(size: u32, cards: u16) -> Self {
         Self::build_upto(size, cards, 2 * size)
     }
@@ -940,7 +884,6 @@ impl AllTables {
         let tb = Self {
             size,
             pieces,
-            cards: Cards(cards),
             mask_lookup,
             directions,
             seeds: Seeds::new(Cards(cards)),
@@ -959,10 +902,6 @@ impl AllTables {
                     }
                 })
                 .collect(),
-            block_done: Default::default(),
-            block_not_done: Default::default(),
-            card_done: Default::default(),
-            card_not_done: Default::default(),
         };
 
         // Everything a table reads is a piece smaller: a take lands in
@@ -1078,7 +1017,6 @@ struct TableJob<'a> {
     /// One bit per layout: retired, but its capture predecessors still have to
     /// be written by the `go_up` pass.
     needs_up: Vec<u64>,
-    total: usize,
     update: ImmutableUpdate<'a>,
     done: bool,
 }
@@ -1131,73 +1069,13 @@ impl Card {
     }
 }
 
-fn pretty(layout: TeamLayout, kpos: KingPos) {
-    let TeamLayout { pieces0, pieces1 } = layout;
-    let KingPos { king0, king1 } = kpos;
-    debug_assert_eq!(pieces0 & pieces1, 0);
-    debug_assert_ne!(1 << king0 & pieces0, 0);
-    debug_assert_ne!(1 << king1 & pieces1, 0);
-
-    println!("----- x side");
-    for y in 0..5 {
-        for x in 0..5 {
-            let i = 24 - 5 * y - x;
-            if king0 == i {
-                print!("O")
-            } else if king1 == i {
-                print!("X")
-            } else if 1 << i & pieces0 != 0 {
-                print!("o")
-            } else if 1 << i & pieces1 != 0 {
-                print!("x")
-            } else {
-                print!(".")
-            }
-        }
-        println!()
-    }
-    println!("----- o side")
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
 
     use crate::onitama_simd::Block;
 
-    use super::{mask_iter, AllTables, PawnCount};
-
-    /// How an 8 man table's chunks sit against the cache lines.
-    ///
-    /// A chunk starts at `chunk_size * i` off a page aligned base, so it is
-    /// inside one line exactly when its size divides one. Four of the sixteen
-    /// tables fail that, which is what the second prefetch is there for.
-    #[test]
-    fn chunks_against_lines() {
-        use super::{count_indexer, Indexer, LINE};
-        let (mut bytes, mut straddling, mut padded) = (0u64, 0u64, 0u64);
-        for counts in count_indexer(4) {
-            let chunk = (counts.count0 + 1) as usize * (counts.count1 + 1) as usize * 4;
-            let n = counts.total() as u64;
-            let straddles = chunk > LINE || LINE % chunk != 0;
-            println!(
-                "{counts:?}: chunk {chunk:>3} B x {n:>9} = {:>5.2} GB{}",
-                (chunk as u64 * n) as f64 / 1e9,
-                if straddles { "  STRADDLES" } else { "" },
-            );
-            bytes += chunk as u64 * n;
-            straddling += if straddles { chunk as u64 * n } else { 0 };
-            padded += chunk.next_power_of_two() as u64 * n;
-        }
-        println!(
-            "total {:.2} GB, {:.2} GB of it straddling; padding every chunk to a \
-             power of two would take {:.2} GB (+{:.1}%)",
-            bytes as f64 / 1e9,
-            straddling as f64 / 1e9,
-            padded as f64 / 1e9,
-            (padded as f64 / bytes as f64 - 1.0) * 100.0,
-        );
-    }
+    use super::{mask_iter, AllTables};
 
     #[test]
     fn build_tb() {
@@ -1208,19 +1086,7 @@ mod tests {
         let unresolved = tb.count_unresolved();
         println!("{unresolved} unresolved states");
         println!("{} resolved states", total - unresolved);
-        println!(
-            "{} blocks done, {} blocks not done",
-            tb.block_done.load(Ordering::Relaxed),
-            tb.block_not_done.load(Ordering::Relaxed)
-        );
-        println!(
-            "{} cards done, {} cards not done",
-            tb.card_done.load(Ordering::Relaxed),
-            tb.card_not_done.load(Ordering::Relaxed)
-        );
-        // assert_eq!(wins, 6752579);
         assert_eq!(wins, 831344251);
-        // assert_eq!(wins, 27126107221);
     }
 
     /// A card set with more backward moves per chunk than `TableJob::live` has
@@ -1413,55 +1279,6 @@ mod tests {
     fn overflowing_card_set_8() {
         let tb = AllTables::build(4, 0b1_0011_1001);
         assert_eq!(tb.count_ones(), 38181597408);
-    }
-
-    #[test]
-    fn counts0() {
-        for layout in PawnCount::default() {
-            dbg!(layout);
-        }
-    }
-
-    /// What [`Seeds`] works out has to be exactly what the seed is.
-    #[test]
-    fn seeds_match() {
-        use super::{Cards, Indexer, InternalIter, Seeds, BLOCK_MASK};
-        let tb = AllTables {
-            size: 0,
-            pieces: 0,
-            cards: Cards(0b11111),
-            mask_lookup: [0; 25],
-            directions: 0,
-            seeds: Seeds::new(Cards(0b11111)),
-            list: Box::new([]),
-            block_done: Default::default(),
-            block_not_done: Default::default(),
-            card_done: Default::default(),
-            card_not_done: Default::default(),
-        };
-        let seed = |counts: PawnCount, layout| {
-            let mut acc = vec![0u32; layout_total(layout, counts)];
-            tb.ez_win_for_each(counts, layout, &mut |i, mask| acc[i] |= Block(mask).invert().expand().0);
-            acc
-        };
-        fn layout_total(layout: super::TeamLayout, counts: PawnCount) -> usize {
-            layout.indexer(counts).total()
-        }
-        for (count0, count1) in [(0, 0), (1, 0), (0, 1), (1, 1), (2, 1), (1, 2), (2, 2)] {
-            let counts = PawnCount { count0, count1 };
-            for layout in counts {
-                let own = seed(counts, layout);
-                layout.indexer(counts).for_enumerate(|i, kpos| {
-                    let (k0, k1) = (kpos.king0 as usize, kpos.king1 as usize);
-                    let computed = if kpos.over() {
-                        BLOCK_MASK
-                    } else {
-                        tb.seeds.temple(layout.pieces1, k1) | tb.seeds.take(layout.pieces1, k0)
-                    };
-                    assert_eq!(computed, own[i], "{layout:?} {kpos:?}");
-                });
-            }
-        }
     }
 
     /// The card masks [`Seeds`] uses partition every configuration: the side

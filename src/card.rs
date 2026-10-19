@@ -1,32 +1,12 @@
-#![allow(dead_code)]
-use bit_iter::BitIter;
 use seq_macro::seq;
 
-// TODO: precalculate with every possible offset if that is faster
-
-#[inline]
-pub(crate) fn cards_mask<const S: bool>(offset: u32, cards: u16) -> u32 {
-    let bitmap = get_bitmap::<S>(cards);
-    offset_mask(offset as usize, bitmap)
-}
-
+/// `mask` moved by `offset`, where 12 is staying put, with whatever that moves
+/// off the board dropped.
 #[inline]
 pub(crate) fn offset_mask(offset: usize, mask: u32) -> u32 {
-    let new = mask & BOARD_MASK[offset];
-    ((new as u64) << 12 >> offset) as u32
-}
-
-#[inline]
-pub(crate) fn offset_mask_fixed(offset: usize, mask: u32) -> u32 {
     let new = mask & BOARD_MASK[24 - offset];
     ((new as u64) << offset >> 12) as u32
 }
-
-/// this method is used to get the orginal mask after using [offset_mask]
-// #[inline]
-// pub(crate) fn undo_offset(offset: u8, mask: u32) -> u32 {
-//     ((mask as u64) << offset >> 12) as u32
-// }
 
 #[allow(clippy::unusual_byte_groupings)]
 const BOARD_MASK: [u32; 25] = [
@@ -89,37 +69,7 @@ pub(crate) fn get_one_bitmap<const S: bool>(card: usize) -> u32 {
     }
 }
 
-// card masks are ordered from top to bottom
-pub(crate) fn get_bitmap<const S: bool>(cards: u16) -> u32 {
-    let mut mask = 0;
-    BitIter::from(cards).for_each(|card| mask |= get_one_bitmap::<S>(card));
-    mask
-}
-
 #[inline]
 const fn reverse_bitmap(board: u32) -> u32 {
     board.reverse_bits() >> (32 - 25)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::cards_mask;
-
-    #[test]
-    pub fn test() {
-        let cards = 1;
-        let res10 = 0b00000_10000_01000_10000_00000;
-        let res12 = 0b00000_00100_00010_00100_00000;
-        let res10_rev = 0b00000_10000_00000_10000_00000;
-        let res3_rev = 0b00100_00010_00000_00000_00000;
-        let mask10 = cards_mask::<false>(10, cards);
-        let mask10_rev = cards_mask::<true>(10, cards);
-        let mask12 = cards_mask::<false>(12, cards);
-        let mask3_rev = cards_mask::<true>(3, cards);
-        // println!("{mask3_rev:025b}");
-        assert_eq!(res12, mask12);
-        assert_eq!(res10, mask10);
-        assert_eq!(res10_rev, mask10_rev);
-        assert_eq!(res3_rev, mask3_rev);
-    }
 }

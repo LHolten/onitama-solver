@@ -84,50 +84,10 @@ impl<'a> TableJob<'a> {
             live,
             spent,
             needs_up: vec![0; padded / 64],
-            total,
             update,
             done: false,
             tb,
         }
-    }
-
-    /// Call `f` on every live layout and add up what it returns.
-    ///
-    /// A retired layout costs one word of [`TableJob::live`] and nothing else:
-    /// its position in the enumeration is only turned back into a layout once a
-    /// live word is found, so a sparse late pass never pays for the gaps.
-    fn map_live<F>(&self, f: F) -> u64
-    where
-        F: Fn(TeamLayout) -> u64 + Sync + Send,
-    {
-        let counts = self.counts;
-
-        #[cfg(feature = "parallell")]
-        let iter = self.live.par_chunks(BLOCK);
-        #[cfg(not(feature = "parallell"))]
-        let iter = self.live.chunks(BLOCK);
-
-        iter.enumerate()
-            .map(|(b, live)| {
-                let start = b * BLOCK;
-                let mut cursor = LayoutCursor::new(counts);
-                let mut sum = 0;
-                for (g, group) in live.chunks(GROUP).enumerate() {
-                    // a retired run is rejected by one scan that stops at the
-                    // first live layout, instead of a branch per layout
-                    if group.iter().all(|&moves| moves == 0) {
-                        continue;
-                    }
-                    let start = start + g * GROUP;
-                    for (j, &moves) in group.iter().enumerate() {
-                        if moves != 0 {
-                            sum += f(cursor.at(start + j));
-                        }
-                    }
-                }
-                sum
-            })
-            .sum()
     }
 
     /// Blocks of layouts this job covers, which is what seeding is split into.

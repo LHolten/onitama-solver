@@ -1,11 +1,10 @@
-use std::iter::{self, once, Once};
+use std::iter::{once, Once};
 
 use bit_iter::BitIter;
-use seq_macro::seq;
 
 use crate::proj::{CountOnes, Mask, Proj};
 
-pub(crate) trait Indexer: Clone + InternalIter {
+pub(crate) trait Indexer: Clone + IntoIterator {
     fn index(&self, item: &Self::Item) -> usize;
 
     fn total(&self) -> usize;
@@ -22,32 +21,10 @@ pub(crate) trait Indexer: Clone + InternalIter {
             gen: ChooseOne,
         }
     }
-
-    fn choose<V, M>(self, n: u32, proj: V, mask: M) -> Flatten<Self, V, M, ChooseExact>
-    where
-        V: Proj<Self::Item>,
-        M: Mask<Self::Item>,
-    {
-        Flatten {
-            outer: self,
-            proj,
-            mask,
-            gen: ChooseExact { count: n },
-        }
-    }
 }
 
 #[derive(Default, Clone)]
 pub struct Empty<T>(pub T);
-
-impl<T> InternalIter for Empty<T> {
-    fn for_each<F>(mut self, mut f: F)
-    where
-        F: for<'a> FnMut(&'a mut Self::Item),
-    {
-        (f)(&mut self.0)
-    }
-}
 
 impl<T> IntoIterator for Empty<T> {
     type Item = T;
@@ -69,55 +46,14 @@ impl<T: Clone> Indexer for Empty<T> {
 }
 
 #[derive(Clone)]
-pub struct Flatten<I: InternalIter, V, M, G> {
+pub struct Flatten<I, V, M, G> {
     outer: I,
     proj: V,
     mask: M,
     gen: G,
 }
 
-pub trait InternalIter: Sized + IntoIterator {
-    fn for_each<F>(self, f: F)
-    where
-        F: for<'a> FnMut(&'a mut Self::Item);
-
-    fn for_enumerate<F>(self, mut f: F)
-    where
-        F: for<'a> FnMut(usize, &'a mut Self::Item),
-    {
-        let mut i = 0;
-        self.for_each(|item| {
-            (f)(i, item);
-            i += 1;
-        })
-    }
-}
-
-impl<I: InternalIter, V, M, G> InternalIter for Flatten<I, V, M, G>
-where
-    V: Proj<I::Item>,
-    M: Mask<I::Item>,
-    G: Gen<M::Output, V::Output>,
-    I::Item: Clone,
-{
-    fn for_each<F>(self, mut f: F)
-    where
-        F: for<'a> FnMut(&'a mut Self::Item),
-    {
-        self.outer.for_each(|board| {
-            let mask: M::Output = self.mask.get_mask(board);
-            debug_assert_eq!(mask.count_ones(), self.mask.get_size());
-
-            self.gen.gen_iter(mask).for_each(|field: V::Output| {
-                let mut new = board.clone();
-                *(self.proj).proj_mut(&mut new) = field;
-                (f)(&mut new)
-            })
-        })
-    }
-}
-
-impl<I: InternalIter, V, M, G> IntoIterator for Flatten<I, V, M, G>
+impl<I: IntoIterator + Clone, V, M, G> IntoIterator for Flatten<I, V, M, G>
 where
     V: Proj<I::Item>,
     M: Mask<I::Item>,
@@ -189,145 +125,5 @@ impl Gen<u32, u32> for ChooseOne {
 
     fn total(&self, mask_size: u32) -> usize {
         mask_size as usize
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct ChooseExact {
-    count: u32,
-}
-
-use std::hint::assert_unchecked;
-
-macro_rules! gen_impl {
-    ($($t:ty)*) => {$(
-        impl Gen<$t, $t> for ChooseExact {
-            type GenIter = impl Iterator<Item = $t>;
-
-            fn gen_iter(&self, mask: $t) -> Self::GenIter {
-                debug_assert!(self.count < 6);
-                debug_assert!(self.count <= mask.count_ones());
-
-                let mut lookup: [$t; 6] = [0; 6];
-                let mut entry = !mask;
-                for i in 0..=self.count as usize {
-                    lookup[self.count as usize - i] = entry;
-                    entry |= (!entry) & (!entry).wrapping_neg();
-                }
-
-                let mut curr: $t = 0;
-                let mut curr_or_skip = !mask;
-                let mut init = false;
-                iter::from_fn(move || {
-                    let lowest = curr & curr.wrapping_neg();
-
-                    let new = curr_or_skip.wrapping_add(lowest);
-                    let bits = (new & mask).count_ones();
-
-                    unsafe {assert_unchecked(bits <= 4)}
-                    curr_or_skip = new | lookup[bits as usize];
-
-                    curr = curr_or_skip & mask;
-
-                    let done = init & (new & mask == 0);
-                    init = true;
-                    (!done).then_some(curr)
-                })
-            }
-
-            fn index(&self, mask: $t, vals: &$t) -> usize {
-                debug_assert_eq!(vals.count_ones(), self.count);
-                debug_assert_eq!(vals & !mask, 0);
-
-                index_exact(*vals as u32, mask as u32)
-            }
-
-            fn total(&self, mask_size: u32) -> usize {
-                comb_exact(mask_size, self.count as u32)
-            }
-        }
-    )*}
-}
-
-gen_impl! { u16 u32 }
-
-fn index_exact(vals: u32, mask: u32) -> usize {
-    let mut i = 0;
-    BitIter::from(vals).enumerate().for_each(|(count, offset)| {
-        let mask_less = (1 << offset) - 1;
-        let num_less = (mask_less & mask).count_ones();
-        i += comb_exact(num_less, count as u32 + 1);
-    });
-    i
-}
-
-fn comb_exact(num_less: u32, count: u32) -> usize {
-    const fn comb_exact_inner(num_less: usize, count: usize) -> usize {
-        if count > num_less {
-            return 0;
-        }
-
-        if count == 0 {
-            return 1;
-        }
-
-        num_less * comb_exact_inner(num_less - 1, count - 1) / count
-    }
-
-    const RES: [[usize; 6]; 26] = seq!(num_less in 0..26 {
-        [#(
-            seq!(count in 0..6 {
-                [#(comb_exact_inner(num_less, count),)*]
-            })
-        ,)*]
-    });
-
-    RES[num_less as usize][count as usize]
-}
-
-#[cfg(test)]
-mod tests {
-
-    use crate::proj;
-
-    use super::{ChooseExact, ChooseOne, Empty, Gen, Indexer};
-
-    #[test]
-    fn comb_some() {
-        let mask = 0b101111u16;
-        let indexer = ChooseExact { count: 2 };
-        indexer
-            .gen_iter(mask)
-            .for_each(|x| println!("{x:06b} with id {}", indexer.index(mask, &x)))
-    }
-
-    #[test]
-    fn comb_one() {
-        let mask = 0b101111u32;
-        let indexer = ChooseOne;
-        indexer
-            .gen_iter(mask)
-            .for_each(|x| println!("{x} with id {}", indexer.index(mask, &x)))
-    }
-
-    #[test]
-    fn comb_two() {
-        #[derive(Clone, Default)]
-        struct Two {
-            one: u32,
-            two: u32,
-            three: u32,
-        }
-        let indexer = Empty::default()
-            .choose(0, proj!(|b: Two| b.one), 0b1111u32)
-            .choose(2, proj!(|b: Two| b.two), (|b: &Two| 0b1111u32 & !b.one, 4))
-            .choose(
-                0,
-                proj!(|b: Two| b.three),
-                (|b: &Two| 0b1111u32 & !b.one & !b.two, 2),
-            );
-        for (i, x) in indexer.clone().into_iter().enumerate() {
-            assert_eq!(i, indexer.index(&x))
-        }
     }
 }
